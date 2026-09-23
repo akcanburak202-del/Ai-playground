@@ -17,7 +17,8 @@ if (!cssHref || !jsSrc) throw new Error('could not find the built CSS/JS in dist
 
 const css = readFileSync(join(dist, cssHref), 'utf8');
 const js = readFileSync(join(dist, jsSrc), 'utf8').replace(/<\/script/gi, '<\\/script');
-const fonts = [...html.matchAll(/<link rel="(?:preconnect|stylesheet)" href="https:\/\/fonts[^>]*>/g)].map((m) => m[0]).join('\n');
+const fonts = [...html.matchAll(/<link\s[^>]*href="https:\/\/fonts\.(?:googleapis|gstatic)\.com[^"]*"[^>]*>/g)].map((m) => m[0].replace(/\s+/g, ' ')).join('\n');
+if (!fonts.includes('stylesheet')) throw new Error('font stylesheet link not found');
 
 const page = `<title>OpusDB Studio</title>
 ${fonts}
