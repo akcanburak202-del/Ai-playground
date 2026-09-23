@@ -1,0 +1,26 @@
+{
+  "name": "opusdb-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/engine",
+    "packages/server",
+    "packages/studio"
+  ],
+  "scripts": {
+    "test": "npm run test -w @opusdb/engine && npm run test -w @opusdb/server",
+    "typecheck": "tsc -p packages/engine && tsc -p packages/server && tsc -p packages/studio",
+    "fuzz": "npm run fuzz -w @opusdb/engine --",
+    "bench": "npm run bench -w @opusdb/engine --",
+    "dev": "npm run dev -w @opusdb/studio",
+    "build": "npm run build -w @opusdb/studio",
+    "server": "npm run start -w @opusdb/server --"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@opusdb/engine",
+  "version": "0.1.0",
+  "description": "OpusDB: a relational SQL database engine written from scratch in TypeScript",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./node": "./src/node.ts"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "fuzz": "node test/fuzz/run.ts",
+    "bench": "node bench/run.ts",
+    "typecheck": "tsc -p ."
+  }
+}
