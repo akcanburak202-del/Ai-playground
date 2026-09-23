@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:single": "vite build --mode single && node scripts/inline.ts",
     "preview": "vite preview",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "shot": "node scripts/shot.ts"
   },
   "engines": {
     "node": ">=22.18"
