@@ -76,6 +76,8 @@ export function TreeLab() {
   const [flash, setFlash] = useState<Set<number>>(new Set());
   const [selected, setSelected] = useState<number | undefined>();
   const seq = useRef(0);
+  const stage = useRef<HTMLDivElement>(null);
+  const [center, setCenter] = useState(0);
   const pending = useRef<TreeEvent[]>([]);
 
   const refresh = useCallback(() => {
@@ -105,6 +107,7 @@ export function TreeLab() {
       setNewKey(undefined);
       setSelected(undefined);
       setLog([]);
+      setCenter((c) => c + 1);
       push([{ kind: 'info', text: seed ? `New tree of order ${o} (max ${o} keys per page) seeded with ${SEED_KEYS.length} keys.` : `Empty tree of order ${o}.` }]);
       refresh();
     },
@@ -112,6 +115,12 @@ export function TreeLab() {
   );
 
   useEffect(() => reset(order), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // on narrow screens the tree is wider than the stage: start with the root in view
+  useEffect(() => {
+    const el = stage.current;
+    if (el && el.scrollWidth > el.clientWidth) el.scrollLeft = (el.scrollWidth - el.clientWidth) / 2;
+  }, [center, dump === null]);
 
   /** Runs one SQL statement against the lab tree and turns the engine's tree events into log lines. */
   const act = (sql: string, params: number[], label: Omit<LogEntry, 'id'>): boolean => {
@@ -299,7 +308,7 @@ export function TreeLab() {
             </button>
           </div>
         </div>
-        <div className="tree-stage">{dump && <TreeDiagram dump={dump} path={path} hitKey={hitKey} newKey={newKey} flash={flash} selected={selected} onSelect={setSelected} />}</div>
+        <div className="tree-stage" ref={stage}>{dump && <TreeDiagram dump={dump} path={path} hitKey={hitKey} newKey={newKey} flash={flash} selected={selected} onSelect={setSelected} />}</div>
         {stats && (
           <div className="legend" style={{ padding: '10px 14px', borderTop: '1px solid var(--rule)' }}>
             <span>

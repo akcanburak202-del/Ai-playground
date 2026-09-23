@@ -11,7 +11,6 @@ import type { SchemaInfo } from '@opusdb/engine';
  */
 
 const FUNCTION_NAMES = new Set([...Object.keys(SCALAR_FUNCTIONS), ...Object.keys(AGGREGATE_FUNCTIONS), ...WINDOW_FUNCTIONS]);
-const LINE_HEIGHT = 21;
 const PAD_X = 14;
 const PAD_Y = 12;
 
@@ -87,6 +86,7 @@ export function Editor({ value, onChange, onRun, error, schema }: EditorProps) {
   const pre = useRef<HTMLPreElement>(null);
   const gutter = useRef<HTMLDivElement>(null);
   const [charW, setCharW] = useState(8.1);
+  const [lineH, setLineH] = useState(21);
   const [popup, setPopup] = useState<{ items: Completion[]; index: number; x: number; y: number; start: number } | null>(null);
   const html = useMemo(() => highlight(value, error?.position), [value, error?.position]);
   const lines = value.split('\n').length;
@@ -96,8 +96,10 @@ export function Editor({ value, onChange, onRun, error, schema }: EditorProps) {
     const measure = () => {
       const c = document.createElement('canvas').getContext('2d');
       if (!c || !ta.current) return;
-      c.font = getComputedStyle(ta.current).font;
+      const style = getComputedStyle(ta.current);
+      c.font = style.font;
       setCharW(c.measureText('0123456789').width / 10);
+      setLineH(parseFloat(style.lineHeight) || 21);
     };
     measure();
     void document.fonts?.ready.then(measure);
@@ -165,10 +167,10 @@ export function Editor({ value, onChange, onRun, error, schema }: EditorProps) {
       const row = before.split('\n').length - 1;
       const col = caret - lineStart - prefix.length;
       const x = PAD_X + col * charW - ta.current.scrollLeft;
-      const y = PAD_Y + (row + 1) * LINE_HEIGHT - ta.current.scrollTop + 2;
+      const y = PAD_Y + (row + 1) * lineH - ta.current.scrollTop + 2;
       setPopup({ items, index: 0, x: Math.max(4, x), y, start: caret - prefix.length });
     },
-    [candidates, charW, schema],
+    [candidates, charW, lineH, schema],
   );
 
   const accept = (c: Completion) => {
