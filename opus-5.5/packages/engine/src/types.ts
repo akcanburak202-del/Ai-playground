@@ -36,6 +36,8 @@ export const ErrorCode = {
   noActiveTransaction: '25P01',
   lockNotAvailable: '55P03',
   featureNotSupported: '0A000',
+  invalidStatementName: '26000',
+  invalidCursorName: '34000',
   ioError: '58030',
   corrupt: 'XX001',
   internal: 'XX000',

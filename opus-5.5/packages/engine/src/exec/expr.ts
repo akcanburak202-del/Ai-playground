@@ -125,8 +125,8 @@ export function compileExpr(e: BExpr, env: CompileEnv): Compiled {
     }
     case 'between': {
       const a = compileExpr(e.arg, env);
-      const lo = compileExpr(e.low, env);
-      const hi = compileExpr(e.high, env);
+      const lo = e.low.type === 'ANY' ? applyAffinity(compileExpr(e.low, env), e.arg.type) : compileExpr(e.low, env);
+      const hi = e.high.type === 'ANY' ? applyAffinity(compileExpr(e.high, env), e.arg.type) : compileExpr(e.high, env);
       const not = e.not;
       return (row) => {
         const v = a(row);
@@ -159,7 +159,7 @@ export function compileExpr(e: BExpr, env: CompileEnv): Compiled {
           return hasNull ? null : not;
         };
       }
-      const items = e.list.map((x) => compileExpr(x, env));
+      const items = e.list.map((x) => (x.type === 'ANY' ? applyAffinity(compileExpr(x, env), e.arg.type) : compileExpr(x, env)));
       return (row) => {
         const v = a(row);
         if (v === null) return null;
@@ -452,7 +452,33 @@ function compileBinary(e: Extract<BExpr, { k: 'binary' }>, env: CompileEnv): Com
   }
 }
 
+/** Numeric strings compare as numbers against numeric columns; numbers compare as text against TEXT columns. */
+function applyAffinity(f: Compiled, target: DataType): Compiled {
+  if (target === 'INTEGER' || target === 'REAL') {
+    return (row) => {
+      const v = f(row);
+      if (typeof v === 'string') {
+        const s = v.trim();
+        if (s !== '' && /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(s)) return Number(s);
+      }
+      return v;
+    };
+  }
+  if (target === 'TEXT') return (row) => {
+    const v = f(row);
+    return typeof v === 'number' ? valueToText(v) : v;
+  };
+  return f;
+}
+
 function compileComparison(op: string, l: Compiled, r: Compiled, lt: DataType, rt: DataType): Compiled {
+  // dynamically typed operands (parameters, ANY columns) take the affinity of the typed side
+  if (lt === 'ANY' && rt !== 'ANY' && rt !== 'NULL') {
+    l = applyAffinity(l, rt);
+    lt = 'ANY';
+  } else if (rt === 'ANY' && lt !== 'ANY' && lt !== 'NULL') {
+    r = applyAffinity(r, lt);
+  }
   const fast = (isNum(lt) && isNum(rt)) || (lt === 'TEXT' && rt === 'TEXT');
   if (fast) {
     switch (op) {

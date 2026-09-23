@@ -11,3 +11,5 @@ export { MemoryStorage, MemoryFile } from './storage/file.ts';
 export type { StorageFile, StorageProvider } from './storage/file.ts';
 export type { TreeEvent } from './storage/btree.ts';
 export { SCALAR_FUNCTIONS, AGGREGATE_FUNCTIONS, WINDOW_FUNCTIONS } from './exec/functions.ts';
+export { loadDemo, DEMO_SCHEMA } from './demo.ts';
+export type { DemoSize } from './demo.ts';
