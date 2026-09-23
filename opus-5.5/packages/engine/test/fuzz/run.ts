@@ -56,15 +56,15 @@ if (json) console.log(JSON.stringify(summary, null, 2));
 else {
   console.log(`\nDifferential fuzzing vs SQLite: ${agreed}/${compared} queries agreed (${(summary.agreement * 100).toFixed(2)}%)`);
   console.log(`  ${total} queries over ${seeds} random schemas, ${rows} result rows compared, ${bothErrored} rejected by both, ${summary.seconds}s`);
-  if (sqliteBugs.length) console.log(`  ${sqliteBugs.length} queries where SQLite's answer changed with/without indexes; OpusDB matched the index-free answer`);
+  if (sqliteBugs.length) console.log(`  ${sqliteBugs.length} queries where SQLite contradicted itself (index vs no index, or LIMIT/OFFSET vs its own full result); OpusDB matched the consistent answer`);
   console.log(`  features: ${Object.entries(features).map(([k, v]) => `${k}=${v}`).join(' ')}`);
 }
 if (args.includes('--show-sqlite-bugs')) {
   for (const m of sqliteBugs.slice(0, 5)) {
     console.log('\n--- SQLITE INCONSISTENCY (seed ' + m.seed + ')');
     console.log(m.sql);
-    console.log('  opus / sqlite without indexes:', m.opus);
-    console.log('  sqlite with indexes          :', m.sqlite);
+    console.log('  opus = SQLite reference:', m.opus);
+    console.log('  sqlite (inconsistent)  :', m.sqlite);
   }
 }
 for (const m of mismatches.slice(0, verbose ? 50 : 8)) {

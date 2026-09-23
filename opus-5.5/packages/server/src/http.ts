@@ -155,6 +155,7 @@ export function startHttp(opts: HttpOptions): Promise<Server> {
     if (!ws) return;
     sockets.add(ws);
     const session = db.session();
+    session.profile = true; // results carry executed plans for the Studio
     log(`websocket session opened (${sockets.size} active)`);
     let queue = Promise.resolve();
     ws.on('message', (text) => {

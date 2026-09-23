@@ -64,6 +64,7 @@ export type Params = Value[] | Record<string, Value>;
 interface CompiledStatement {
   kind: 'select' | 'insert' | 'update' | 'delete';
   op: Operator;
+  instrumented?: boolean;
   ctx: ExecContext;
   columns: ColumnMeta[];
   cookie: number;
@@ -190,6 +191,8 @@ export class Session {
   readonly db: Database;
   inTransaction = false;
   timeoutMs: number | undefined;
+  /** Attach an instrumented plan (with actual row counts and timings) to every query result. */
+  profile = false;
   /** Set to true to abort the statement that is currently running. */
   private currentCtx: ExecContext | null = null;
 
@@ -366,6 +369,12 @@ export class Session {
   }
 
   runCompiled(c: CompiledStatement, params: Value[], sql: string, t0: number, analyze: boolean): QueryResult {
+    const profiling = this.profile && !analyze && !c.instrumented;
+    if (profiling) {
+      instrument(c.op);
+      c.instrumented = true;
+    }
+    if (c.instrumented) resetStats(c.op);
     const exec = () => {
       c.ctx.begin(params, this.timeoutMs);
       this.currentCtx = c.ctx;
@@ -389,7 +398,7 @@ export class Session {
       res.lastInsertRowid = op.lastInsertRowid;
     } else if (op instanceof UpdateOp || op instanceof DeleteOp) res.rowsAffected = op.rowsAffected;
     else res.rowsAffected = rows.length;
-    void analyze;
+    if (c.instrumented && !analyze) res.plan = toPlanNode(c.op, true);
     return res;
   }
 
@@ -401,6 +410,7 @@ export class Session {
     const compiled = this.compile(inner);
     if (stmt.analyze) {
       instrument(compiled.op);
+      compiled.instrumented = true;
       this.runCompiled(compiled, params, p.text, performance.now(), true);
     }
     const plan = toPlanNode(compiled.op, stmt.analyze);
@@ -539,6 +549,13 @@ export class PreparedStatement {
 }
 
 // ------------------------------------------------------------------ EXPLAIN rendering
+
+function resetStats(op: Operator): void {
+  op.statRows = 0;
+  op.statLoops = 0;
+  op.statTime = 0;
+  for (const c of op.children) resetStats(c);
+}
 
 export function toPlanNode(op: Operator, analyze: boolean): PlanNode {
   const children = op.children.map((c) => toPlanNode(c, analyze));

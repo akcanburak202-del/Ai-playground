@@ -268,7 +268,7 @@ class Gen {
     return { sql, scope };
   }
 
-  select(): { sql: string; ordered: boolean } {
+  select(): { sql: string; ordered: boolean; base?: string; limit?: number; offset?: number } {
     const { sql: from, scope } = this.from();
     const where = this.chance(0.75) ? ` WHERE ${this.bool(scope, this.int(1, 3))}` : '';
     const mode = this.int(0, 9);
@@ -345,8 +345,11 @@ class Gen {
     if (this.chance(0.35)) {
       this.feat('order-limit');
       const dirs = cols.map((_, i) => `${i + 1}${this.chance(0.4) ? ' DESC' : ''}`);
-      sql += ` ORDER BY ${dirs.join(', ')} LIMIT ${this.int(1, 8)}${this.chance(0.3) ? ` OFFSET ${this.int(1, 3)}` : ''}`;
-      return { sql, ordered: true };
+      const base = `${sql} ORDER BY ${dirs.join(', ')}`;
+      const limit = this.int(1, 8);
+      const offset = this.chance(0.3) ? this.int(1, 3) : 0;
+      sql = `${base} LIMIT ${limit}${offset ? ` OFFSET ${offset}` : ''}`;
+      return { sql, ordered: true, base, limit, offset };
     }
     return { sql, ordered: false };
   }
@@ -469,7 +472,7 @@ export function runFuzz(opts: FuzzOptions): FuzzStats {
       if (problems.length) mismatch(`integrity after ${sql}`, problems.join('; '), 'ok');
       continue;
     }
-    const { sql, ordered } = g.select();
+    const { sql, ordered, base, limit, offset } = g.select();
     stats.queries++;
     let a: Value[][] | null = null;
     let b: unknown[][] | null = null;
@@ -503,6 +506,15 @@ export function runFuzz(opts: FuzzOptions): FuzzStats {
       ref = liteRows(plain, sql);
     } catch {
       ref = null;
+    }
+    if (!(ref && sameRows(a, ref, ordered)) && base !== undefined) {
+      // second oracle: SQLite's full ordered result, with LIMIT/OFFSET applied here
+      try {
+        const full = liteRows(plain, base).slice(offset ?? 0, (offset ?? 0) + (limit ?? 0));
+        if (sameRows(a, full, true)) ref = full;
+      } catch {
+        // keep the first reference
+      }
     }
     if (ref && sameRows(a, ref, ordered) && !sameRows(b, ref, ordered)) {
       stats.agreed++;

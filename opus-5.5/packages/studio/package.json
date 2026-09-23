@@ -1,0 +1,25 @@
+{
+  "name": "@opusdb/studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpusDB Studio: SQL editor, query plans, B+tree lab, storage inspector and benchmarks in the browser",
+  "type": "module",
+  "scripts": {
+    "gen": "node scripts/gen-stats.ts",
+    "dev": "npm run gen && vite",
+    "build": "npm run gen && vite build && node scripts/inline.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@opusdb/engine": "0.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "vite": "^8.3.0"
+  }
+}

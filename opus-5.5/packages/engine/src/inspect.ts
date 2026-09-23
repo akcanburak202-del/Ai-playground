@@ -1,7 +1,7 @@
 import type { DataType, Value } from './types.ts';
 import { describeValue } from './types.ts';
 import type { Database } from './database.ts';
-import { PageType } from './storage/page.ts';
+import { encodePage, PageType } from './storage/page.ts';
 import type { FreePage, NodePage } from './storage/page.ts';
 import type { DumpNode } from './storage/btree.ts';
 import { exprToSql } from './sql/printer.ts';
@@ -200,6 +200,54 @@ export class Inspector {
       persistent: p.storage.persistent,
       description: p.storage.description,
     };
+  }
+
+  /** Pages visited when searching `key` in a table (rowid) or index (first column) b-tree. */
+  searchPath(name: string, key: Value): { path: number[]; found: boolean } | null {
+    const cat = this.db.catalog;
+    cat.refresh();
+    const t = cat.tables.get(name.toLowerCase());
+    const ix = cat.indexes.get(name.toLowerCase());
+    const tree = t ? cat.tableTree(t) : ix ? cat.indexTree(ix) : null;
+    if (!tree) return null;
+    const c = tree.cursor();
+    const probe = t ? Number(key) : [key];
+    const ok = c.seek(probe as never);
+    const path = ok ? c.path() : [];
+    if (!ok) {
+      // key is past the last entry: the search still walked the rightmost path
+      c.last();
+      path.push(...c.path());
+    }
+    const found = ok && tree.cmpPrefix(c.key(), probe as never) === 0;
+    return { path, found };
+  }
+
+  /** Raw bytes of a page as it would be written to disk, plus a short decoded summary. */
+  page(id: number): { id: number; bytes: Uint8Array; summary: Record<string, string | number> } | null {
+    const pager = this.db.pager;
+    if (id < 0 || id >= pager.header.pageCount) return null;
+    const p = id === 0 ? pager.header : pager.get(id);
+    const bytes = encodePage(p, pager.pageSize);
+    const summary: Record<string, string | number> = {};
+    switch (p.type) {
+      case PageType.header:
+        Object.assign(summary, { type: 'header', pageSize: p.pageSize, pageCount: p.pageCount, freePages: p.freeCount, catalogRoot: p.catalogRoot, schemaCookie: p.schemaCookie, changeCounter: p.changeCounter });
+        break;
+      case PageType.overflow:
+        Object.assign(summary, { type: 'overflow', next: p.next, bytes: p.data.length });
+        break;
+      case PageType.free:
+        Object.assign(summary, { type: 'free', next: p.next });
+        break;
+      default: {
+        const n = p as NodePage;
+        const names = { 1: 'table leaf', 2: 'table interior', 3: 'index leaf', 4: 'index interior' } as const;
+        Object.assign(summary, { type: names[n.type], entries: n.keys.length, used: n.size, free: pager.pageSize - n.size });
+        if (n.keys.length) summary.range = `${fmtKey(n.keys[0])} … ${fmtKey(n.keys[n.keys.length - 1])}`;
+      }
+    }
+    return { id, bytes, summary };
   }
 
   tableSql(name: string): string | undefined {

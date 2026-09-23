@@ -1,0 +1,365 @@
+{
+  "generatedAt": "2026-09-23T21:34:15.054Z",
+  "loc": {
+    "engine": 11318,
+    "engineTests": 1245,
+    "server": 887,
+    "serverTests": 120,
+    "studio": 4498,
+    "subsystems": [
+      {
+        "name": "sql",
+        "lines": 1726,
+        "files": 4
+      },
+      {
+        "name": "binder",
+        "lines": 1535,
+        "files": 3
+      },
+      {
+        "name": "planner",
+        "lines": 1208,
+        "files": 1
+      },
+      {
+        "name": "exec",
+        "lines": 3317,
+        "files": 6
+      },
+      {
+        "name": "btree",
+        "lines": 1829,
+        "files": 4
+      },
+      {
+        "name": "pager",
+        "lines": 490,
+        "files": 1
+      },
+      {
+        "name": "file",
+        "lines": 127,
+        "files": 2
+      },
+      {
+        "name": "api",
+        "lines": 1576,
+        "files": 6
+      }
+    ]
+  },
+  "tests": {
+    "engine": 33,
+    "server": 4
+  },
+  "runtimeDependencies": {
+    "engine": 0,
+    "server": 0
+  },
+  "benchMemory": {
+    "rows": 100000,
+    "file": false,
+    "node": "v22.22.2",
+    "sqlite": "3.51.2",
+    "results": [
+      {
+        "case": "Bulk insert 100,000 rows (1 transaction)",
+        "unit": "rows",
+        "opus": {
+          "ms": 389.5,
+          "perSec": 256730
+        },
+        "sqlite": {
+          "ms": 143.4,
+          "perSec": 697335
+        },
+        "ratio": 2.72
+      },
+      {
+        "case": "Create index on customer_id",
+        "unit": "rows",
+        "opus": {
+          "ms": 308,
+          "perSec": 324689
+        },
+        "sqlite": {
+          "ms": 36.7,
+          "perSec": 2724827
+        },
+        "ratio": 8.39
+      },
+      {
+        "case": "Point lookup by primary key",
+        "unit": "queries",
+        "opus": {
+          "ms": 115.4,
+          "perSec": 433241
+        },
+        "sqlite": {
+          "ms": 153,
+          "perSec": 326692
+        },
+        "ratio": 0.75
+      },
+      {
+        "case": "Secondary index lookup",
+        "unit": "queries",
+        "opus": {
+          "ms": 1309.9,
+          "perSec": 15269
+        },
+        "sqlite": {
+          "ms": 438.4,
+          "perSec": 45621
+        },
+        "ratio": 2.99
+      },
+      {
+        "case": "Range scan (rowid BETWEEN, ~100 rows each)",
+        "unit": "queries",
+        "opus": {
+          "ms": 143.1,
+          "perSec": 34930
+        },
+        "sqlite": {
+          "ms": 61.5,
+          "perSec": 81263
+        },
+        "ratio": 2.33
+      },
+      {
+        "case": "Full scan + GROUP BY (x10)",
+        "unit": "rows",
+        "opus": {
+          "ms": 518.2,
+          "perSec": 1929873
+        },
+        "sqlite": {
+          "ms": 393.4,
+          "perSec": 2542253
+        },
+        "ratio": 1.32
+      },
+      {
+        "case": "ORDER BY amount DESC LIMIT 10 (x10)",
+        "unit": "rows",
+        "opus": {
+          "ms": 168,
+          "perSec": 5953700
+        },
+        "sqlite": {
+          "ms": 51.9,
+          "perSec": 19274245
+        },
+        "ratio": 3.24
+      },
+      {
+        "case": "Join + aggregate (orders x customers)",
+        "unit": "rows",
+        "opus": {
+          "ms": 64.6,
+          "perSec": 1548009
+        },
+        "sqlite": {
+          "ms": 16.9,
+          "perSec": 5932816
+        },
+        "ratio": 3.83
+      },
+      {
+        "case": "UPDATE via index (5,000 statements)",
+        "unit": "statements",
+        "opus": {
+          "ms": 65.5,
+          "perSec": 76303
+        },
+        "sqlite": {
+          "ms": 13.3,
+          "perSec": 376038
+        },
+        "ratio": 4.93
+      },
+      {
+        "case": "Autocommit inserts (2,000 transactions)",
+        "unit": "txns",
+        "opus": {
+          "ms": 56.7,
+          "perSec": 35288
+        },
+        "sqlite": {
+          "ms": 3.8,
+          "perSec": 525186
+        },
+        "ratio": 14.88
+      }
+    ]
+  },
+  "benchFile": {
+    "rows": 100000,
+    "file": true,
+    "node": "v22.22.2",
+    "sqlite": "3.51.2",
+    "results": [
+      {
+        "case": "Bulk insert 100,000 rows (1 transaction)",
+        "unit": "rows",
+        "opus": {
+          "ms": 393.1,
+          "perSec": 254408
+        },
+        "sqlite": {
+          "ms": 150.1,
+          "perSec": 666303
+        },
+        "ratio": 2.62
+      },
+      {
+        "case": "Create index on customer_id",
+        "unit": "rows",
+        "opus": {
+          "ms": 307.3,
+          "perSec": 325393
+        },
+        "sqlite": {
+          "ms": 53.9,
+          "perSec": 1855511
+        },
+        "ratio": 5.7
+      },
+      {
+        "case": "Point lookup by primary key",
+        "unit": "queries",
+        "opus": {
+          "ms": 133.9,
+          "perSec": 373339
+        },
+        "sqlite": {
+          "ms": 233.7,
+          "perSec": 213940
+        },
+        "ratio": 0.57
+      },
+      {
+        "case": "Secondary index lookup",
+        "unit": "queries",
+        "opus": {
+          "ms": 1464.6,
+          "perSec": 13655
+        },
+        "sqlite": {
+          "ms": 913.4,
+          "perSec": 21895
+        },
+        "ratio": 1.6
+      },
+      {
+        "case": "Range scan (rowid BETWEEN, ~100 rows each)",
+        "unit": "queries",
+        "opus": {
+          "ms": 125,
+          "perSec": 39998
+        },
+        "sqlite": {
+          "ms": 52.9,
+          "perSec": 94520
+        },
+        "ratio": 2.36
+      },
+      {
+        "case": "Full scan + GROUP BY (x10)",
+        "unit": "rows",
+        "opus": {
+          "ms": 502.2,
+          "perSec": 1991113
+        },
+        "sqlite": {
+          "ms": 383.4,
+          "perSec": 2608126
+        },
+        "ratio": 1.31
+      },
+      {
+        "case": "ORDER BY amount DESC LIMIT 10 (x10)",
+        "unit": "rows",
+        "opus": {
+          "ms": 165.6,
+          "perSec": 6040264
+        },
+        "sqlite": {
+          "ms": 53.1,
+          "perSec": 18829135
+        },
+        "ratio": 3.12
+      },
+      {
+        "case": "Join + aggregate (orders x customers)",
+        "unit": "rows",
+        "opus": {
+          "ms": 64.3,
+          "perSec": 1556320
+        },
+        "sqlite": {
+          "ms": 18.2,
+          "perSec": 5509292
+        },
+        "ratio": 3.54
+      },
+      {
+        "case": "UPDATE via index (5,000 statements)",
+        "unit": "statements",
+        "opus": {
+          "ms": 90.8,
+          "perSec": 55051
+        },
+        "sqlite": {
+          "ms": 16.6,
+          "perSec": 301450
+        },
+        "ratio": 5.48
+      },
+      {
+        "case": "Autocommit inserts (2,000 transactions)",
+        "unit": "txns",
+        "opus": {
+          "ms": 47.1,
+          "perSec": 42451
+        },
+        "sqlite": {
+          "ms": 32.2,
+          "perSec": 62042
+        },
+        "ratio": 1.46
+      }
+    ]
+  },
+  "fuzz": {
+    "seeds": 200,
+    "queries": 72000,
+    "compared": 70650,
+    "agreed": 70650,
+    "bothErrored": 1350,
+    "mismatches": 0,
+    "sqliteInconsistencies": 12,
+    "agreement": 1,
+    "rowsCompared": 3795330,
+    "seconds": 151.3,
+    "features": {
+      "inner-join": 23889,
+      "scalar-subquery": 5487,
+      "distinct": 7369,
+      "cross-join": 23904,
+      "left-join": 11920,
+      "aggregate": 21714,
+      "window": 7093,
+      "compound": 7207,
+      "update": 2630,
+      "subquery-in": 6406,
+      "order-limit": 12666,
+      "subquery-exists": 6216,
+      "insert": 2669,
+      "having": 4333,
+      "delete": 2701
+    }
+  }
+}

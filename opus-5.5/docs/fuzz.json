@@ -1,0 +1,29 @@
+{
+  "seeds": 200,
+  "queries": 72000,
+  "compared": 70650,
+  "agreed": 70650,
+  "bothErrored": 1350,
+  "mismatches": 0,
+  "sqliteInconsistencies": 12,
+  "agreement": 1,
+  "rowsCompared": 3795330,
+  "seconds": 151.3,
+  "features": {
+    "inner-join": 23889,
+    "scalar-subquery": 5487,
+    "distinct": 7369,
+    "cross-join": 23904,
+    "left-join": 11920,
+    "aggregate": 21714,
+    "window": 7093,
+    "compound": 7207,
+    "update": 2630,
+    "subquery-in": 6406,
+    "order-limit": 12666,
+    "subquery-exists": 6216,
+    "insert": 2669,
+    "having": 4333,
+    "delete": 2701
+  }
+}
