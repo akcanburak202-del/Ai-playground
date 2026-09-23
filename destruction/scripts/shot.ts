@@ -18,7 +18,7 @@
  */
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -44,7 +44,9 @@ const [w, h] = (flag('size') ?? '1280x720').split('x').map(Number) as [number, n
 const timeout = Number(flag('timeout') ?? 180) * 1000;
 const scenarioPath = flag('scenario');
 
-const server = await createServer({ root, logLevel: 'error', server: { port: 0, host: '127.0.0.1' } });
+// A private dep-optimizer cache per run, so several screenshot runs can work side by side.
+const cacheDir = resolve(root, `node_modules/.vite-shot-${process.pid}`);
+const server = await createServer({ root, cacheDir, logLevel: 'error', server: { port: 0, host: '127.0.0.1', hmr: false } });
 await server.listen();
 const addr = server.httpServer!.address();
 const port = typeof addr === 'object' && addr ? addr.port : 5173;
@@ -95,5 +97,6 @@ try {
 } finally {
   await browser.close();
   await server.close();
+  rmSync(cacheDir, { recursive: true, force: true });
 }
 process.exit(failed ? 1 : 0);
