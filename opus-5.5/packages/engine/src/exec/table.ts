@@ -2,7 +2,7 @@ import type { DataType, Row, Value } from '../types.ts';
 import { ErrorCode, OpusError, describeValue, hashKey } from '../types.ts';
 import type { Catalog, IndexSchema, TableSchema } from '../catalog.ts';
 import type { BTree } from '../storage/btree.ts';
-import { ByteReader, encodeRecord } from '../storage/codec.ts';
+import { decodeRow, encodeRecord } from '../storage/codec.ts';
 import type { Pager } from '../storage/pager.ts';
 import type { Compiled } from './expr.ts';
 import { truth } from './expr.ts';
@@ -25,22 +25,14 @@ export class TableAccess {
     this.pad = schema.columns.map((c) => (c.default && c.default.type === 'literal' ? castValue(c.default.value, c.type) : null));
   }
 
-  /** Decodes a record into [col0, ..., colN-1, rowid]. */
-  decode(payload: Uint8Array, rowid: number): Row {
-    const r = new ByteReader(payload);
-    const stored = r.varint();
-    const n = this.ncols;
-    const row = new Array<Value>(n + 1);
-    const m = stored < n ? stored : n;
-    for (let i = 0; i < m; i++) row[i] = r.value();
-    for (let i = m; i < n; i++) row[i] = this.pad[i];
-    row[n] = rowid;
-    return row;
+  /** Decodes a record into [col0, ..., colN-1, rowid]; `need` limits which columns are materialised. */
+  decode(payload: Uint8Array, rowid: number, need?: Uint8Array): Row {
+    return decodeRow(payload, this.ncols, this.pad, rowid, need);
   }
 
-  get(rowid: number): Row | undefined {
+  get(rowid: number, need?: Uint8Array): Row | undefined {
     const p = this.tree.get(rowid);
-    return p ? this.decode(p, rowid) : undefined;
+    return p ? decodeRow(p, this.ncols, this.pad, rowid, need) : undefined;
   }
 }
 

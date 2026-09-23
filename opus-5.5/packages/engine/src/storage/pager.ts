@@ -1,6 +1,6 @@
 import { ErrorCode, OpusError } from '../types.ts';
 import type { StorageFile, StorageProvider } from './file.ts';
-import { decodePage, encodePage, PageType } from './page.ts';
+import { clonePage, decodePage, encodePage, PageType } from './page.ts';
 import type { HeaderPage, Page } from './page.ts';
 
 /**
@@ -64,9 +64,20 @@ export interface WalInfo {
   commitsSinceCheckpoint: number;
 }
 
+const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** SQLite-style cumulative checksum over 32-bit little-endian words. */
 function checksum(data: Uint8Array, s0: number, s1: number): [number, number] {
-  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const n = data.byteLength & ~7;
+  if (LITTLE_ENDIAN && (data.byteOffset & 3) === 0) {
+    const w = new Uint32Array(data.buffer, data.byteOffset, n >>> 2);
+    for (let i = 0; i < w.length; i += 2) {
+      s0 = (s0 + w[i] + s1) >>> 0;
+      s1 = (s1 + w[i + 1] + s0) >>> 0;
+    }
+    return [s0, s1];
+  }
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   for (let i = 0; i < n; i += 8) {
     s0 = (s0 + dv.getUint32(i, true) + s1) >>> 0;
     s1 = (s1 + dv.getUint32(i + 4, true) + s0) >>> 0;
@@ -118,7 +129,7 @@ export class Pager {
   private committed: HeaderPage;
   private headerDirty = false;
 
-  private stmtUndo: Map<number, Uint8Array | null> | null = null;
+  private stmtUndo: Map<number, Page | null> | null = null;
   private stmtHeader: HeaderPage | null = null;
   private stmtHeaderDirty = false;
 
@@ -313,7 +324,8 @@ export class Pager {
 
   private recordUndo(id: number, e: Entry | undefined): void {
     if (this.stmtUndo && !this.stmtUndo.has(id)) {
-      this.stmtUndo.set(id, e && e.dirty ? encodePage(e.page, this.pageSize) : null);
+      // shallow clone: node arrays are copied, payloads and keys are immutable
+      this.stmtUndo.set(id, e && e.dirty ? clonePage(e.page) : null);
     }
   }
 
@@ -405,7 +417,7 @@ export class Pager {
         }
         this.dirty.delete(id);
       } else {
-        const page = decodePage(before, id);
+        const page = before;
         if (e) e.page = page;
         else this.cache.set(id, { page, dirty: true, ref: true });
         this.dirty.add(id);
@@ -424,31 +436,51 @@ export class Pager {
     this.stmtUndo = null;
     this.stmtHeader = null;
     if (!this.hasChanges) return;
-    this.header.changeCounter = (this.header.changeCounter + 1) >>> 0;
-    this.headerDirty = true;
+    // The header page is only rewritten when its fields changed; the commit
+    // marker goes on the last frame of the transaction either way.
+    const withHeader = this.headerDirty;
+    if (withHeader) this.header.changeCounter = (this.header.changeCounter + 1) >>> 0;
 
     const ids = [...this.dirty].sort((a, b) => a - b);
     const frameSize = FRAME_HEADER_SIZE + this.pageSize;
-    const nFrames = ids.length + 1;
+    const nFrames = ids.length + (withHeader ? 1 : 0);
     const buf = new Uint8Array(nFrames * frameSize);
-    const dv = new DataView(buf.buffer);
+    const words = new Uint32Array(buf.buffer);
+    const put32 = (at: number, v: number) => {
+      buf[at] = v & 0xff;
+      buf[at + 1] = (v >>> 8) & 0xff;
+      buf[at + 2] = (v >>> 16) & 0xff;
+      buf[at + 3] = (v >>> 24) & 0xff;
+    };
     let s0 = this.ck0;
     let s1 = this.ck1;
     const offsets: [number, number][] = [];
     for (let f = 0; f < nFrames; f++) {
-      // header page goes last and carries the commit marker
+      // the header page (when written) goes last
       const id = f < ids.length ? ids[f] : 0;
       const page = id === 0 ? this.header : this.cache.get(id)!.page;
       const base = f * frameSize;
-      buf.set(encodePage(page, this.pageSize), base + FRAME_HEADER_SIZE);
-      dv.setUint32(base, id, true);
-      dv.setUint32(base + 4, f === nFrames - 1 ? this.header.pageCount : 0, true);
-      dv.setUint32(base + 8, this.salt1, true);
-      dv.setUint32(base + 12, this.salt2, true);
-      [s0, s1] = checksum(buf.subarray(base, base + 8), s0, s1);
-      [s0, s1] = checksum(buf.subarray(base + FRAME_HEADER_SIZE, base + frameSize), s0, s1);
-      dv.setUint32(base + 16, s0, true);
-      dv.setUint32(base + 20, s1, true);
+      encodePage(page, this.pageSize, buf, base + FRAME_HEADER_SIZE);
+      put32(base, id);
+      put32(base + 4, f === nFrames - 1 ? this.header.pageCount : 0);
+      put32(base + 8, this.salt1);
+      put32(base + 12, this.salt2);
+      if (LITTLE_ENDIAN) {
+        // checksum over the first 8 header bytes and the page, straight from the word view
+        const w0 = base >>> 2;
+        s0 = (s0 + words[w0] + s1) >>> 0;
+        s1 = (s1 + words[w0 + 1] + s0) >>> 0;
+        const end = (base + frameSize) >>> 2;
+        for (let i = (base + FRAME_HEADER_SIZE) >>> 2; i < end; i += 2) {
+          s0 = (s0 + words[i] + s1) >>> 0;
+          s1 = (s1 + words[i + 1] + s0) >>> 0;
+        }
+      } else {
+        [s0, s1] = checksum(buf.subarray(base, base + 8), s0, s1);
+        [s0, s1] = checksum(buf.subarray(base + FRAME_HEADER_SIZE, base + frameSize), s0, s1);
+      }
+      put32(base + 16, s0);
+      put32(base + 20, s1);
       offsets.push([id, this.walEnd + base + FRAME_HEADER_SIZE]);
     }
     try {

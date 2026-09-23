@@ -66,6 +66,8 @@ export function instrument(op: Operator): void {
 
 export class SeqScan extends Operator {
   readonly name = 'Seq Scan';
+  /** Columns to materialise (undefined = all). */
+  need?: Uint8Array;
   private readonly access: TableAccess;
   private readonly filter?: Compiled;
   private readonly reverse: boolean;
@@ -87,7 +89,7 @@ export class SeqScan extends Operator {
     const filter = this.filter;
     const ctx = this.ctx;
     while (this.ok) {
-      const row = this.access.decode(c.payload(), c.rowid());
+      const row = this.access.decode(c.payload(), c.rowid(), this.need);
       this.ok = this.reverse ? c.prev() : c.next();
       ctx.tick();
       ctx.rowsScanned++;
@@ -114,6 +116,7 @@ function rowidProbe(v: Value): number | undefined {
 /** Lookup by rowid (INTEGER PRIMARY KEY): point lookups or a key range. */
 export class RowidScan extends Operator {
   readonly name: string;
+  need?: Uint8Array;
   private readonly access: TableAccess;
   private readonly keys?: Compiled[];
   private readonly lo?: Bound;
@@ -179,7 +182,7 @@ export class RowidScan extends Operator {
     if (this.keys) {
       while (this.pending.length) {
         const id = this.pending.shift()!;
-        const row = this.access.get(id);
+        const row = this.access.get(id, this.need);
         this.ctx.rowsScanned++;
         if (row && (!filter || truth(filter(row)) === true)) return row;
       }
@@ -192,7 +195,7 @@ export class RowidScan extends Operator {
         this.ok = false;
         return null;
       }
-      const row = this.access.decode(c.payload(), rowid);
+      const row = this.access.decode(c.payload(), rowid, this.need);
       this.ok = this.reverse ? c.prev() : c.next();
       this.ctx.tick();
       this.ctx.rowsScanned++;
@@ -216,6 +219,7 @@ export interface IndexScanSpec {
 
 export class IndexScan extends Operator {
   readonly name: string;
+  need?: Uint8Array;
   private readonly access: TableAccess;
   readonly index: IndexSchema;
   private readonly itree: BTree;
@@ -342,7 +346,7 @@ export class IndexScan extends Operator {
         row[n] = rowid;
         if (this.access.rowidCol >= 0) row[this.access.rowidCol] = rowid;
       } else {
-        row = this.access.get(rowid);
+        row = this.access.get(rowid, this.need);
         if (!row) throw new OpusError(ErrorCode.corrupt, `index ${this.index.name} points to missing row ${rowid}`);
       }
       if (!filter || truth(filter(row)) === true) return row;
@@ -834,6 +838,19 @@ export class HashAggregate extends Operator {
     const input = this.children[0];
     const groups = this.groups;
     const aggs = this.aggs;
+    if (groups.length === 0) {
+      // plain aggregate: one group, no hashing
+      const states = aggs.map(createAggState);
+      input.open();
+      for (let r = input.next(); r; r = input.next()) {
+        this.ctx.tick();
+        for (let i = 0; i < aggs.length; i++) stepAgg(aggs[i], states[i], r);
+      }
+      input.close();
+      this.out = [states.map((s) => s.final())];
+      this.i = 0;
+      return;
+    }
     const map = new Map<unknown, { vals: Value[]; states: AggState[] }>();
     input.open();
     const single = groups.length === 1;
@@ -965,16 +982,24 @@ export class TopN extends Operator {
     };
     input.open();
     let seq = 0;
+    const keys = this.keys;
+    const nk = keys.length;
+    const probe: Value[] = new Array(nk);
     for (let r = input.next(); r; r = input.next()) {
       this.ctx.tick();
-      const item = { row: r, key: this.keys.map((k) => k(r)), seq: seq++ };
-      if (heap.length < n) {
-        heap.push(item);
-        up(heap.length - 1);
-      } else if (worse(heap[0], item)) {
-        heap[0] = item;
+      if (heap.length >= n) {
+        // cheap rejection before allocating: compare against the current worst row
+        for (let i = 0; i < nk; i++) probe[i] = keys[i](r);
+        if (cmp(probe, heap[0].key) >= 0) {
+          seq++;
+          continue;
+        }
+        heap[0] = { row: r, key: probe.slice(), seq: seq++ };
         down(0);
+        continue;
       }
+      heap.push({ row: r, key: keys.map((k) => k(r)), seq: seq++ });
+      up(heap.length - 1);
     }
     input.close();
     heap.sort((a, b) => cmp(a.key, b.key) || a.seq - b.seq);

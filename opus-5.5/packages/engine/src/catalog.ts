@@ -6,7 +6,7 @@ import { ErrorCode, OpusError } from './types.ts';
 import type { Pager } from './storage/pager.ts';
 import { BTree } from './storage/btree.ts';
 import type { BTreeOptions, TreeEvent } from './storage/btree.ts';
-import { decodeRecord, encodeRecord } from './storage/codec.ts';
+import { decodeRecord, decodeRow, encodeRecord } from './storage/codec.ts';
 
 /**
  * The system catalog lives in an ordinary table b-tree rooted at the page
@@ -40,6 +40,8 @@ export interface IndexSchema {
   auto: boolean;
   catalogRowid: number;
   tree?: BTree;
+  /** Distinct values of the leading column, sampled lazily by the planner. */
+  ndvCache?: { rows: number; value: number };
 }
 
 export interface TableStats {
@@ -238,21 +240,27 @@ export class Catalog {
   private createIndexInternal(table: TableSchema, name: string, columns: number[], desc: boolean[], unique: boolean, auto: boolean): IndexSchema {
     const ix: IndexSchema = { name, table: table.name, columns, desc, unique, root: BTree.create(this.pager, 'index'), auto, catalogRowid: 0 };
     ix.catalogRowid = this.catalogInsert('index', name, table.name, ix.root, indexToSql(ix, table));
-    // populate from existing rows
+    // populate from existing rows: collect, sort, then append in key order
+    // (sorted appends keep the right edge hot and pack pages densely)
     const tree = this.tableTree(table);
     const itree = this.indexTree(ix);
+    const keys: Value[][] = [];
     const c = tree.cursor();
+    const ncols = table.columns.length;
+    const pad = table.columns.map(() => null);
     for (let ok = c.first(); ok; ok = c.next()) {
-      const row = decodeRecord(c.payload());
+      const row = decodeRow(c.payload(), ncols, pad, 0);
       const key: Value[] = columns.map((i) => (i < row.length ? row[i] : null));
-      if (unique && !key.some((v) => v === null)) {
-        const probe = itree.cursor();
-        if (probe.seek(key) && itree.cmpPrefix(probe.key(), key) === 0) {
-          throw new OpusError(ErrorCode.uniqueViolation, `could not create unique index "${name}": duplicate key (${columns.map((i) => table.columns[i].name).join(', ')})`);
-        }
-      }
       key.push(c.rowid());
-      itree.insert(key);
+      keys.push(key);
+    }
+    keys.sort((a, b) => itree.cmp(a, b));
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (unique && i > 0 && !k.slice(0, -1).some((v) => v === null) && itree.cmpPrefix(keys[i - 1], k.slice(0, -1)) === 0) {
+        throw new OpusError(ErrorCode.uniqueViolation, `could not create unique index "${name}": duplicate key (${columns.map((j) => table.columns[j].name).join(', ')})`);
+      }
+      itree.insert(k);
     }
     table.indexes.push(ix);
     this.indexes.set(lower(name), ix);

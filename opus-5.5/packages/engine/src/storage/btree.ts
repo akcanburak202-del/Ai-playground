@@ -220,11 +220,31 @@ export class BTree {
 
   /** Returns the payload stored under a rowid (table trees). */
   get(key: number): Uint8Array | undefined {
-    let node = this.pager.get(this.root) as NodePage;
-    while (!isLeaf(node)) node = this.pager.get(node.children[this.search(node.keys, key, true, false)]) as NodePage;
-    const leaf = node as TableLeafPage;
-    const i = this.search(leaf.keys, key, false, false);
-    if (i < leaf.keys.length && leaf.keys[i] === key) return this.readCell(leaf.cells[i]);
+    const pager = this.pager;
+    let node = pager.get(this.root) as TableLeafPage | TableInteriorPage;
+    while (node.type === PageType.tableInterior) {
+      const keys = node.keys;
+      let lo = 0;
+      let hi = keys.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (keys[mid] <= key) lo = mid + 1;
+        else hi = mid;
+      }
+      node = pager.get(node.children[lo]) as TableLeafPage | TableInteriorPage;
+    }
+    const keys = node.keys;
+    let lo = 0;
+    let hi = keys.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (keys[mid] < key) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < keys.length && keys[lo] === key) {
+      const c = node.cells[lo];
+      return c instanceof Uint8Array ? c : this.readCell(c);
+    }
     return undefined;
   }
 
@@ -829,7 +849,8 @@ export class Cursor {
 
   payload(): Uint8Array {
     const top = this.stack[this.stack.length - 1];
-    return this.tree.readCell((top.node as TableLeafPage).cells[top.idx]);
+    const c = (top.node as TableLeafPage).cells[top.idx];
+    return c instanceof Uint8Array ? c : this.tree.readCell(c);
   }
 
   /** Page numbers along the current root-to-leaf path (for visualising searches). */

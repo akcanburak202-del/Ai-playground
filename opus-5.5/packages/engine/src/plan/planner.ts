@@ -166,12 +166,37 @@ export class Planner {
     return Math.max(1, this.handle(t).rowCount());
   }
 
+  /**
+   * Estimated number of distinct values in a column: ANALYZE statistics when
+   * present, exact for unique keys, counted from an index whose leading column
+   * it is (cached), otherwise a heuristic that grows sub-linearly with size.
+   */
   private ndv(t: TableSchema, col: number): number {
     const rows = this.tableRows(t);
     if (col === -1 || col === t.rowidCol) return rows;
     if (t.stats) return Math.max(1, t.stats.ndv[col]);
     if (t.indexes.some((ix) => ix.unique && ix.columns.length === 1 && ix.columns[0] === col)) return rows;
-    return Math.max(1, rows * DEFAULT_EQ_SEL);
+    const ix = t.indexes.find((i) => i.columns[0] === col);
+    if (ix) return this.indexNdv(ix, rows);
+    return Math.max(1, Math.min(rows / 2, 10 + Math.sqrt(rows)));
+  }
+
+  private indexNdv(ix: IndexSchema, rows: number): number {
+    const c = ix.ndvCache;
+    if (c && Math.abs(c.rows - rows) <= c.rows * 0.2) return c.value;
+    const tree = this.catalog.indexTree(ix);
+    const cur = tree.cursor();
+    let n = 0;
+    let prev: Value | undefined;
+    let first = true;
+    for (let ok = cur.first(); ok; ok = cur.next()) {
+      const v = (cur.key() as Value[])[0];
+      if (first || v !== prev) n++;
+      prev = v;
+      first = false;
+    }
+    ix.ndvCache = { rows, value: Math.max(1, n) };
+    return ix.ndvCache.value;
   }
 
   /** Rough selectivity of a predicate (0..1). */
@@ -729,6 +754,17 @@ export class Planner {
       }
     }
     op.layout = layout;
+    if (this.used && !this.noCovering) {
+      // materialise only the columns the statement actually references
+      const n = scan.cols.length - 1;
+      const need = new Uint8Array(n);
+      let all = true;
+      for (let i = 0; i < n; i++) {
+        need[i] = this.used.has(scan.cols[i].id) ? 1 : 0;
+        if (!need[i]) all = false;
+      }
+      if (!all) (op as SeqScan | RowidScan | IndexScan).need = need;
+    }
     if (filterExpr) op.details.push(`Filter: ${showExpr(filterExpr)}`);
     return this.est(op, plan.rows, plan.cost);
   }

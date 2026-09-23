@@ -72,29 +72,38 @@ export function recordSize(values: readonly Value[]): number {
   return size;
 }
 
+const wf64 = new Float64Array(1);
+const wf64bytes = new Uint8Array(wf64.buffer);
+const WRITER_LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** Little-endian binary writer (no DataView: this sits on the hot commit path). */
 export class ByteWriter {
   buf: Uint8Array;
-  view: DataView;
   pos = 0;
   constructor(buf: Uint8Array, pos = 0) {
     this.buf = buf;
-    this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     this.pos = pos;
   }
   u8(v: number): void {
     this.buf[this.pos++] = v;
   }
   u16(v: number): void {
-    this.view.setUint16(this.pos, v, true);
-    this.pos += 2;
+    const b = this.buf;
+    b[this.pos++] = v & 0xff;
+    b[this.pos++] = (v >>> 8) & 0xff;
   }
   u32(v: number): void {
-    this.view.setUint32(this.pos, v, true);
-    this.pos += 4;
+    const b = this.buf;
+    b[this.pos++] = v & 0xff;
+    b[this.pos++] = (v >>> 8) & 0xff;
+    b[this.pos++] = (v >>> 16) & 0xff;
+    b[this.pos++] = (v >>> 24) & 0xff;
   }
   f64(v: number): void {
-    this.view.setFloat64(this.pos, v, true);
-    this.pos += 8;
+    wf64[0] = v;
+    const b = this.buf;
+    if (WRITER_LE) for (let i = 0; i < 8; i++) b[this.pos++] = wf64bytes[i];
+    else for (let i = 7; i >= 0; i--) b[this.pos++] = wf64bytes[i];
   }
   varint(n: number): void {
     while (n >= 0x80) {
@@ -148,15 +157,13 @@ export class ByteWriter {
       const size = numberTagSize(v);
       if (size === 2) {
         this.u8(TAG_I8);
-        this.view.setInt8(this.pos++, v);
+        this.u8(v & 0xff);
       } else if (size === 3) {
         this.u8(TAG_I16);
-        this.view.setInt16(this.pos, v, true);
-        this.pos += 2;
+        this.u16(v & 0xffff);
       } else if (size === 5) {
         this.u8(TAG_I32);
-        this.view.setInt32(this.pos, v, true);
-        this.pos += 4;
+        this.u32(v >>> 0);
       } else {
         this.u8(TAG_F64);
         this.f64(v);
@@ -275,4 +282,102 @@ export function encodeRecord(values: readonly Value[]): Uint8Array {
 
 export function decodeRecord(buf: Uint8Array): Value[] {
   return new ByteReader(buf).record();
+}
+
+// ------------------------------------------------------------------ fast row decoding
+
+const f64 = new Float64Array(1);
+const f64bytes = new Uint8Array(f64.buffer);
+const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+let P = 0;
+
+function readText(buf: Uint8Array, n: number): string {
+  const start = P;
+  const end = start + n;
+  P = end;
+  if (n > 48) return textDecoder.decode(buf.subarray(start, end));
+  let s = '';
+  for (let i = start; i < end; i++) {
+    const c = buf[i];
+    if (c >= 0x80) return textDecoder.decode(buf.subarray(start, end));
+    s += String.fromCharCode(c);
+  }
+  return s;
+}
+
+function readVarint(buf: Uint8Array): number {
+  let b = buf[P++];
+  if (b < 0x80) return b;
+  let result = b & 0x7f;
+  let mul = 128;
+  for (;;) {
+    b = buf[P++];
+    result += (b & 0x7f) * mul;
+    if (b < 0x80) return result;
+    mul *= 128;
+  }
+}
+
+/** Reads (or, when `skip` is set, steps over) one value at position P. */
+function readValue(buf: Uint8Array, skip: boolean): Value {
+  const tag = buf[P++];
+  switch (tag) {
+    case TAG_NULL:
+      return null;
+    case TAG_FALSE:
+      return false;
+    case TAG_TRUE:
+      return true;
+    case TAG_I8: {
+      const v = buf[P++];
+      return v > 127 ? v - 256 : v;
+    }
+    case TAG_I16: {
+      const v = buf[P] | (buf[P + 1] << 8);
+      P += 2;
+      return v > 32767 ? v - 65536 : v;
+    }
+    case TAG_I32: {
+      const v = buf[P] | (buf[P + 1] << 8) | (buf[P + 2] << 16) | (buf[P + 3] << 24);
+      P += 4;
+      return v;
+    }
+    case TAG_F64: {
+      if (skip) {
+        P += 8;
+        return null;
+      }
+      if (littleEndian) for (let i = 0; i < 8; i++) f64bytes[i] = buf[P + i];
+      else for (let i = 0; i < 8; i++) f64bytes[7 - i] = buf[P + i];
+      P += 8;
+      return f64[0];
+    }
+    case TAG_TEXT: {
+      const n = readVarint(buf);
+      if (skip) {
+        P += n;
+        return null;
+      }
+      return readText(buf, n);
+    }
+    default:
+      throw new Error(`corrupt record: unknown value tag ${tag} at ${P - 1}`);
+  }
+}
+
+/**
+ * Decodes a table record into a row array of `ncols` columns followed by the
+ * rowid. Columns missing from old records take `pad` values; columns whose
+ * `need` flag is 0 are skipped (left NULL) to avoid building unused strings.
+ */
+export function decodeRow(buf: Uint8Array, ncols: number, pad: readonly Value[], rowid: number, need?: Uint8Array): Value[] {
+  P = 0;
+  const stored = readVarint(buf);
+  const row = new Array<Value>(ncols + 1);
+  const m = stored < ncols ? stored : ncols;
+  if (need) for (let i = 0; i < m; i++) row[i] = readValue(buf, need[i] === 0);
+  else for (let i = 0; i < m; i++) row[i] = readValue(buf, false);
+  for (let i = m; i < ncols; i++) row[i] = pad[i];
+  row[ncols] = rowid;
+  return row;
 }

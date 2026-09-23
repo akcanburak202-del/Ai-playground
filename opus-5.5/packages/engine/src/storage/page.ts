@@ -133,9 +133,9 @@ export function computeNodeSize(p: NodePage): number {
   }
 }
 
-export function encodePage(page: Page, pageSize: number): Uint8Array {
-  const buf = new Uint8Array(pageSize);
-  const w = new ByteWriter(buf);
+export function encodePage(page: Page, pageSize: number, target?: Uint8Array, offset = 0): Uint8Array {
+  const buf = target ?? new Uint8Array(pageSize);
+  const w = new ByteWriter(buf, offset);
   switch (page.type) {
     case PageType.header:
       for (let i = 0; i < MAGIC.length; i++) w.u8(MAGIC.charCodeAt(i));
@@ -200,7 +200,7 @@ export function encodePage(page: Page, pageSize: number): Uint8Array {
       w.u32(page.next);
       break;
   }
-  if (w.pos > pageSize) throw new OpusError(ErrorCode.internal, `page overflow while encoding (${w.pos} > ${pageSize})`);
+  if (w.pos - offset > pageSize) throw new OpusError(ErrorCode.internal, `page overflow while encoding (${w.pos - offset} > ${pageSize})`);
   return buf;
 }
 
