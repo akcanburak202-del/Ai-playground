@@ -8,6 +8,7 @@ import { rayBoxEntry, type Destructible, type RayHit } from './Destructible.ts';
 export class DestructibleRegistry {
   private items: Destructible[] = [];
   private byId = new Map<number, Destructible>();
+  private scratch = new THREE.Box3();
 
   add(d: Destructible): void {
     if (this.byId.has(d.id)) return;
@@ -40,9 +41,13 @@ export class DestructibleRegistry {
   raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, ignore?: Destructible, radius?: number): RayHit | null {
     let best: RayHit | null = null;
     let bestDist = maxDist;
+    const grow = radius && radius > 0 ? radius : 0;
     for (const d of this.items) {
       if (d.disposed || d === ignore) continue;
-      const entry = rayBoxEntry(d.bounds, origin, dir, bestDist);
+      // A fat round can clip an object whose box its centre line misses.
+      let box = d.bounds;
+      if (grow > 0) box = this.scratch.copy(d.bounds).expandByScalar(grow);
+      const entry = rayBoxEntry(box, origin, dir, bestDist);
       if (entry === Infinity || entry > bestDist) continue;
       const hit = d.raycast(origin, dir, bestDist, radius);
       if (hit && hit.distance <= bestDist) {
