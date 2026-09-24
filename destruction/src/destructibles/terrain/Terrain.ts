@@ -207,10 +207,11 @@ export class Terrain implements Destructible {
         this.tiles.push({ i0: ti * TILE, j0: tj * TILE, mesh, collider: null, dirty: false, lod: 0, scarred: false });
       }
     }
-    // The ring reaches 2 m under the detailed field (just below it) so the long shared edge can
-    // never open pixel cracks (T-junctions against the 0.25 m grid).
-    this.far = new THREE.Mesh(farRing(half - 2, 2000), this.material);
-    this.far.position.y = -0.08;
+    // The ring reaches 2 m under the detailed field (whose last 2 m are exactly flat at 0), dipping
+    // to 8 cm below it there, so the long shared edge can never open pixel cracks (T-junctions
+    // against the 0.25 m grid); from the field's edge outwards it lies at y = 0 — the plane the far
+    // field's ray cast and physics slabs use, so hits out there land on the drawn ground.
+    this.far = new THREE.Mesh(farRing(half - 2, half, 2000, 0.08), this.material);
     this.far.name = 'terrain-far';
     this.far.receiveShadow = true;
     this.far.castShadow = false;
@@ -703,25 +704,35 @@ function smooth01(x: number): number {
   return t * t * (3 - 2 * t);
 }
 
-/** Flat square ring from the detailed square's edge (half-size `a`) out to `b`, at y = 0. */
-function farRing(a: number, b: number): THREE.BufferGeometry {
-  // Inner ring vertices sit exactly on the detailed field's border (height 0 there).
-  const pts = [
-    [-a, -a], [a, -a], [a, a], [-a, a],
-    [-b, -b], [b, -b], [b, b], [-b, b],
-  ];
-  const pos = new Float32Array(pts.length * 3);
-  pts.forEach(([x, z], k) => {
-    pos[k * 3] = x!;
-    pos[k * 3 + 1] = 0;
-    pos[k * 3 + 2] = z!;
+/**
+ * Square ring from half-size `a` (at y = −dip, under the detailed field) up to the field's edge `m`
+ * (y = 0) and flat at y = 0 out to `b`.
+ */
+function farRing(a: number, m: number, b: number, dip: number): THREE.BufferGeometry {
+  const squares: [number, number][] = [[a, -dip], [m, 0], [b, 0]];
+  const pos = new Float32Array(squares.length * 4 * 3);
+  squares.forEach(([h, y], q) => {
+    [[-h, -h], [h, -h], [h, h], [-h, h]].forEach(([x, z], k) => {
+      const o = (q * 4 + k) * 3;
+      pos[o] = x!;
+      pos[o + 1] = y;
+      pos[o + 2] = z!;
+    });
   });
-  const nor = new Float32Array(pts.length * 3);
-  for (let k = 0; k < pts.length; k++) nor[k * 3 + 1] = 1;
+  const nor = new Float32Array(pos.length);
+  for (let k = 0; k < pos.length / 3; k++) nor[k * 3 + 1] = 1;
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-  // Four trapezoids between the squares, wound counter-clockwise seen from +Y.
-  g.setIndex([0, 5, 4, 0, 1, 5, 1, 6, 5, 1, 2, 6, 2, 7, 6, 2, 3, 7, 3, 4, 7, 3, 0, 4]);
+  // Two bands of four trapezoids between consecutive squares, counter-clockwise seen from +Y.
+  const idx: number[] = [];
+  for (let q = 0; q < squares.length - 1; q++) {
+    const i = q * 4, j = i + 4;
+    for (let k = 0; k < 4; k++) {
+      const k1 = (k + 1) % 4;
+      idx.push(i + k, j + k1, j + k, i + k, i + k1, j + k1);
+    }
+  }
+  g.setIndex(idx);
   return g;
 }

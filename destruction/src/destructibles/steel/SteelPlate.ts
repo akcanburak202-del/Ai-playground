@@ -6,6 +6,7 @@ import { material as getMaterial, type MaterialProps } from '../../physics/mater
 import type { BlastLoad, ImpactEvent, ThicknessProbe } from '../../physics/ballistics/types.ts';
 import type { PhysicsOwner } from '../../physics/PhysicsWorld.ts';
 import { PlateSim } from './plateSim.ts';
+import { safeHullDesc } from './colliders.ts';
 import { diffusivity, maxBlastMomentum, plugShearHeat, sheetHeatLoss, steelParams, TAYLOR_QUINNEY, AMBIENT_C, type SteelParams } from './steelMaterial.ts';
 import { createSteelMaterial, type SteelUniforms } from './look.ts';
 import { DetailMap } from './detailMap.ts';
@@ -1272,7 +1273,9 @@ export class SteelPlate implements Destructible, Structural {
     const wp = com.clone().applyMatrix4(this.pivot.matrixWorld);
     const wq = new THREE.Quaternion();
     this.pivot.getWorldQuaternion(wq);
-    const desc = phys.R.ColliderDesc.convexHull(Float32Array.from(pts)) ?? phys.R.ColliderDesc.cuboid(this.spec.width / 2, this.spec.height / 2, h);
+    // Flat, collinear or tiny point sets (a torn sliver, particles in a line) would make Rapier's
+    // hull degenerate: those get an oriented box (colliders.ts).
+    const desc = safeHullDesc(phys.R, pts, Math.max(0.004, this.thickness)) ?? phys.R.ColliderDesc.cuboid(this.spec.width / 2, this.spec.height / 2, Math.max(h, 0.002));
     desc.setMass(m).setFriction(0.6).setRestitution(0.05);
     this.body = phys.createDynamic({
       position: wp, quaternion: wq, colliders: [desc], owner: this.owner, linvel, contactForceThreshold: 2e4,

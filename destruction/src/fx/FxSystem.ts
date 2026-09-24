@@ -4,7 +4,6 @@ import type {
   BlastEvent, DebrisContactEvent, FractureEvent, FxApi, ShatterEvent, ShotEvent, SimContext, StructuralFailureEvent, System,
 } from '../app/contracts.ts';
 import type { ImpactEvent } from '../physics/ballistics/types.ts';
-import { rangeForOverpressure, KB } from '../physics/ballistics/blast.ts';
 import type { Rng } from '../core/rng.ts';
 import { TNT_ENERGY } from '../core/units.ts';
 import { getAtmosphere, type Atmosphere } from '../render/atmosphere.ts';
@@ -49,6 +48,22 @@ const FIREBALL_CD = 300;
  */
 function flashCandela(energyJ: number): number {
   return FIREBALL_CD * Math.pow(Math.max(energyJ, 0) / TNT_ENERGY, 2 / 3);
+}
+
+/**
+ * Radius of the dust puffs raised when a brittle volume V (m³) breaks into n pieces. Airborne fines
+ * scale with the new fracture surface, not the volume: cutting a cube into n equal parts adds
+ * A ≈ 6 (n^⅓ − 1) V^⅔ (+ V^⅔ where it tore from its parent). At ≈ 0.01 kg of fines (< 20 µm) per m²
+ * of fracture face (estimate: a crushed layer of cement paste a fraction of a millimetre thick) and a
+ * mass extinction coefficient k ≈ 3Q / (2ρd) ≈ 115 m²/kg (d ≈ 10 µm, ρ = 2600 kg/m³, Q ≈ 2; Seinfeld
+ * & Pandis 2006), the cloud reaches optical depth 1 at R = √(1.5 k M / π). emitDust() puffs of
+ * radius r spread to ≈ 2.5 r, so r ≈ R / 2.5; kept between 0.15 m and 1.6 m.
+ */
+export function fractureDustRadius(volume: number, pieces: number): number {
+  const a = Math.pow(Math.max(volume, 0), 2 / 3);
+  const area = 6 * (Math.cbrt(Math.max(pieces, 1)) - 1) * a + a;
+  const R = Math.sqrt((1.5 * 115 * 0.01 * area) / Math.PI);
+  return Math.min(1.6, Math.max(0.15, R / 2.5));
 }
 
 interface Emitter { x: number; y: number; z: number; radius: number; until: number; color: number; rise: number; acc: number; rate: number }
@@ -423,6 +438,12 @@ export class FxSystem implements System, FxApi {
     const launcher = w.category === 'launcher';
     // Visual flash size scales with the propellant gas, ~ cube root of the muzzle energy.
     const s = Math.cbrt(Math.max(E, 50) / 1750) * (cannon ? 1.8 : 1);
+    // Propellant burnt: a gun turns ≈ 30 % of the propellant's ≈ 4 MJ/kg into muzzle energy
+    // (interior-ballistics energy balance), m_p ≈ E / 1.2 MJ/kg: 1.5 g for 5.56 mm (actual 1.6 g),
+    // ≈ 5 kg for a 120 mm APFSDS (7–8 kg). Its gas at ambient pressure, ≈ 0.9 m³/kg (≈ 40 mol/kg of
+    // CO, CO₂, H₂O, H₂, N₂ at STP), is the muzzle cloud: radius (3V / 4π)^⅓ ≈ 7 cm for a rifle,
+    // ≈ 1 m for a tank gun, which entrainment grows two- to threefold while it thins.
+    const rGas = Math.cbrt((3 * 0.9 * (E / 1.2e6)) / (4 * Math.PI));
     const o = e.origin, d = e.direction;
     const size = 0.07 * s;
     {
@@ -432,20 +453,35 @@ export class FxSystem implements System, FxApi {
         const v = rng.range(20, 45) * Math.sqrt(s);
         this.emitFlame(o.x + d.x * f, o.y + d.y * f, o.z + d.z * f, d.x * v, d.y * v, d.z * v, size * 0.6, size * 1.1, rng.range(0.025, 0.045), 2000, rng.int(0, 12), t0, 25, 0);
       }
-      // A gun turns ≈ 30 % of the propellant's energy into muzzle energy (interior-ballistics
-      // energy balance) and roughly that share again afterburns visibly at the muzzle (estimate):
-      // the visible flash carries about the muzzle energy.
-      this.lights.fire(t0, o, 0xffb77a, flashCandela(E), 4 + 3 * s, 0.03 + 0.01 * s);
+      // Visible flash: the muzzle gases afterburn in air, but modern propellants carry flash
+      // suppressants and most of that energy leaves as heat and infrared; count ≈ 10 % of the muzzle
+      // energy as fireball-equivalent (estimate) and a life of the secondary flash, ≈ 10–40 ms. It
+      // sits in the flash, about one gas radius ahead of the muzzle, and reaches a few tens of metres.
+      _v.copy(o).addScaledVector(d, rGas);
+      this.lights.fire(t0, _v, 0xffb77a, flashCandela(0.1 * E), 6 + 20 * rGas, 0.01 + 0.03 * rGas);
     }
-    // Propellant smoke: a faint puff for rifles, a real cloud for cannon.
-    const smokeN = cannon ? 8 : 2;
-    for (let i = 0; i < smokeN; i++) this.puff(o.x + d.x * 0.3 * size, o.y + d.y * 0.3 * size, o.z + d.z * 0.3 * size, d.x * rng.range(2, 6) * Math.sqrt(s), d.y * rng.range(2, 6), d.z * rng.range(2, 6) * Math.sqrt(s), 0.04 * s, 0.35 * s, rng.range(1.5, 3.5) * Math.sqrt(s), 0x9d9a94, cannon ? 0.45 : 0.12, t0);
+    // Propellant smoke: the gas cloud a little ahead of the muzzle, pushed along the bore and stopped
+    // by drag within a couple of radii; faint for rifles, a real but brief cloud for cannon.
+    const smokeN = cannon ? 7 : 2;
+    const kSmoke = 4;
+    for (let i = 0; i < smokeN; i++) {
+      const ahead = rGas * rng.range(0.5, 2.5);
+      const v = rng.range(1.5, 4) * rGas * kSmoke;
+      rng.inCone(d, 0.35, _u);
+      this.puff(o.x + d.x * ahead, o.y + d.y * ahead, o.z + d.z * ahead, _u.x * v, _u.y * v, _u.z * v,
+        0.5 * rGas, rGas * rng.range(1.8, 2.8), rng.range(1.2, 2.4) * (0.6 + rGas), 0x9d9a94, cannon ? 0.5 : 0.15, t0, kSmoke, -0.02, 1, true);
+    }
     if (launcher) this.backblast(e, t0);
     if (cannon && E > 1e6) {
-      // Tank gun: the muzzle blast kicks up a ring of dust from the ground below the barrel.
+      // Tank gun: the blast, directed forward, raises a sheet of dust from the ground ahead of the
+      // barrel when the muzzle is within a few gas radii of it.
       const g = groundOf(this.ctx.scene);
-      const gy = g.heightAt(o.x, o.z);
-      if (o.y - gy < 4) this.emitDust(_v.set(o.x, gy + 0.3, o.z), null, 2.2, 14, g.dustColorAt(o.x, o.z), 1.3, t0);
+      _v.copy(o).addScaledVector(_u.set(d.x, 0, d.z).normalize(), 3 * rGas);
+      const gy = g.heightAt(_v.x, _v.z);
+      if (o.y - gy < 3 * rGas) {
+        _v.y = gy + 0.3 * rGas;
+        this.emitDust(_v, _j.copy(_u).multiplyScalar(4 * rGas), 1.2 * rGas, 8, g.dustColorAt(_v.x, _v.z), 0.5, t0);
+      }
       this.shaker.add(0.35);
     } else if (w.recoil > 0) this.shaker.add(w.recoil * 0.08);
   }
@@ -579,8 +615,18 @@ export class FxSystem implements System, FxApi {
     const P = this.P;
 
     // Flash. Peak luminous intensity ≈ fireball radiance × projected area (a ~2300 K surface of
-    // radius R_f ≈ 1.75 W^⅓), i.e. ≈ 300 W^⅔ render-candela; it decays with the fireball.
-    this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, FIREBALL_CD * Math.pow(W, 2 / 3) * (thermo ? 1.5 : 1), 25 * w3 + 8, tFire);
+    // radius R_f ≈ 1.75 W^⅓), i.e. ≈ 300 W^⅔ render-candela. The white-hot phase is brief: the
+    // detonation products cool below bright incandescence within ≈ 25 ms·kg^−⅓ (high-speed footage
+    // of 1–10 kg charges; cube-root scaling, Baker et al. 1983) — the orange afterburn that follows
+    // is drawn by the fireball particles, which light nothing much in daylight. Its reach: where it
+    // still adds ≈ 5 % to the sunlight, √(I / 0.05 E_sun), capped at a few fireball radii.
+    {
+      const I = FIREBALL_CD * Math.pow(W, 2 / 3) * (thermo ? 1.5 : 1);
+      const sc = this.atmo.sunColor.value;
+      const eSun = Math.max(0.5, 0.2126 * sc.r + 0.7152 * sc.g + 0.0722 * sc.b);
+      const reach = Math.min(Math.sqrt(I / (0.05 * eSun)), 6 * Rf + 4);
+      this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, I, reach, 0.025 * w3 * (thermo ? 2.5 : 1));
+    }
 
     // 1) Fireball body: incandescent turbulent puffs that expand fast, stall and cool into soot.
     const nFire = Math.round(Math.min(260, (36 + 55 * w3) * (thermo ? 1.5 : 1)));
@@ -691,8 +737,8 @@ export class FxSystem implements System, FxApi {
       const mat = ground.materialAt(c.x, c.z);
       const nEj = Math.round(Math.min(160, 24 + 50 * w3));
       this.emitChips(_v.set(c.x, gy + 0.05, c.z), UP, 0.9, 16 * Math.pow(w3, 0.35), nEj, Math.min(0.12, 0.03 * sw), mat.class === 'soil' ? 0x4f4033 : mat.color, 'stone', now + 0.005);
-      // Dust lifted by the front as it sweeps the ground, timed by the KB arrival time.
-      this.shockDust(c, dustHex, W, now);
+      // The front sweeping the ground is drawn by the shock ring (a continuous band); dust puffs placed
+      // along it read as a dotted circle, so the ring is all there is.
       this.shock.spawn(now, c, gy, W, _c.setHex(dustHex));
     } else if (W > 2) {
       this.shock.spawn(now, c, gy, W, _c.setHex(dustHex));
@@ -706,36 +752,15 @@ export class FxSystem implements System, FxApi {
     }
   }
 
-  /** Ground dust kicked up where the shock front passes, at the KB arrival time of each radius. */
-  private shockDust(c: THREE.Vector3, hex: number, W: number, now: number): void {
-    const rng = this.rng;
-    const w3 = Math.cbrt(W);
-    // Loose surface dust is lifted where the front still carries ≳ 20 kPa (the ground-shock /
-    // dust-lofting threshold is of that order: Glasstone & Dolan 1977, §3.50ff); the band is thin
-    // and hugs the ground.
-    const rEnd = Math.min(45, rangeForOverpressure(W, 20000));
-    const r0 = Math.max(0.8, 1.5 * w3);
-    if (rEnd <= r0) return;
-    const rings = Math.min(6, Math.max(2, Math.round((rEnd - r0) / (2.5 * w3))));
-    const ground = groundOf(this.ctx.scene);
-    for (let k = 0; k < rings; k++) {
-      const r = r0 + ((rEnd - r0) * (k + 0.5)) / rings;
-      const ta = KB.arrivalTime(r / w3) * w3;
-      const n = Math.round(Math.min(22, 6 + r * 0.9));
-      for (let i = 0; i < n; i++) {
-        const a = ((i + rng.next()) / n) * Math.PI * 2;
-        const x = c.x + Math.cos(a) * r, z = c.z + Math.sin(a) * r;
-        const y = ground.heightAt(x, z) + 0.08;
-        this.puff(x, y, z, Math.cos(a) * 2.5, rng.range(0.1, 0.4), Math.sin(a) * 2.5, 0.1 + 0.015 * r, 0.35 + 0.03 * r, rng.range(1.2, 2.5), hex, 0.2 * (1 - k / (rings + 1)), now + ta, 1.8, 0.002, 1, true);
-      }
-    }
-  }
-
   private onFracture(e: FractureEvent): void {
     const done = this.marked(e.position);
-    const size = Math.cbrt(Math.max(e.volume, 1e-6));
-    if (!(done & MARK_DUST)) this.emitDust(e.position, e.direction ? _v.copy(e.direction).multiplyScalar(1.5) : null, Math.max(0.2, size * 1.5), Math.round(Math.min(30, 4 + e.volume * 40)), e.material.dustColor, 1.3);
-    if (!(done & MARK_CHIPS)) this.emitChips(e.position, e.direction ?? UP, 1.2, 5, Math.min(60, 8 + e.volume * 60), Math.min(0.05, 0.015 + size * 0.02), e.material.color, 'stone');
+    const V = Math.max(e.volume, 1e-6);
+    const size = Math.cbrt(V);
+    if (!(done & MARK_DUST) && e.material.class !== 'ductile') {
+      const r = fractureDustRadius(V, Math.max(1, e.pieces));
+      this.emitDust(e.position, e.direction ? _v.copy(e.direction).multiplyScalar(1.5) : null, r, Math.round(Math.min(18, 3 + 6 * r)), e.material.dustColor, 1);
+    }
+    if (!(done & MARK_CHIPS)) this.emitChips(e.position, e.direction ?? UP, 1.2, 5, Math.min(60, 8 + e.volume * 60), Math.min(0.05, 0.015 + size * 0.02), e.material.color, e.material.class === 'ductile' ? 'metal' : 'stone');
   }
 
   private onDebrisContact(e: DebrisContactEvent): void {
@@ -760,8 +785,14 @@ export class FxSystem implements System, FxApi {
   }
 
   private onStructuralFailure(e: StructuralFailureEvent): void {
-    const size = Math.cbrt(Math.max(e.mass, 1) / 2400);
-    this.emitDust(e.position, null, Math.max(0.5, size * 1.2), Math.round(Math.min(30, 6 + size * 8)), 0xbdb7ac, 2);
+    // Losing support, buckling or being severed raises no dust by itself — a collapse's dust comes
+    // from material that fractures, crushes and lands (fracture / debrisContact events, and the
+    // element's own crushing dust). Only a brittle member failing by crushing puffs here, sized
+    // like the fracture of a crushed zone about one member depth long.
+    if (e.cause !== 'crushing' || (e.material && e.material.class !== 'brittle')) return;
+    if (this.marked(e.position) & MARK_DUST) return;
+    const r = fractureDustRadius(Math.min(1, e.mass / 2400 / 20), 12);
+    this.emitDust(e.position, null, r, Math.round(Math.min(12, 3 + 6 * r)), e.material?.dustColor ?? 0xbdb7ac, 1);
   }
 
   // ─── Per frame ───────────────────────────────────────────────────────────────────────────

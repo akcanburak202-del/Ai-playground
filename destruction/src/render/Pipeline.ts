@@ -9,7 +9,8 @@ import type { RenderPipelineApi, SceneDef, SimContext } from '../app/contracts.t
 import { getAtmosphere, type Atmosphere } from './atmosphere.ts';
 import { deriveLighting, GOLDEN_HOUR_SKY, sunDirection, type SkyParams, type SunLighting } from './skyModel.ts';
 import { createSkyRig, type SkyRig } from './sky.ts';
-import { CompositePass, FxPass, ScenePass, type FrameState } from './passes.ts';
+import { CompositePass, FxPass, ScenePass, guardBloomInput, type FrameState } from './passes.ts';
+import { hasGroundProvider } from '../fx/ground.ts';
 
 export type Quality = 0 | 1 | 2;
 
@@ -37,6 +38,7 @@ const QUALITY: Record<Quality, QualitySettings> = {
 const _savedPos = new THREE.Vector3();
 const _savedQuat = new THREE.Quaternion();
 const _shakeQuat = new THREE.Quaternion();
+const _kickEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 const _grey = new THREE.Color();
 
 /**
@@ -80,6 +82,8 @@ export class Pipeline implements RenderPipelineApi {
   private width = 1;
   private height = 1;
   private clock = 0;
+  private kickPitch = 0;
+  private kickYaw = 0;
 
   constructor(opts: { quality?: Quality } = {}) {
     this.quality = opts.quality ?? 2;
@@ -111,7 +115,9 @@ export class Pipeline implements RenderPipelineApi {
     s.background = null;
     s.fog = null;
     for (const o of [this.sun, this.hemi, this.ground, this.sky!.mesh]) if (o.parent !== s) s.add(o);
-    this.ground.visible = true;
+    // The fallback plane only stands in for a missing terrain: a terrain hides it when it is created
+    // and shows it again when disposed, so a re-setup (new sky, quality) must not bring it back.
+    if (!hasGroundProvider(s)) this.ground.visible = true;
 
     const sunDef = scene?.sun ?? DEFAULT_SUN;
     const [dx, dy, dz] = sunDirection(sunDef.elevation, sunDef.azimuth);
@@ -126,8 +132,8 @@ export class Pipeline implements RenderPipelineApi {
     this.hemi.groundColor.setRGB(...L.groundRadiance);
     this.hemi.intensity = 0.3;
     // A photographer exposes for the lit facade: brighten low suns partially (not fully — golden hour
-    // is a little moodier than noon).
-    r.toneMappingExposure = this.exposureBias * 1.15 * Math.pow(6 / Math.max(L.sunIntensity, 0.5), 0.6);
+    // is a little moodier than noon). Anchor: luminance irradiance of a wall facing the sun.
+    r.toneMappingExposure = this.exposureBias * 1.15 * Math.pow(6 / Math.max(L.wallIrradiance, 0.3), 0.6);
 
     const key = `${sunDef.elevation}/${sunDef.azimuth}/${JSON.stringify(this.skyParams)}`;
     if (key !== this.skyKey) {
@@ -174,6 +180,7 @@ export class Pipeline implements RenderPipelineApi {
     // and the sun disc bloom. Incandescent sources run at 10–100× the lit wall (see fx glow()), so
     // the strength stays low: veiling glare of a real lens is a few per cent of the source.
     this.bloomPass = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.1, 0.3, 7.0);
+    guardBloomInput(this.bloomPass.materialHighPassFilter);
     this.outputPass = new OutputPass();
     this.smaaPass = new SMAAPass();
     this.fxaaPass = new FXAAPass();
@@ -235,19 +242,24 @@ export class Pipeline implements RenderPipelineApi {
     atmo.cameraFar.value = cam.far;
     r.getDrawingBufferSize(atmo.resolution.value);
 
+    // Render-only view offsets (camera shake, recoil kick): applied around the frame and undone after,
+    // so the aim ray and everything simulated keep the true camera.
     const shake = atmo.shake;
-    const shaking = shake.active;
-    if (shaking) {
+    const kicked = this.kickPitch !== 0 || this.kickYaw !== 0;
+    const moved = shake.active || kicked;
+    if (moved) {
       _savedPos.copy(cam.position);
       _savedQuat.copy(cam.quaternion);
-      cam.position.add(shake.position);
-      cam.quaternion.multiply(_shakeQuat.setFromEuler(shake.rotation));
+      if (kicked) cam.quaternion.multiply(_shakeQuat.setFromEuler(_kickEuler.set(this.kickPitch, this.kickYaw, 0, 'YXZ')));
+      if (shake.active) {
+        cam.position.add(shake.position);
+        cam.quaternion.multiply(_shakeQuat.setFromEuler(shake.rotation));
+      }
     }
     cam.updateMatrixWorld();
-    this.sky!.mesh.position.setFromMatrixPosition(cam.matrixWorld);
     composer.render(realDt);
     atmo.hasSunShadow.value = 0;
-    if (shaking) {
+    if (moved) {
       cam.position.copy(_savedPos);
       cam.quaternion.copy(_savedQuat);
       cam.updateMatrixWorld();
@@ -268,6 +280,15 @@ export class Pipeline implements RenderPipelineApi {
       this.composer.setPixelRatio(r.getPixelRatio());
       this.composer.setSize(this.width, this.height);
     }
+  }
+
+  /**
+   * Recoil kick for the next frames: a view rotation (radians; +pitch looks up, +yaw turns left)
+   * applied only while rendering. The caller drives its decay and calls this every frame.
+   */
+  viewKick(pitch: number, yaw: number): void {
+    this.kickPitch = Number.isFinite(pitch) ? pitch : 0;
+    this.kickYaw = Number.isFinite(yaw) ? yaw : 0;
   }
 
   setQuality(level: Quality): void {

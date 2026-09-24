@@ -147,6 +147,10 @@ export class BeamSim {
   private fixedSet: Uint8Array;
   private nodeMin: Int32Array;
   private nodeMax: Int32Array;
+  /** Per node: the (row, slot) gradient offsets of the constraints touching it (solve scratch) */
+  private static readonly MAX_NODE_ROWS = 16;
+  private nodeRows: Int32Array;
+  private nodeRowCount: Int32Array;
 
   constructor(o: BeamSimOptions | null, clone?: BeamSim, range?: [number, number]) {
     if (clone && range) {
@@ -213,6 +217,8 @@ export class BeamSim {
     this.fixedSet = new Uint8Array(mMax);
     this.nodeMin = new Int32Array(n);
     this.nodeMax = new Int32Array(n);
+    this.nodeRows = new Int32Array(n * BeamSim.MAX_NODE_ROWS);
+    this.nodeRowCount = new Int32Array(n);
 
     if (clone && range) {
       const i0 = range[0];
@@ -590,21 +596,37 @@ export class BeamSim {
     for (let i = 0; i < n; i++) if (this.nodeMax[i]! >= 0) bw = Math.max(bw, this.nodeMax[i]! - this.nodeMin[i]!);
     const band = this.band;
     band.resize(m, bw);
-    // A = J W Jᵀ + α̃, accumulated node by node.
+    // A = J W Jᵀ + α̃, accumulated node by node over the (row, slot) pairs touching each node
+    // (gathered once: at most ~12 rows touch a node), straight into the band storage.
+    const nr = this.nodeRowCount, rows = this.nodeRows, MAXR = BeamSim.MAX_NODE_ROWS;
+    nr.fill(0);
+    for (let j = 0; j < m; j++) {
+      for (let k = 0; k < 3; k++) {
+        const nd = this.cN[3 * j + k]!;
+        if (nd < 0 || w[nd] === 0) continue;
+        const c = nr[nd]!;
+        if (c >= MAXR) continue;
+        rows[nd * MAXR + c] = 9 * j + 3 * k;
+        nr[nd] = c + 1;
+      }
+    }
+    const A = band.a, W1 = bw + 1, G = this.cG;
     for (let i = 0; i < n; i++) {
       const wi = w[i]!;
-      if (wi === 0) continue;
-      const j0 = this.nodeMin[i]!, j1 = this.nodeMax[i]!;
-      for (let a = j0; a <= j1; a++) {
-        const ka = this.slotOf(a, i);
-        if (ka < 0) continue;
-        const ga = 9 * a + 3 * ka;
-        for (let b = j0; b <= a; b++) {
-          const kb = this.slotOf(b, i);
-          if (kb < 0) continue;
-          const gb = 9 * b + 3 * kb;
-          const d = this.cG[ga]! * this.cG[gb]! + this.cG[ga + 1]! * this.cG[gb + 1]! + this.cG[ga + 2]! * this.cG[gb + 2]!;
-          band.add(a, b, wi * d);
+      const cnt = nr[i]!;
+      if (wi === 0 || cnt === 0) continue;
+      const base = i * MAXR;
+      for (let p = 0; p < cnt; p++) {
+        const ga = rows[base + p]!;
+        const a = (ga / 9) | 0;
+        const gax = G[ga]!, gay = G[ga + 1]!, gaz = G[ga + 2]!;
+        for (let q = 0; q <= p; q++) {
+          const gb = rows[base + q]!;
+          const b = (gb / 9) | 0;
+          const d = wi * (gax * G[gb]! + gay * G[gb + 1]! + gaz * G[gb + 2]!);
+          // Rows are gathered in increasing order, so a ≥ b.
+          const hi = a >= b ? a : b, lo = a >= b ? b : a;
+          A[hi * W1 + (lo - hi + bw)] = A[hi * W1 + (lo - hi + bw)]! + (a === b && p !== q ? 2 * d : d);
         }
       }
     }
@@ -653,6 +675,7 @@ export class BeamSim {
         band.pin(j);
         rhs[j] = lam[j]!;
       }
+      this.passes++;
       if (!band.factor()) {
         this.factorFailures++;
         return false;
@@ -786,6 +809,8 @@ export class BeamSim {
   factorFailures = 0;
   /** Diagnostics: substeps whose yield active set had not settled after the pass limit */
   activeSetUnconverged = 0;
+  /** Diagnostics: banded factorisations done (active-set passes over all substeps) */
+  passes = 0;
   private reactV = [0, 0];
 
   private checkConnections(h: number): void {
@@ -931,13 +956,7 @@ export class BeamSim {
       const rate = (Math.max(this.imposed, this.applied) / LOAD_RAMP) * dt;
       this.applied += Math.max(-rate, Math.min(rate, this.imposed - this.applied));
     }
-    let vrel = 0;
-    for (let i = 0; i < n - 1; i++) {
-      const r = Math.hypot(v[3 * i + 3]! - v[3 * i]!, v[3 * i + 4]! - v[3 * i + 1]!, v[3 * i + 5]! - v[3 * i + 2]!);
-      if (r > vrel) vrel = r;
-    }
-    let nsub = Math.max(1, Math.ceil(dt / this.minSubstepDt - 1e-9));
-    nsub = Math.min(this.maxSubsteps, Math.max(nsub, Math.ceil((dt * vrel) / (0.05 * this.ds))));
+    const nsub = this.desiredSubsteps(dt);
     const h = dt / nsub;
     const w0 = this.plasticWork;
     // The imposed load is the weight of what the member carries (a floor, a roof), so it also has
@@ -1015,6 +1034,28 @@ export class BeamSim {
     }
     const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     return { substeps: nsub, maxSpeed: maxV, plasticWork: this.plasticWork - w0, ms: t1 - t0 };
+  }
+
+  /**
+   * Substeps `step(dt)` takes: at least dt/minSubstepDt, more while nodes move fast relative to
+   * each other (≤ 5 % of the spacing of relative travel per substep), at most maxSubsteps.
+   */
+  desiredSubsteps(dt: number): number {
+    const v = this.v;
+    let vrel = 0;
+    for (let i = 0; i < this.n - 1; i++) {
+      const r = Math.hypot(v[3 * i + 3]! - v[3 * i]!, v[3 * i + 4]! - v[3 * i + 1]!, v[3 * i + 5]! - v[3 * i + 2]!);
+      if (r > vrel) vrel = r;
+    }
+    const nsub = Math.max(1, Math.ceil(dt / this.minSubstepDt - 1e-9));
+    return Math.max(1, Math.min(this.maxSubsteps, Math.max(nsub, Math.ceil((dt * vrel) / (0.05 * this.ds)))));
+  }
+
+  /** Fastest node speed, m/s */
+  maxNodeSpeed(): number {
+    let m = 0;
+    for (let i = 0; i < this.n; i++) m = Math.max(m, Math.hypot(this.v[3 * i]!, this.v[3 * i + 1]!, this.v[3 * i + 2]!));
+    return m;
   }
 
   /** Nodes cannot pass through the ground plane y = 0 (half the section depth as margin). */

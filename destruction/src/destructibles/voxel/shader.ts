@@ -8,6 +8,10 @@
 export const VERT_PARS = /* glsl */ `
 varying vec3 vObjPos;
 varying vec3 vObjNrm;
+#ifdef VOXEL_BATCHED
+// Rotation of this piece's instance (the fragment turns its object-space normal with it).
+varying mat3 vBatchR;
+#endif
 #ifdef VOXEL_ATTRS
 attribute float aDamage;
 attribute float aDepth;
@@ -21,6 +25,9 @@ varying float vSoot;
 export const VERT_MAIN = /* glsl */ `
 vObjPos = position;
 vObjNrm = objectNormal;
+#ifdef VOXEL_BATCHED
+vBatchR = mat3(batchingMatrix);
+#endif
 #ifdef VOXEL_ATTRS
 vDamage = aDamage;
 vDepth = aDepth;
@@ -31,6 +38,9 @@ vSoot = aSoot;
 export const FRAG_VARYINGS = /* glsl */ `
 varying vec3 vObjPos;
 varying vec3 vObjNrm;
+#ifdef VOXEL_BATCHED
+varying mat3 vBatchR;
+#endif
 #ifdef VOXEL_ATTRS
 varying float vDamage;
 varying float vDepth;
@@ -536,7 +546,11 @@ float roughnessFactor = clamp(roughness * vxS.rough, 0.04, 1.0);
 `;
 
 export const FRAG_NORMAL = /* glsl */ `
+#ifdef VOXEL_BATCHED
+normal = normalize(normalMatrix * (vBatchR * vxS.n));
+#else
 normal = normalize(normalMatrix * vxS.n);
+#endif
 `;
 
 export const FRAG_EMISSIVE = /* glsl */ `
@@ -551,16 +565,26 @@ reflectedLight.directDiffuse *= mix(1.0, vxS.ao, 0.35);
 
 /** Rusty deformed-bar steel (B500): mill scale, orange-brown rust patches, transverse ribs. */
 export const REBAR_VERT_PARS = /* glsl */ `
+#ifdef REBAR_BAKED
+attribute float aAlong;
+#else
 attribute float aLen;
+#endif
 varying vec3 vBarPos;
 varying float vBarAlong;
 `;
 export const REBAR_VERT_MAIN = /* glsl */ `
+#ifdef REBAR_BAKED
+// Debris bars: geometry already in the element's frame, distance along the bar per vertex.
+vBarAlong = aAlong;
+vBarPos = position;
+#else
 vBarAlong = (position.y + 0.5) * aLen;
 #ifdef USE_INSTANCING
 vBarPos = (instanceMatrix * vec4(position, 1.0)).xyz;
 #else
 vBarPos = position;
+#endif
 #endif
 `;
 export const REBAR_FRAG_PARS = /* glsl */ `

@@ -8,6 +8,9 @@ import type { BrittleFinish } from '../../app/contracts.ts';
  * Features that must line up with the element (form-tie holes, panel seams, brick coursing, marble
  * veins, travertine bedding) are generated in the shader in object space instead; these maps carry
  * the fine skin: timber grain imprint, mottling, pores, crystal speckle, clay grain.
+ *
+ * Generation is written as resumable generators (they yield every few ms of work) so the app can
+ * warm the maps in slices behind its menu (warmFinishMaps); finishMaps() simply runs them through.
  */
 export interface FinishMaps {
   size: number;
@@ -16,6 +19,9 @@ export interface FinishMaps {
   albedoRough: Uint8Array;
   normalHeight: Uint8Array;
 }
+
+/** A resumable piece of generation work: yields between slices, returns its result. */
+type Gen<T> = Generator<void, T, void>;
 
 class TileRng {
   private s: number;
@@ -34,7 +40,7 @@ class TileRng {
 }
 
 /** Periodic value noise with `px`×`py` lattice cells over the tile, quintic interpolation, in [-1, 1]. */
-function valueTile(size: number, px: number, py: number, seed: number, out: Float32Array, amp: number): void {
+function* valueTile(size: number, px: number, py: number, seed: number, out: Float32Array, amp: number): Gen<void> {
   const rng = new TileRng(seed);
   const lat = new Float32Array(px * py);
   for (let i = 0; i < lat.length; i++) lat[i] = rng.next() * 2 - 1;
@@ -48,6 +54,7 @@ function valueTile(size: number, px: number, py: number, seed: number, out: Floa
     fx[x] = f * f * f * (f * (f * 6 - 15) + 10);
   }
   for (let y = 0; y < size; y++) {
+    if ((y & 31) === 31) yield;
     const v = y * sy;
     const j = Math.floor(v);
     let g = v - j;
@@ -64,12 +71,12 @@ function valueTile(size: number, px: number, py: number, seed: number, out: Floa
 }
 
 /** Tileable fBm: octaves of value noise, base lattice (px, py), doubling each octave. */
-function fbm(size: number, px: number, py: number, octaves: number, gain: number, seed: number): Float32Array {
+function* fbm(size: number, px: number, py: number, octaves: number, gain: number, seed: number): Gen<Float32Array> {
   const out = new Float32Array(size * size);
   let amp = 1, norm = 0;
   for (let o = 0; o < octaves; o++) {
     const cx = Math.min(size, px << o), cy = Math.min(size, py << o);
-    valueTile(size, cx, cy, seed * 7919 + o * 104729, out, amp);
+    yield* valueTile(size, cx, cy, seed * 7919 + o * 104729, out, amp);
     norm += amp;
     amp *= gain;
   }
@@ -81,7 +88,7 @@ function fbm(size: number, px: number, py: number, octaves: number, gain: number
  * Tileable cellular noise: jittered feature points on an n×n grid; returns F1 (distance to the
  * nearest point, in cell units) and the id of that cell.
  */
-function worley(size: number, n: number, seed: number, stretchY = 1): { f1: Float32Array; f2: Float32Array; id: Uint32Array } {
+function* worley(size: number, n: number, seed: number, stretchY = 1): Gen<{ f1: Float32Array; f2: Float32Array; id: Uint32Array }> {
   const rng = new TileRng(seed);
   const ptx = new Float32Array(n * n), pty = new Float32Array(n * n);
   for (let i = 0; i < n * n; i++) {
@@ -93,6 +100,7 @@ function worley(size: number, n: number, seed: number, stretchY = 1): { f1: Floa
   const wrap = new Int32Array(n + 2);
   for (let c = -1; c <= n; c++) wrap[c + 1] = ((c % n) + n) % n;
   for (let y = 0; y < size; y++) {
+    if ((y & 31) === 31) yield;
     const v = y * s;
     const cy = Math.floor(v);
     for (let x = 0; x < size; x++) {
@@ -158,7 +166,7 @@ function enc(v: number): number {
 }
 
 /** Pack layers into the two RGBA8 maps (normal from height via a Sobel filter, wrap-around). */
-function pack(L: Layers, bumpScale: number): FinishMaps {
+function* pack(L: Layers, bumpScale: number): Gen<FinishMaps> {
   const { size } = L;
   const n = size * size;
   const ar = new Uint8Array(n * 4), nh = new Uint8Array(n * 4);
@@ -173,6 +181,7 @@ function pack(L: Layers, bumpScale: number): FinishMaps {
   const hr = hmax - hmin || 1;
   const k = bumpScale / (8 * texel);
   for (let y = 0; y < size; y++) {
+    if ((y & 31) === 31) yield;
     const ym = ((y - 1 + size) % size) * size, y0 = y * size, yp = ((y + 1) % size) * size;
     for (let x = 0; x < size; x++) {
       const xm = (x - 1 + size) % size, xp = (x + 1) % size;
@@ -199,12 +208,13 @@ function pack(L: Layers, bumpScale: number): FinishMaps {
 const srgb = (c: number) => Math.pow(c / 255, 2.2);
 
 /** Concrete skin shared by the concrete finishes: mottling, bugholes, laitance. */
-function concreteSkin(L: Layers, seed: number, mottle: number, holes: number): void {
+function* concreteSkin(L: Layers, seed: number, mottle: number, holes: number): Gen<void> {
   const { size } = L;
-  const m = fbm(size, 2, 2, 6, 0.6, seed);
-  const fine = fbm(size, 48, 48, 3, 0.5, seed + 5);
-  const bug = worley(size, 26, seed + 9);
+  const m = yield* fbm(size, 2, 2, 6, 0.6, seed);
+  const fine = yield* fbm(size, 48, 48, 3, 0.5, seed + 5);
+  const bug = yield* worley(size, 26, seed + 9);
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const k = 1 + mottle * m[i]! + 0.035 * fine[i]!;
     L.r[i]! *= k;
     L.g[i]! *= k;
@@ -227,17 +237,18 @@ function concreteSkin(L: Layers, seed: number, mottle: number, holes: number): v
   }
 }
 
-function boardFormed(size: number): FinishMaps {
+function* boardFormed(size: number): Gen<FinishMaps> {
   const tile = 0.6;
   const L = layers(size, tile, [srgb(152), srgb(151), srgb(147)], 0.8);
   // Timber grain imprint: growth rings as iso-lines of a strongly warped, stretched noise field
   // (flat-sawn boards show cathedral figures and wandering lines, not a regular sine), plus
   // fibre streaks; printed 0.2–0.5 mm deep into the skin, with only a faint tonal trace.
-  const streak = fbm(size, 2, 70, 4, 0.55, 11);
-  const warpA = fbm(size, 2, 6, 4, 0.55, 12);
-  const warpB = fbm(size, 4, 16, 3, 0.5, 14);
-  const knot = worley(size, 4, 13);
-  for (let y = 0; y < size; y++)
+  const streak = yield* fbm(size, 2, 70, 4, 0.55, 11);
+  const warpA = yield* fbm(size, 2, 6, 4, 0.55, 12);
+  const warpB = yield* fbm(size, 4, 16, 3, 0.5, 14);
+  const knot = yield* worley(size, 4, 13);
+  for (let y = 0; y < size; y++) {
+    if ((y & 31) === 31) yield;
     for (let x = 0; x < size; x++) {
       const i = x + y * size;
       const v = (y / size) * tile;
@@ -253,26 +264,28 @@ function boardFormed(size: number): FinishMaps {
       L.g[i]! *= t;
       L.b[i]! *= t;
     }
-  concreteSkin(L, 21, 0.09, 0.03);
-  return pack(L, 1.0);
+  }
+  yield* concreteSkin(L, 21, 0.09, 0.03);
+  return yield* pack(L, 1.0);
 }
 
-function smoothConcrete(size: number): FinishMaps {
+function* smoothConcrete(size: number): Gen<FinishMaps> {
   const L = layers(size, 1.0, [srgb(160), srgb(159), srgb(156)], 0.62);
-  concreteSkin(L, 31, 0.05, 0.05);
-  return pack(L, 0.8);
+  yield* concreteSkin(L, 31, 0.05, 0.05);
+  return yield* pack(L, 0.8);
 }
 
-function exposedAggregate(size: number): FinishMaps {
+function* exposedAggregate(size: number): Gen<FinishMaps> {
   const tile = 0.6;
   const L = layers(size, tile, [srgb(142), srgb(140), srgb(135)], 0.88);
-  concreteSkin(L, 41, 0.04, 0.0);
+  yield* concreteSkin(L, 41, 0.04, 0.0);
   // Washed exposed aggregate: rounded river gravel (6–14 mm) standing out of grey cement paste.
-  const w = worley(size, 48, 43);
+  const w = yield* worley(size, 48, 43);
   const palette = [
     [150, 146, 138], [184, 176, 162], [120, 116, 112], [168, 150, 128], [206, 200, 190], [98, 94, 92], [140, 128, 116],
   ].map((c) => c.map(srgb));
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const id = w.id[i]!;
     const r0 = 0.3 + 0.18 * hash01(id * 3 + 1);
     const f = w.f1[i]!;
@@ -290,15 +303,17 @@ function exposedAggregate(size: number): FinishMaps {
     L.height[i]! += 0.003 * dome;
     L.rough[i] = L.rough[i]! * (1 - t) + 0.5 * t;
   }
-  return pack(L, 1.2);
+  yield;
+  return yield* pack(L, 1.2);
 }
 
-function marble(size: number): FinishMaps {
+function* marble(size: number): Gen<FinishMaps> {
   const L = layers(size, 0.8, [srgb(234), srgb(234), srgb(231)], 0.16);
   // Crystal fabric: faint calcite grain and cloudy grey drifts; veins are 3D (shader).
-  const cloud = fbm(size, 4, 4, 6, 0.6, 51);
-  const grain = worley(size, 220, 52);
+  const cloud = yield* fbm(size, 4, 4, 6, 0.6, 51);
+  const grain = yield* worley(size, 220, 52);
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const c = 1 - 0.05 * Math.max(0, cloud[i]!) + 0.012 * (hash01(grain.id[i]!) - 0.5);
     L.r[i]! *= c;
     L.g[i]! *= c;
@@ -306,14 +321,16 @@ function marble(size: number): FinishMaps {
     L.rough[i]! += 0.04 * hash01(grain.id[i]! * 3);
     L.height[i]! += 0.00002 * (grain.f2[i]! - grain.f1[i]!);
   }
-  return pack(L, 0.3);
+  yield;
+  return yield* pack(L, 0.3);
 }
 
-function travertine(size: number): FinishMaps {
+function* travertine(size: number): Gen<FinishMaps> {
   const L = layers(size, 0.8, [srgb(222), srgb(212), srgb(192)], 0.5);
-  const fine = fbm(size, 64, 64, 3, 0.5, 61);
-  const cloud = fbm(size, 3, 6, 5, 0.55, 62);
+  const fine = yield* fbm(size, 64, 64, 3, 0.5, 61);
+  const cloud = yield* fbm(size, 3, 6, 5, 0.55, 62);
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const k = 1 + 0.05 * cloud[i]! + 0.03 * fine[i]!;
     L.r[i]! *= k;
     L.g[i]! *= k * 0.995;
@@ -321,17 +338,19 @@ function travertine(size: number): FinishMaps {
     L.height[i]! += 0.00015 * fine[i]!;
     L.rough[i]! += 0.06 * fine[i]!;
   }
-  return pack(L, 0.8);
+  yield;
+  return yield* pack(L, 0.8);
 }
 
 const GRANITE = [[28, 28, 30], [214, 208, 198], [128, 128, 132], [196, 170, 160], [22, 22, 24]].map((c) => c.map(srgb));
 
-function granite(size: number): FinishMaps {
+function* granite(size: number): Gen<FinishMaps> {
   const L = layers(size, 0.4, [srgb(150), srgb(146), srgb(142)], 0.3);
   // Salt-and-pepper: feldspar (white/cream), quartz (translucent grey), biotite/hornblende (black).
-  const w = worley(size, 150, 71);
-  const w2 = worley(size, 330, 72);
+  const w = yield* worley(size, 150, 71);
+  const w2 = yield* worley(size, 330, 72);
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const h = hash01(w.id[i]!);
     let c: number[];
     if (h < 0.22) c = GRANITE[0]!;
@@ -347,29 +366,33 @@ function granite(size: number): FinishMaps {
     L.rough[i] = h < 0.22 ? 0.22 : 0.32;
     L.height[i] = 0.00003 * (w.f2[i]! - w.f1[i]!);
   }
-  return pack(L, 0.3);
+  yield;
+  return yield* pack(L, 0.3);
 }
 
-function onyx(size: number): FinishMaps {
+function* onyx(size: number): Gen<FinishMaps> {
   const L = layers(size, 0.8, [srgb(220), srgb(180), srgb(118)], 0.1);
-  const fib = fbm(size, 6, 40, 5, 0.6, 81);
+  const fib = yield* fbm(size, 6, 40, 5, 0.6, 81);
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const k = 1 + 0.06 * fib[i]!;
     L.r[i]! *= k;
     L.g[i]! *= k;
     L.b[i]! *= k;
     L.height[i] = 0.00001 * fib[i]!;
   }
-  return pack(L, 0.2);
+  yield;
+  return yield* pack(L, 0.2);
 }
 
-function brick(size: number): FinishMaps {
+function* brick(size: number): Gen<FinishMaps> {
   const L = layers(size, 0.5, [srgb(138), srgb(74), srgb(56)], 0.86);
   // Sand-faced clay: fine grain, dark iron specks, fire flashing (clouds).
-  const fine = fbm(size, 90, 90, 3, 0.55, 91);
-  const cloud = fbm(size, 5, 5, 5, 0.55, 92);
-  const speck = worley(size, 240, 93);
+  const fine = yield* fbm(size, 90, 90, 3, 0.55, 91);
+  const cloud = yield* fbm(size, 5, 5, 5, 0.55, 92);
+  const speck = yield* worley(size, 240, 93);
   for (let i = 0; i < size * size; i++) {
+    if ((i & 0x3fff) === 0x3fff) yield;
     const k = 1 + 0.08 * fine[i]! + 0.1 * cloud[i]!;
     L.r[i]! *= k;
     L.g[i]! *= k * (1 - 0.05 * cloud[i]!);
@@ -380,26 +403,73 @@ function brick(size: number): FinishMaps {
     L.height[i]! += 0.0004 * fine[i]!;
     L.rough[i]! += 0.05 * fine[i]!;
   }
-  return pack(L, 1.0);
+  yield;
+  return yield* pack(L, 1.0);
 }
 
 const cache = new Map<string, FinishMaps>();
+/** Generations under way in slices (warmFinishMaps); a synchronous request finishes them. */
+const inflight = new Map<string, Gen<FinishMaps>>();
+
+/** Every finish, in the order the scenes most often need them. */
+export const ALL_FINISHES: readonly BrittleFinish[] = [
+  'board-formed-concrete', 'smooth-concrete', 'travertine', 'marble', 'onyx', 'granite', 'brick', 'exposed-aggregate',
+];
+
+function generate(finish: BrittleFinish, size: number): Gen<FinishMaps> {
+  switch (finish) {
+    case 'board-formed-concrete': return boardFormed(size);
+    case 'smooth-concrete': return smoothConcrete(size);
+    case 'exposed-aggregate': return exposedAggregate(size);
+    case 'marble': return marble(size);
+    case 'travertine': return travertine(size);
+    case 'granite': return granite(size);
+    case 'onyx': return onyx(size);
+    case 'brick': return brick(size);
+  }
+}
 
 /** Maps for a finish (generated on first use, then cached for the page lifetime). */
 export function finishMaps(finish: BrittleFinish, size = 512): FinishMaps {
   const key = `${finish}@${size}`;
-  let m = cache.get(key);
+  const m = cache.get(key);
   if (m) return m;
-  switch (finish) {
-    case 'board-formed-concrete': m = boardFormed(size); break;
-    case 'smooth-concrete': m = smoothConcrete(size); break;
-    case 'exposed-aggregate': m = exposedAggregate(size); break;
-    case 'marble': m = marble(size); break;
-    case 'travertine': m = travertine(size); break;
-    case 'granite': m = granite(size); break;
-    case 'onyx': m = onyx(size); break;
-    case 'brick': m = brick(size); break;
+  const g = inflight.get(key) ?? generate(finish, size);
+  let r = g.next();
+  while (!r.done) r = g.next();
+  inflight.delete(key);
+  cache.set(key, r.value);
+  return r.value;
+}
+
+export function hasFinishMaps(finish: BrittleFinish, size = 512): boolean {
+  return cache.has(`${finish}@${size}`);
+}
+
+/**
+ * Generate the maps of `finishes` ahead of use, in slices of about `sliceMs` of work separated by
+ * `pause()` (a macrotask by default), so it can run behind a menu without stalling frames. A
+ * synchronous finishMaps() call meanwhile completes the finish it asks for at once.
+ */
+export async function warmFinishMaps(
+  finishes: readonly BrittleFinish[] = ALL_FINISHES, size = 512, sliceMs = 8,
+  pause: () => Promise<void> = () => new Promise((res) => setTimeout(res, 0)),
+): Promise<void> {
+  for (const finish of finishes) {
+    const key = `${finish}@${size}`;
+    for (;;) {
+      if (cache.has(key)) break;
+      let g = inflight.get(key);
+      if (!g) inflight.set(key, (g = generate(finish, size)));
+      const t0 = performance.now();
+      let r = g.next();
+      while (!r.done && performance.now() - t0 < sliceMs) r = g.next();
+      if (r.done) {
+        inflight.delete(key);
+        cache.set(key, r.value);
+        break;
+      }
+      await pause();
+    }
   }
-  cache.set(key, m);
-  return m;
 }

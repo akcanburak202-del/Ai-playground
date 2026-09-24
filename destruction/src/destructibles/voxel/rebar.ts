@@ -27,8 +27,13 @@ export class RebarSet {
   chunkSegs = new Map<number, number[]>();
   private stamp: Uint32Array;
   private stampValue = 1;
-  /** Bumped whenever geometry/visibility changes (instancing refresh) */
+  /**
+   * Bumped whenever geometry, area or visibility changes (instancing refresh, cached mass). Code
+   * that edits nodes, segArea, segCut or segGone directly must bump it.
+   */
   version = 0;
+  private massCache = -1;
+  private massVersion = -1;
 
   constructor(nodes: Float32Array, nodeCount: number, segA: Int32Array, segB: Int32Array, segR: Float32Array, segCount: number) {
     this.nodes = nodes;
@@ -155,8 +160,9 @@ export class RebarSet {
     return pointSegDist2(px, py, pz, n[a]!, n[a + 1]!, n[a + 2]!, n[b]!, n[b + 1]!, n[b + 2]!);
   }
 
-  /** Mass of live steel, kg */
+  /** Mass of live steel, kg (cached per version: the structure graph asks for weights often). */
   mass(): number {
+    if (this.massVersion === this.version) return this.massCache;
     let m = 0;
     const rho = MATERIALS.rebar_b500.density;
     for (let s = 0; s < this.segCount; s++) {
@@ -165,6 +171,8 @@ export class RebarSet {
       const L = Math.hypot(n[b]! - n[a]!, n[b + 1]! - n[a + 1]!, n[b + 2]! - n[a + 2]!);
       m += rho * Math.PI * this.segR[s]! ** 2 * this.segArea[s]! * L;
     }
+    this.massCache = m;
+    this.massVersion = this.version;
     return m;
   }
 

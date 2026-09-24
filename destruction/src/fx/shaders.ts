@@ -97,11 +97,17 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         vUv = atlasUv(c, a5.y);
         vRot = vec2(cr, sr);
         // Fade in within a frame or two (an impact's ejecta appear at once), out over the last
-        // 45 %; a puff thins as it spreads.
+        // 45 %. A puff thins as it spreads: its aerosol mass is conserved, so the optical depth
+        // through it falls as 1 / size² (column mass M / πR²; Beer–Lambert opacity 1 − e^−τ). The
+        // spawn opacity sets τ at the birth size.
         float fadeIn = smoothstep(0.0, clamp(0.012 * life, 0.004, 0.04), age);
         float fadeOut = 1.0 - smoothstep(0.55, 1.0, x);
-        float spread = clamp((size - a3.x) / max(a3.y - a3.x, 1e-4), 0.0, 1.0);
-        vColor = vec4(a4.rgb * mix(a5.w, 1.0, smoothstep(0.0, 0.75, x)), a4.a * fadeIn * fadeOut * mix(1.0, 0.4, spread));
+        float tau0 = -log(1.0 - min(a4.a, 0.97));
+        float grow = a3.x / max(size, 1e-4);
+        // Never draw a puff over the lens: fade those whose centre comes within about their own
+        // size of the camera (the viewer standing in a muzzle or dust cloud sees into it, not a wall).
+        float nearFade = clamp((-mv.z - 0.2) / max(1.2 * size, 0.3), 0.0, 1.0);
+        vColor = vec4(a4.rgb * mix(a5.w, 1.0, smoothstep(0.0, 0.75, x)), tau0 * grow * grow * fadeIn * fadeOut * nearFade);
         // Incandescent puffs cool into soot within the first third of their life (radiative and
         // entrainment cooling of the detonation products).
         vHeat = a5.z > 0.0 ? a5.z * mix(1.0, 0.3, smoothstep(0.0, 0.45, x)) : 0.0;
@@ -139,7 +145,8 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
       void main() {
         vec4 tx = texture2D(uAtlas, vUv);
         float dens = tx.a;
-        float a = dens * vColor.a;
+        // vColor.a is the optical depth through the puff's centre; the atlas alpha its profile.
+        float a = 1.0 - exp(-dens * vColor.a);
         if (a < 0.002) discard;
         a *= softFade(vViewDepth, vSoft);
         vec2 n2 = tx.rg * 2.0 - 1.0;

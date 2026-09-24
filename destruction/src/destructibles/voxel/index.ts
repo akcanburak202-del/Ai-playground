@@ -4,6 +4,7 @@ import { VoxelElement } from './VoxelElement.ts';
 
 export { VoxelElement, type VoxelStats } from './VoxelElement.ts';
 export { schedulerFor, RemeshScheduler } from './scheduler.ts';
+export { warmVoxelLooks, disposeVoxelTextures } from './look.ts';
 
 /**
  * Build a brittle voxel element (concrete, stone, brick; optionally reinforced) and register it

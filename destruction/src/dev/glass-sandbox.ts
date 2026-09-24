@@ -377,6 +377,7 @@ const demo = {
     const info = ctx.renderer.info;
     const dice = ctx.scene.children.find((c) => c.name === 'glass-dice') as THREE.Mesh | undefined;
     out.dice = dice ? (dice.geometry as THREE.InstancedBufferGeometry).instanceCount : 0;
+    out.probes = ReflectionProbes.of(ctx)?.stats ?? null;
     out.bodies = ctx.physics.dynamicCount;
     out.drawCalls = info.render.calls;
     out.triangles = info.render.triangles;

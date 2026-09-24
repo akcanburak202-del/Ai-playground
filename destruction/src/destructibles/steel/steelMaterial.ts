@@ -149,3 +149,51 @@ export function maxBlastMomentum(tntKg: number, kind?: BlastKind): number {
   // the same share bounds the momentum its products can push the target with.
   return Math.max(0, tntKg) * 2440 * (kind === 'shaped' ? SHAPED_CONTACT_COUPLING : 1);
 }
+
+/**
+ * Impulse a charge in contact gives the struck member, N·s: I ≈ 1 000 N·s per kg TNT — half the
+ * momentum (8/27)·W·D of a slab charge detonating against a rigid wall (D = 6.9 km/s), the rest
+ * leaving sideways from a compact charge. The same figure the ballistics module feeds Nurick &
+ * Martin's dish relation with (blast.ts `contactDish`, PHYSICS.md §7.1), so the member's global
+ * push and its local dish come from one impulse. Shaped charges couple SHAPED_CONTACT_COUPLING.
+ */
+export function contactImpulse(tntKg: number, kind?: BlastKind): number {
+  return Math.max(0, tntKg) * 1000 * (kind === 'shaped' ? SHAPED_CONTACT_COUPLING : 1);
+}
+
+/**
+ * Permanent mid-point deflection of a clamped plate panel under a localised impulse, m.
+ * Nurick & Martin (1989, Int. J. Impact Eng. 8, 159–186), localised-load form:
+ *     φ = I (1 + ln(R / r0)) / (π R t² √(ρ σ_y)),   δ/t = 0.480 φ + 0.277   (φ ≥ 1)
+ * with I the total impulse on the panel (N·s), R the panel radius, r0 the loaded radius and t the
+ * thickness. Below φ = 1 the panel barely yields: δ/t falls linearly to 0 (as blast.ts contactDish).
+ * For a member the panel is the struck plate between its supports: a flange outstand pair
+ * (R = b/2), a web (R = h/2 − t_f), a box wall (R = its half width).
+ */
+export function panelDish(p: SteelParams, impulse: number, R: number, r0: number, t: number): number {
+  if (!(impulse > 0) || !(t > 0) || !(R > 0)) return 0;
+  const r = Math.min(Math.max(r0, 1e-3), R);
+  const phi = (impulse * (1 + Math.log(R / r))) / (Math.PI * R * t * t * Math.sqrt(p.rho * p.fy));
+  const dt = phi >= 1 ? 0.48 * phi + 0.277 : 0.757 * phi;
+  return t * dt;
+}
+
+/**
+ * Two permanent dishes at the same spot. In the membrane regime the energy a dish of depth δ
+ * absorbs grows as δ² (plastic membrane work ∝ N_0 δ²), so a second load that alone would dish
+ * the pristine panel by δ₂ deepens a dish δ₁ to √(δ₁² + δ₂²): Jones' "pseudo-shakedown" of
+ * plating under repeated impacts (N. Jones, Int. J. Impact Eng. 72, 2014: δ_N ∝ √N for equal
+ * loads). The increment therefore shrinks with every hit, as the tests show.
+ */
+export function accumulateDish(prev: number, add: number): number {
+  return Math.sqrt(prev * prev + add * add);
+}
+
+/**
+ * Mean radial membrane strain of a parabolic dish w = δ (1 − r²/R²): ε = ⟨½ w'²⟩ = (δ/R)²
+ * (moderate-rotation membrane strain, e.g. Jones, Structural Impact 1989 §7.4). The sheet thins
+ * by volume constancy, t' = t / (1 + ε).
+ */
+export function dishStrain(depth: number, R: number): number {
+  return (depth / Math.max(R, 1e-4)) ** 2;
+}

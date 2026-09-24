@@ -25,6 +25,11 @@ export function setGroundProvider(scene: THREE.Scene, p: GroundProvider | null):
   else providers.delete(scene);
 }
 
+/** True while a terrain (or another ground provider) is registered for this scene. */
+export function hasGroundProvider(scene: THREE.Scene): boolean {
+  return providers.has(scene);
+}
+
 export function groundOf(scene: THREE.Scene): GroundProvider {
   return providers.get(scene) ?? FLAT;
 }

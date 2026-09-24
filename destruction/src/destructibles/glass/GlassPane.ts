@@ -17,7 +17,7 @@ import { createGlassUniforms, createReflectionMaterial, createTransmissionMateri
 import { DICE_CAP, DiceSystem, type DieSpawn } from './DiceSystem.ts';
 import { HeapDecal } from './HeapDecal.ts';
 import { FloorProbe } from './floor.ts';
-import { admitBlast, allowance, spend } from './budget.ts';
+import { allowance, blastJob, drainBlasts, dropBlasts, spend } from './budget.ts';
 import { Membrane } from './membrane.ts';
 import { Shards } from './Shards.ts';
 import { ReflectionProbes } from './probes.ts';
@@ -168,10 +168,12 @@ export class GlassPane implements Destructible, Structural {
   private knock: { x: number; y: number; r: number; R: number; v0: number }[] = [];
   /** Unit in-plane direction of gravity (pane-local x, y) and the in-plane share of g, 0..1 */
   private readonly gIn = [0, -1, 1];
-  private pendingBlasts: BlastLoad[] = [];
   /** Crack segments left to draw (blast stars are drawn over a few steps) */
   private cracksPending = false;
-  private blastWaits = 0;
+  /** Deferrable jobs run within the scene's glass budget (see fixedUpdate), bound once */
+  private readonly diceWork = (ms: number) => this.runDiceJob(ms);
+  private readonly releaseWork = (ms: number) => this.runReleaseQueue(ms);
+  private readonly crackWork = (ms: number) => this.paintCracks(ms);
   private shards: Shards | null = null;
   private lastHit = { x: 0, y: 0, time: -1e9, p: new THREE.Vector3(), R: 0.05 };
   /** Releases are reported as few, aggregated 'shatter' events (sound and dust per burst, not per piece). */
@@ -913,6 +915,8 @@ export class GlassPane implements Destructible, Structural {
       if (j0 - k >= 0) rows.push(j0 - k);
     }
     this.heapFirst = ds.spawned;
+    // The dice are spawned by fixedUpdate within the scene's glass budget (the first ones leave
+    // after the crazed pane's hold; one spawned late starts where its closed-form flight has got to).
     this.diceJob = {
       timing, s, d, salt, nx, ny, rows, next: 0, fadeAt, x, y,
       impactP: cause.kind === 'impact' ? cause.ev.momentum.clone() : null,
@@ -920,7 +924,6 @@ export class GlassPane implements Destructible, Structural {
       field: cause.kind === 'blast' ? cause.field : null,
       heap: new Float32Array(2 * nx * ny), heapFloor: new Float32Array(nx * ny), nh: 0,
     };
-    this.runDiceJob(8);
     this.goneArea = W * H;
     // The whole pane lets go: glitter burst at the origin and the shatter event (sound, FX).
     const origin = this.toWorld(x, y, 0, new THREE.Vector3());
@@ -928,7 +931,7 @@ export class GlassPane implements Destructible, Structural {
     this.ctx.fx.chips({ position: origin, direction: this.normalW.clone().multiplyScalar(away), spread: 1.3, speed: blast ? 25 : 4, count: 60, size: 0.005, color: this.material.color, kind: 'glass' });
     this.ctx.events.emit('shatter', { time: now, position: this.bounds.getCenter(new THREE.Vector3()), area: W * H, material: this.material });
     this.ctx.structure.touch(this);
-    // Cost of the frame the pane broke in (the dice spawn continues over the next frames).
+    // Cost of the break itself (the dice are spawned over the next steps).
     this.stats.breakMs = performance.now() - t0;
   }
 
@@ -1229,20 +1232,15 @@ export class GlassPane implements Destructible, Structural {
     return { nx, ny, D, I, max, ox, oy, center: load.center.clone(), contact };
   }
 
+  /**
+   * Process a blast now if the scene's per-step glass budget allows, else in the next steps, in the
+   * order the shock front reached the panes (see budget.ts).
+   */
   applyBlast(load: BlastLoad): void {
-    this.blastWithin(load, false);
-  }
-
-  /** Process a blast now if the scene's per-step budget allows (or `force`), else defer it a step. */
-  private blastWithin(load: BlastLoad, force: boolean): void {
     if (this.disposed || this.hasFailed()) return;
-    if (!admitBlast(this.ctx) && !force) {
-      this.pendingBlasts.push(load);
-      return;
-    }
-    const t0 = performance.now();
-    this.processBlast(load);
-    spend(this.ctx, performance.now() - t0);
+    blastJob(this.ctx, this, () => {
+      if (!this.disposed && !this.hasFailed()) this.processBlast(load);
+    });
   }
 
   private processBlast(load: BlastLoad): void {
@@ -1306,29 +1304,12 @@ export class GlassPane implements Destructible, Structural {
 
   fixedUpdate(dt: number): void {
     if (this.disposed) return;
+    // Blasts the budget deferred go first (scene-wide, once per step), then this pane's queued work.
+    drainBlasts(this.ctx);
     // Dice of a broken tempered pane still being spawned (a few ms per step, centre-out).
-    if (this.diceJob) {
-      const t = performance.now();
-      this.runDiceJob(allowance(this.ctx, this.diceJob.field ? 12 : 5, 2));
-      spend(this.ctx, performance.now() - t);
-    }
-    if (this.releaseQueue.length) {
-      const t = performance.now();
-      this.runReleaseQueue(allowance(this.ctx, 5, 1));
-      spend(this.ctx, performance.now() - t);
-    }
-    if (this.cracksPending) {
-      const t = performance.now();
-      this.paintCracks(allowance(this.ctx, 4, 1));
-      spend(this.ctx, performance.now() - t);
-    }
-    if (this.pendingBlasts.length) {
-      // Deferred by the shared budget; after a few steps it goes through regardless, so a stalled
-      // clock (or a scene of many panes) never starves one.
-      this.blastWaits++;
-      this.blastWithin(this.pendingBlasts.shift()!, this.blastWaits > 8);
-      if (!this.pendingBlasts.length) this.blastWaits = 0;
-    }
+    if (this.diceJob) this.budgeted(this.diceJob.field ? 8 : 5, 1, this.diceWork);
+    if (this.releaseQueue.length) this.budgeted(5, 1, this.releaseWork);
+    if (this.cracksPending) this.budgeted(4, 1, this.crackWork);
     const t0 = performance.now();
     const now = this.ctx.time.now;
     if (this.type === 'annealed') {
@@ -1378,6 +1359,15 @@ export class GlassPane implements Destructible, Structural {
       if (emitted) this.lastShatter = now;
     }
     this.stats.stepMs = performance.now() - t0;
+  }
+
+  /** Run a deferrable job with what the scene's glass budget allows this step (skipped when nothing). */
+  private budgeted(cap: number, floor: number, job: (ms: number) => void): void {
+    const ms = allowance(this.ctx, cap, floor);
+    if (ms <= 0) return;
+    const t = performance.now();
+    job(ms);
+    spend(this.ctx, performance.now() - t);
   }
 
   private emitShatter(p: THREE.Vector3, area: number): void {
@@ -1491,7 +1481,14 @@ export class GlassPane implements Destructible, Structural {
         growStar(g, 0, 0, 0, blastStar(1.3, this.width, this.height, this.rnd), this.rnd, (x, y) => this.isGone(x, y));
         this.paintCracks();
         const faces = this.currentFaces(g).filter((f) => !this.isGone(f.sample[0], f.sample[1]));
-        for (const f of faces) this.releaseFace(f, null, false);
+        // Every piece leaves now (the hole shows at once); their bodies are spawned within the
+        // scene's glass budget over the next steps, largest first, as after a blast.
+        faces.sort((a, b) => b.area - a.area);
+        const now = this.ctx.time.now;
+        for (const f of faces) {
+          this.markGone(f.outer, f.holes, false);
+          this.releaseQueue.push({ face: f, field: null, rigid: true, t0: now });
+        }
         this.paintGone(faces);
         break;
       }
@@ -1542,7 +1539,7 @@ export class GlassPane implements Destructible, Structural {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.pendingBlasts.length = 0;
+    dropBlasts(this.ctx, this);
     this.root.removeFromParent();
     this.boxGeom.dispose();
     this.lam?.geom.dispose();

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
-import { FxSystem, BUDGET } from '../src/fx/FxSystem.ts';
+import { FxSystem, BUDGET, fractureDustRadius } from '../src/fx/FxSystem.ts';
 import { ParticleLayer, newRecord } from '../src/fx/ParticleLayer.ts';
 import { EventBus } from '../src/core/events.ts';
 import { Rng } from '../src/core/rng.ts';
@@ -170,5 +170,87 @@ test('fx system: sustained 30 mm fire (GAU-8, 65 rounds/s) is thinned before it 
   assert.ok(last5 < BUDGET.chips, `chips emitted in 5 s of fire: ${last5}`);
   assert.ok(last5 > 500, `the burst still throws debris (${last5})`);
   assert.ok(allFinite(fx));
+  fx.dispose();
+});
+
+/** Live smoke particles as {pos, size0, size1, t0, life}. */
+function smokeParticles(fx: FxSystem, now: number): { x: number; y: number; z: number; s0: number; s1: number; life: number }[] {
+  const g = fx.smokeLayer.mesh.geometry;
+  const a0 = (g.getAttribute('a0') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const a1 = (g.getAttribute('a1') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const a3 = (g.getAttribute('a3') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const out = [];
+  for (let i = 0; i < fx.smokeLayer.capacity; i++) {
+    const t0 = a0[i * 4 + 3]!, life = a1[i * 4 + 3]!;
+    if (t0 > now + 1 || now - t0 > life) continue;
+    out.push({ x: a0[i * 4]!, y: a0[i * 4 + 1]!, z: a0[i * 4 + 2]!, s0: a3[i * 4]!, s1: a3[i * 4 + 1]!, life });
+  }
+  return out;
+}
+
+test('fx: collapse dust follows fracture surface, not the mass that lost its support', () => {
+  // Fines scale with the new fracture area: more pieces, more dust; bounded either way.
+  assert.ok(fractureDustRadius(1, 8) > fractureDustRadius(1, 2));
+  assert.ok(fractureDustRadius(10, 8) > fractureDustRadius(1, 8));
+  for (const [v, n] of [[1e-6, 1], [0.01, 3], [1, 8], [14, 30], [500, 1000]] as const) {
+    const r = fractureDustRadius(v, n);
+    assert.ok(r >= 0.15 && r <= 1.6, `radius ${r} for ${v} m³ in ${n}`);
+  }
+  const { sim, ctx } = fakeSim();
+  const fx = new FxSystem(sim);
+  ctx.fx = fx;
+  ctx.time.now = 1;
+  // A 35 t slab and a steel column losing support / buckling: no dust from the failure itself.
+  ctx.events.emit('structuralFailure', { time: 1, position: new THREE.Vector3(0, 10, 0), label: 'slab', mass: 35000, cause: 'support-lost' });
+  ctx.events.emit('structuralFailure', { time: 1, position: new THREE.Vector3(0, 2, 0), label: 'col', mass: 220, cause: 'buckling', material: MATERIALS.steel_s355 });
+  assert.equal(fx.smokeLayer.emitted, 0);
+  // A crushing concrete column puffs, modestly.
+  ctx.events.emit('structuralFailure', { time: 1, position: new THREE.Vector3(3, 1, 0), label: 'pier', mass: 80000, cause: 'crushing', material: MATERIALS.concrete });
+  const puffs = smokeParticles(fx, 1);
+  assert.ok(puffs.length > 0 && puffs.length <= 12);
+  assert.ok(puffs.every((p) => p.s1 < 4.5), 'crushing dust stays a few metres wide');
+  fx.dispose();
+});
+
+test('fx: a tank gun fired by the viewer makes a brief cloud ahead of the muzzle, not around the eye', () => {
+  const { sim, ctx } = fakeSim();
+  const fx = new FxSystem(sim);
+  ctx.fx = fx;
+  ctx.time.now = 1;
+  const eye = new THREE.Vector3(0, 1.6, 0);
+  const d = new THREE.Vector3(0, 0, -1);
+  const muzzle = eye.clone().add(new THREE.Vector3(0, -1.2, -3));
+  ctx.events.emit('shot', { time: 1, weapon: { id: 'tankgun', name: '', role: '', category: 'cannon', ammo: ['m829a4'], rpm: 8, fireMode: 'single', dispersionMOA: 1, tracerEvery: 0, delivery: 'direct', recoil: 1, sound: '', zoom: 1, muzzleOffset: [0, -1.2, 3] }, ammo: getAmmo('m829a4'), origin: muzzle, direction: d });
+  const puffs = smokeParticles(fx, 1);
+  assert.ok(puffs.length > 0);
+  for (const p of puffs) {
+    assert.ok(p.s1 <= 3.5, `puff half-size ${p.s1.toFixed(2)} m`);
+    assert.ok(p.life <= 4, `puff life ${p.life.toFixed(2)} s`);
+    // Born at or ahead of the muzzle, never between the muzzle and the eye.
+    assert.ok((p.z - muzzle.z) * d.z >= -0.05, 'ahead of the muzzle');
+    assert.ok(Math.hypot(p.x - eye.x, p.y - eye.y, p.z - eye.z) > 2.5, 'clear of the eye');
+  }
+  // The flash light is out within ≈ 0.15 s.
+  fx.lights.update(1.15);
+  for (const l of fx.lights.group.children as THREE.PointLight[]) assert.ok(l.intensity < 1, `light ${l.intensity}`);
+  fx.dispose();
+});
+
+test('fx: a 1 kg detonation flash is brief and local', () => {
+  const { sim, ctx } = fakeSim();
+  const fx = new FxSystem(sim);
+  ctx.fx = fx;
+  ctx.time.now = 1;
+  ctx.events.emit('blast', { center: new THREE.Vector3(0, 1, 0), tntKg: 1, kind: 'shaped', normal: new THREE.Vector3(0, 0, 1), time: 1, fireballRadius: 1.75 });
+  const lights = fx.lights.group.children as THREE.PointLight[];
+  fx.lights.update(1.004);
+  const peak = Math.max(...lights.map((l) => l.intensity));
+  assert.ok(peak > 100, `peak ${peak}`);
+  const lit = lights.find((l) => l.intensity === peak)!;
+  assert.ok(lit.distance > 0 && lit.distance <= 6 * 1.75 + 4 + 1e-9, `reach ${lit.distance}`);
+  fx.lights.update(1.06);
+  assert.ok(Math.max(...lights.map((l) => l.intensity)) < 0.01 * peak, 'down to 1 % within 60 ms');
+  // No dotted shock-front puffs: every ground-dust puff of the blast starts within the fireball's reach.
+  for (const p of smokeParticles(fx, 1)) assert.ok(Math.hypot(p.x, p.z) < 3 * 1.75, `puff at r = ${Math.hypot(p.x, p.z).toFixed(2)}`);
   fx.dispose();
 });

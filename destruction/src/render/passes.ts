@@ -12,6 +12,50 @@ export interface FrameState {
   depth: THREE.DepthTexture | null;
 }
 
+/** Largest value the half-float scene target can hold (65 504), rounded down. */
+export const HDR_MAX = 6.0e4;
+
+/**
+ * GLSL: replace non-finite HDR values. A mirror highlight above the half-float range is written as
+ * +Inf (e.g. the sun in glass at GGX roughness 0.015: D = 1/(π r⁴) ≈ 6·10⁶, Walter et al. 2007), and
+ * Inf − Inf or 0 · Inf in a later shader make NaN; bloom's blur chain spreads either over the whole
+ * frame. +Inf becomes the largest finite value (it is the brightest thing in view), NaN becomes 0.
+ * Written with ordered comparisons (false for NaN) so no NaN-folding optimiser can remove the test.
+ */
+export const FINITE_GLSL = /* glsl */ `
+float finiteHdr(float x) { return abs(x) <= ${HDR_MAX.toFixed(1)} ? x : (x > 0.0 ? ${HDR_MAX.toFixed(1)} : 0.0); }
+vec4 finiteHdr(vec4 c) {
+  return vec4(finiteHdr(c.r), finiteHdr(c.g), finiteHdr(c.b), c.a >= 0.0 && c.a <= 1.0 ? c.a : 1.0);
+}
+`;
+
+/**
+ * Bloom input guard: UnrealBloomPass's luminosity high pass is the only input of its blur chain, so
+ * making it pass only finite values keeps a single overflowing pixel from turning into a frame-wide
+ * NaN. The input is also scaled down to at most `cap` per channel (hue kept): an optically thick
+ * body cannot outshine a black body at its temperature, but additive flame billboards stack to
+ * several hundred where a fireball's cores overlap, and the glare of that sum veiled the whole frame
+ * white. 48 ≈ the radiance of 2200–2300 K gas (fx glow()): white-hot surfaces bloom fully, stacked
+ * layers add nothing more to the glare. Patched once per material; sets `userData.nanGuard`.
+ */
+export function guardBloomInput(m: THREE.ShaderMaterial | undefined, cap = 48): void {
+  if (!m || m.userData.nanGuard) return;
+  const src = 'vec4 texel = texture2D( tDiffuse, vUv );';
+  if (!m.fragmentShader.includes(src)) throw new Error('three UnrealBloomPass high-pass shader changed: update guardBloomInput');
+  m.fragmentShader = m.fragmentShader.replace(
+    'void main() {',
+    `${FINITE_GLSL}\nvoid main() {`,
+  ).replace(
+    src,
+    `${src}
+			texel = finiteHdr( texel );
+			float texelMax = max( max( texel.r, texel.g ), texel.b );
+			if ( texelMax > ${cap.toFixed(1)} ) texel.rgb *= ${cap.toFixed(1)} / texelMax;`,
+  );
+  m.userData.nanGuard = true;
+  m.needsUpdate = true;
+}
+
 /**
  * Opaque scene into the composer's read buffer (with a depth texture). The effects root is hidden
  * here: particles are composited later with soft depth, after AO and haze, so AO never darkens
@@ -149,6 +193,7 @@ export class CompositePass extends Pass {
       vertexShader: /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
       fragmentShader: /* glsl */ `
         ${ATMOSPHERE_GLSL}
+        ${FINITE_GLSL}
         uniform sampler2D tColor;
         uniform highp sampler2D tDepth;
         uniform sampler2D tAO;
@@ -158,7 +203,8 @@ export class CompositePass extends Pass {
         uniform vec3 camPos;
         varying vec2 vUv;
         void main() {
-          vec4 c = texture2D(tColor, vUv);
+          // Sanitise the scene HDR once, before AO, haze, particles, bloom and tone mapping.
+          vec4 c = finiteHdr(texture2D(tColor, vUv));
           float z = texture2D(tDepth, vUv).x;
           if (z >= 1.0) { gl_FragColor = c; return; }
           // AO darkens the ambient term only; a sun-lit pixel is dominated by direct light that the

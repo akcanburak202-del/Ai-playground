@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { BrittleFinish } from '../../app/contracts.ts';
-import { finishMaps } from './textures.ts';
+import { ALL_FINISHES, finishMaps, warmFinishMaps } from './textures.ts';
+import { FamilyBatches } from './batch.ts';
 import {
   FRAG_AO, FRAG_DISCARD, FRAG_EMISSIVE, FRAG_VARYINGS, FRAG_MAP, FRAG_NOISE, FRAG_NORMAL, FRAG_ROUGHNESS, FRAG_SURFACE,
   REBAR_FRAG_MAP, REBAR_FRAG_PARS, REBAR_VERT_MAIN, REBAR_VERT_PARS, VERT_MAIN, VERT_PARS,
@@ -23,12 +24,15 @@ const FINISH_DEFINE: Record<BrittleFinish, string> = {
   brick: 'FINISH_BRICK',
 };
 
-/** GPU textures per finish, reference counted so the last element to go disposes them. */
+/**
+ * GPU textures per finish. They are kept for the page lifetime once made (≈ 2.7 MB of GPU memory
+ * per finish with mipmaps; the CPU maps are cached anyway), so a scene load does not upload and
+ * mip-map them again; disposeVoxelTextures() frees them.
+ */
 class FinishTextures {
   readonly ar: THREE.DataTexture;
   readonly nh: THREE.DataTexture;
   readonly tile: number;
-  refs = 0;
   constructor(finish: BrittleFinish, anisotropy: number) {
     const m = finishMaps(finish);
     this.tile = m.tile;
@@ -57,16 +61,37 @@ const textures = new Map<BrittleFinish, FinishTextures>();
 function acquireTextures(finish: BrittleFinish, anisotropy: number): FinishTextures {
   let t = textures.get(finish);
   if (!t) textures.set(finish, (t = new FinishTextures(finish, anisotropy)));
-  t.refs++;
   return t;
 }
 
-function releaseTextures(finish: BrittleFinish): void {
-  const t = textures.get(finish);
-  if (!t) return;
-  if (--t.refs <= 0) {
-    t.dispose();
-    textures.delete(finish);
+/** Free the cached finish textures (elements still using them re-create them on demand). */
+export function disposeVoxelTextures(): void {
+  for (const t of textures.values()) t.dispose();
+  textures.clear();
+}
+
+/** Yield to the browser until it is idle (or a macrotask where requestIdleCallback is missing). */
+function idle(): Promise<void> {
+  const ric = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+  return new Promise((res) => (ric ? ric(() => res(), { timeout: 100 }) : setTimeout(res, 0)));
+}
+
+/**
+ * Prepare the finish textures before any element needs them: generate the maps in slices of
+ * about `sliceMs` of work while the browser is idle (≈ 1.3 s of work for all eight finishes),
+ * then, given the renderer, upload them to the GPU one finish per idle period. Safe to call
+ * behind a menu while a scene is live; an element that needs a finish first finishes it at once.
+ */
+export async function warmVoxelLooks(finishes: readonly BrittleFinish[] = ALL_FINISHES, opts: { renderer?: THREE.WebGLRenderer; sliceMs?: number } = {}): Promise<void> {
+  await warmFinishMaps(finishes, 512, opts.sliceMs ?? 8, idle);
+  const r = opts.renderer;
+  if (!r) return;
+  const aniso = Math.min(8, r.capabilities?.getMaxAnisotropy?.() ?? 4);
+  for (const f of finishes) {
+    const t = acquireTextures(f, aniso);
+    r.initTexture(t.ar);
+    r.initTexture(t.nh);
+    await idle();
   }
 }
 
@@ -97,16 +122,18 @@ export interface DiscardUniforms {
 }
 
 /**
- * Materials of one element family (an element and the debris pieces cut from it). The chunk
- * material is shared by the family; base materials are per element because each has its own
- * chunk mask.
+ * Materials of one element family (an element and the debris pieces cut from it). Re-meshed
+ * chunks and debris draw through BatchedMeshes (batch.ts) with the family's batched materials;
+ * base materials are per element because each has its own chunk mask.
  */
 export class VoxelLook {
   readonly finish: BrittleFinish;
-  readonly chunkMaterial: THREE.MeshStandardMaterial;
-  /** Same surface for loose debris pieces (more angular fracture shading) */
-  readonly debrisMaterial: THREE.MeshStandardMaterial;
   readonly rebarMaterial: THREE.MeshStandardMaterial;
+  /** Draw batches shared by the family's loose pieces (see batch.ts) */
+  readonly batches: FamilyBatches;
+  private debrisBatchMaterial: THREE.MeshStandardMaterial | null = null;
+  private chunkBatchMaterial: THREE.MeshStandardMaterial | null = null;
+  private rebarBatchMaterial: THREE.MeshStandardMaterial | null = null;
   private tex: FinishTextures;
   private shared: Record<string, THREE.IUniform>;
   private refs = 0;
@@ -126,9 +153,12 @@ export class VoxelLook {
       uShape: { value: new THREE.Vector4(shape?.kind ?? 0, shape?.radius ?? 0, shape?.halfHeight ?? 0, shape?.taper ?? 0) },
       uShape2: { value: new THREE.Vector2(shape?.flutes ?? 0, shape?.fluteDepth ?? 0) },
     };
-    this.chunkMaterial = this.makeSurface(true, null);
-    this.debrisMaterial = this.makeSurface(true, null, true);
-    this.rebarMaterial = makeRebarMaterial();
+    this.rebarMaterial = makeRebarMaterial(false);
+    this.batches = new FamilyBatches(
+      finish,
+      () => (this.debrisBatchMaterial ??= this.makeSurface(true, null, true, true)),
+      () => (this.rebarBatchMaterial ??= makeRebarMaterial(true)),
+    );
   }
 
   acquire(): this {
@@ -138,10 +168,16 @@ export class VoxelLook {
 
   release(): void {
     if (--this.refs > 0) return;
-    this.chunkMaterial.dispose();
-    this.debrisMaterial.dispose();
+    this.batches.dispose();
+    this.debrisBatchMaterial?.dispose();
+    this.chunkBatchMaterial?.dispose();
+    this.rebarBatchMaterial?.dispose();
     this.rebarMaterial.dispose();
-    releaseTextures(this.finish);
+  }
+
+  /** Surface of a static element's re-meshed chunks, drawn through one BatchedMesh per element. */
+  batchedChunkMaterial(): THREE.MeshStandardMaterial {
+    return (this.chunkBatchMaterial ??= this.makeSurface(true, null, false, true));
   }
 
   /** Material for the analytic base mesh: same surface, no damage attributes, chunk discard. */
@@ -171,13 +207,14 @@ export class VoxelLook {
     return { depth, distance };
   }
 
-  private makeSurface(attrs: boolean, discard: DiscardUniforms | null, debris = false): THREE.MeshStandardMaterial {
+  private makeSurface(attrs: boolean, discard: DiscardUniforms | null, debris = false, batched = false): THREE.MeshStandardMaterial {
     const m = new THREE.MeshStandardMaterial(standardParams(this.finish));
     const defines: Record<string, string> = { [FINISH_DEFINE[this.finish]]: '' };
     if (attrs) defines.VOXEL_ATTRS = '';
     if (debris) defines.VOXEL_DEBRIS = '';
     if (attrs && this.flatPristine) defines.VOXEL_FLAT_PRISTINE = '';
     if (discard) defines.VOXEL_DISCARD = '';
+    if (batched) defines.VOXEL_BATCHED = '';
     const shared = this.shared;
     m.onBeforeCompile = (shader) => {
       Object.assign(shader.uniforms, shared);
@@ -195,15 +232,17 @@ export class VoxelLook {
         .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${FRAG_EMISSIVE}`)
         .replace('#include <aomap_fragment>', `#include <aomap_fragment>\n${FRAG_AO}`);
     };
-    const key = `voxel-${this.finish}-${attrs ? 'a' : ''}${discard ? 'd' : ''}${attrs && this.flatPristine ? 'f' : ''}${debris ? 'r' : ''}`;
+    const key = `voxel-${this.finish}-${attrs ? 'a' : ''}${discard ? 'd' : ''}${attrs && this.flatPristine ? 'f' : ''}${debris ? 'r' : ''}${batched ? 'b' : ''}`;
     m.customProgramCacheKey = () => key;
     return m;
   }
 }
 
-function makeRebarMaterial(): THREE.MeshStandardMaterial {
+/** Bar material; `baked` for debris bars merged into one geometry per piece (see batch.ts). */
+function makeRebarMaterial(baked: boolean): THREE.MeshStandardMaterial {
   const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 1 });
   m.onBeforeCompile = (shader) => {
+    if (baked) shader.defines = { ...(shader.defines ?? {}), REBAR_BAKED: '' };
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${REBAR_VERT_PARS}`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>\n${REBAR_VERT_MAIN}`);
@@ -214,6 +253,6 @@ function makeRebarMaterial(): THREE.MeshStandardMaterial {
       .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = barMetal;')
       .replace('#include <normal_fragment_maps>', 'normal = vxBump(normal, -vViewPosition, rib * 0.0007, 1.0);');
   };
-  m.customProgramCacheKey = () => 'voxel-rebar';
+  m.customProgramCacheKey = () => (baked ? 'voxel-rebar-baked' : 'voxel-rebar');
   return m;
 }

@@ -47,6 +47,70 @@ export function createGlassUniforms(crack: THREE.Texture, w: number, h: number, 
   };
 }
 
+// ─── Specular guard ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Roughness floor of the glass reflection pass for image-based light (environment and probes).
+ * Float glass is optically flat, so reflections stay sharper than three's default floor (0.0525,
+ * which hides cube-map mip aliasing on rough materials); the PMREM base level is sharp either way.
+ */
+export const GLASS_ENV_ROUGHNESS = 0.03;
+/**
+ * Roughness floor for direct (punctual) light. A flat mirror shows the sun as its disc, never as
+ * something smaller: GGX (Walter et al. 2007, α = r²) has D ≈ α² / (π (α² + θh²)²) near the peak,
+ * half its peak at θh ≈ 0.64 α, and a reflected ray turns by 2 θh; matching the solar disc's angular
+ * radius (0.2666°, 4.65 mrad; Allen's Astrophysical Quantities) gives α ≈ 3.6·10⁻³, r ≈ 0.06. At the
+ * earlier floor of 0.015 the peak D = 1/(π α²) ≈ 6·10⁶ overflowed the half-float scene target to +Inf.
+ */
+export const GLASS_SUN_ROUGHNESS = 0.06;
+/**
+ * Brightest a mirrored punctual light may be, as radiance per unit of the light's irradiance
+ * (directLight.color = E): the sky draws its sun disc at ≈ 25× a sun-lit white wall (E/π; see
+ * Pipeline/sky.ts), and a reflection is never brighter than the source it reflects. Near grazing
+ * the GGX visibility term 1/(4 N·L N·V) would otherwise push the glint of a 0.06 lobe past 10⁵.
+ */
+export const GLASS_GLINT = 25 / Math.PI;
+/** Final guard on anything a glass pass adds to the frame (half-float target max 65 504), scene-linear. */
+export const GLASS_MAX_RADIANCE = 2000;
+
+const DIRECT_BRDF = 'vec3 specularBRDF = BRDF_GGX( directLight.direction, geometryViewDir, geometryNormal, material );';
+const DIRECT_ADD = 'reflectedLight.directSpecular += irradiance * specularBRDF * material.multiScatteringCompensation;';
+const ROUGHNESS_FLOOR = 'max( roughnessFactor, 0.0525 )';
+const PARS = THREE.ShaderChunk.lights_physical_pars_fragment;
+/** three's chunk still has the lines the guard rewrites (else only the final clamp applies). */
+const PARS_OK = PARS.includes(DIRECT_BRDF) && PARS.includes(DIRECT_ADD);
+
+/**
+ * Keep a physically based glass/dice shader finite and sane: roughness floors for image-based and
+ * direct light, a cap on each punctual light's mirror glint, and a last clamp (NaN/Inf → 0) of the
+ * outgoing radiance. `envFloor` null leaves three's image-based floor alone.
+ */
+function guardSpecular(shader: { fragmentShader: string }, envFloor: number | null): void {
+  let fs = shader.fragmentShader;
+  if (PARS_OK) {
+    fs = fs.replace(
+      '#include <lights_physical_pars_fragment>',
+      PARS.replace(
+        DIRECT_BRDF,
+        /* glsl */ `PhysicalMaterial gSunMaterial = material;
+        gSunMaterial.roughness = max( material.roughness, ${GLASS_SUN_ROUGHNESS.toFixed(4)} );
+        vec3 specularBRDF = BRDF_GGX( directLight.direction, geometryViewDir, geometryNormal, gSunMaterial );`,
+      ).replace(
+        DIRECT_ADD,
+        `reflectedLight.directSpecular += min( irradiance * specularBRDF * material.multiScatteringCompensation, directLight.color * ${GLASS_GLINT.toFixed(4)} );`,
+      ),
+    );
+  }
+  const floor = PARS_OK ? envFloor : Math.max(envFloor ?? 0.0525, GLASS_SUN_ROUGHNESS);
+  if (floor !== null) fs = fs.replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment.replace(ROUGHNESS_FLOOR, `max( roughnessFactor, ${floor.toFixed(4)} )`));
+  shader.fragmentShader = fs.replace(
+    '#include <opaque_fragment>',
+    /* glsl */ `if ( any( isnan( outgoingLight ) ) || any( isinf( outgoingLight ) ) ) outgoingLight = vec3( 0.0 );
+    outgoingLight = clamp( outgoingLight, 0.0, ${GLASS_MAX_RADIANCE.toFixed(1)} );
+    #include <opaque_fragment>`,
+  );
+}
+
 /** Integer hash and dicing sites — must stay bit-identical to dicing.ts. */
 const DICING_GLSL = /* glsl */ `
 uniform sampler2D uCrack;
@@ -351,10 +415,9 @@ export function createReflectionMaterial(u: GlassUniforms, o: GlassPassOptions =
           }
         }`,
       )
-      .replace('#include <opaque_fragment>', 'outgoingLight *= gCover;\n#include <opaque_fragment>')
-      // Float glass is optically flat: allow a much tighter sun highlight than three's default
-      // roughness floor (which exists to hide cube-map mip aliasing on rough materials).
-      .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment.replace('max( roughnessFactor, 0.0525 )', 'max( roughnessFactor, 0.015 )'));
+      .replace('#include <opaque_fragment>', 'outgoingLight *= gCover;\n#include <opaque_fragment>');
+    // Sharp reflections of the surroundings, a sun glint the size of the sun, never non-finite.
+    guardSpecular(shader, GLASS_ENV_ROUGHNESS);
   };
   m.customProgramCacheKey = () => (o.shards ? 'glass-refl-shards' : 'glass-refl');
   return m;
@@ -555,6 +618,8 @@ export function createDiceMaterial(time: THREE.IUniform<number>): THREE.MeshStan
         if (sz.y > 1.4 * vDieCell) ln = max(ln, 1.0 - smoothstep(0.02, 0.09, f.y));
         diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.75, 0.8, 0.78), 0.55 * ln);`,
       );
+    // Thousands of glossy tumbling facets: some always sit at the grazing mirror angle.
+    guardSpecular(shader, null);
   };
   m.customProgramCacheKey = () => 'glass-dice';
   return m;
@@ -625,6 +690,7 @@ export function createHeapMaterial(density: THREE.Texture, size: THREE.Vector2, 
         /* glsl */ `#include <normal_fragment_maps>
         normal = normalize((viewMatrix * vec4(gHeapFacet.x, gHeapFacet.z, gHeapFacet.y, 0.0)).xyz);`,
       );
+    guardSpecular(shader, null);
   };
   m.customProgramCacheKey = () => 'glass-heap';
   return m;

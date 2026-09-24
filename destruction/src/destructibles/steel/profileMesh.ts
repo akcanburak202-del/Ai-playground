@@ -30,11 +30,20 @@ class OutlineBuilder {
   brk: boolean[] = [];
   private len = 0;
   private last: { y: number; z: number } | null = null;
+  /** Longest straight segment: wide faces get intermediate vertices so a dish can bend them */
+  private readonly maxSeg: number;
 
-  /** Straight face from a to b with outward normal n (two own vertices: flat shading). */
+  constructor(maxSeg: number) {
+    this.maxSeg = maxSeg;
+  }
+
+  /**
+   * Straight face from a to b with outward normal n (own vertices: flat shading), split into
+   * segments no longer than maxSeg — a flange drawn as one quad across could only shift, never dish.
+   */
   face(ay: number, az: number, by: number, bz: number, ny: number, nz: number): void {
-    this.push(ay, az, ny, nz, false);
-    this.push(by, bz, ny, nz, true);
+    const k = Math.max(1, Math.ceil(Math.hypot(by - ay, bz - az) / this.maxSeg - 1e-9));
+    for (let i = 0; i <= k; i++) this.push(ay + ((by - ay) * i) / k, az + ((bz - az) * i) / k, ny, nz, i === k);
   }
 
   /** Arc around (cy, cz) from angle a0 to a1 (radians, from +z towards +y); normals point out (convex) or in (concave). */
@@ -68,8 +77,8 @@ class OutlineBuilder {
   }
 }
 
-export function profileOutline(p: BeamProfile, rootRadius: number): Outline {
-  const b = new OutlineBuilder();
+export function profileOutline(p: BeamProfile, rootRadius: number, maxSeg = 0.03): Outline {
+  const b = new OutlineBuilder(maxSeg);
   const v2 = (y: number, z: number) => new THREE.Vector2(z, y);
   switch (p.type) {
     case 'I': {
@@ -242,6 +251,9 @@ export class SweptMesh {
     this.strain = new Float32Array(nv);
     this.rim = new Float32Array(nv);
     const idx: number[] = [];
+    let quads = 0;
+    for (let i = 0; i < m - 1; i++) if (!outline.brk[i]) quads++;
+    this.bandIndices = 6 * quads;
     for (let k = 0; k < this.rings - 1; k++) {
       for (let i = 0; i < m - 1; i++) {
         if (outline.brk[i]) continue;
@@ -310,6 +322,9 @@ export class SweptMesh {
     const nm = new THREE.Matrix3();
     if (toLocal) nm.getNormalMatrix(toLocal);
     const first = new THREE.Vector3(), last = new THREE.Vector3(), firstT = new THREE.Vector3(), lastT = new THREE.Vector3(), firstU = new THREE.Vector3(), lastU = new THREE.Vector3();
+    // Dents reach 3 R along the member: each ring only tests the few within reach of it.
+    const near = this.nearDents;
+    let dk0 = R, dk1 = -1;
     for (let k = 0; k < R; k++) {
       const s = (k / (R - 1)) * L;
       const f = Math.min(n - 1 - 1e-9, s / ds);
@@ -340,15 +355,21 @@ export class SweptMesh {
       const heat = src.temp[i]! * (1 - t) + src.temp[j]! * t;
       const strain = Math.max(src.plast[i]!, src.plast[j]!) * 0.5;
       const sRest = this.s0 + s;
+      near.length = 0;
+      for (const d of dents) if (Math.abs(sRest - d.s) < 3 * d.R) near.push(d);
       for (let q = 0; q < m; q++) {
         const ov = this.outline.verts[q]!;
         let y = ov.y, z = ov.z;
-        for (const d of dents) {
+        for (const d of near) {
           const ddist2 = (sRest - d.s) ** 2 + (y - d.y) ** 2 + (z - d.z) ** 2;
           if (ddist2 > 9 * d.R * d.R) continue;
           const w = d.depth * Math.exp(-ddist2 / (d.R * d.R));
           y += w * d.dy;
           z += w * d.dz;
+          if (w > 2e-4) {
+            if (k < dk0) dk0 = k;
+            if (k > dk1) dk1 = k;
+          }
         }
         const vi = k * m + q;
         let px = P.x + U.x * y + V.x * z, py = P.y + U.y * y + V.y * z, pz = P.z + U.z * y + V.z * z;
@@ -412,12 +433,18 @@ export class SweptMesh {
     }
     const g = this.geometry;
     if (!this.windingChecked) this.fixWinding();
+    // A dished face is no longer flat: shade it from the deformed surface. Sharp corners are
+    // separate vertices, so they stay sharp; the caps keep their own normals.
+    if (dk1 >= dk0) this.recomputeRingNormals(dk0 - 1, dk1 + 1);
     for (const name of ['position', 'normal', 'aHeat', 'aStrain']) (g.getAttribute(name) as THREE.BufferAttribute).needsUpdate = true;
     g.computeBoundingSphere();
     g.computeBoundingBox();
   }
 
   private windingChecked = false;
+  private readonly nearDents: Dent[] = [];
+  /** Index entries per ring band (6 per quad of the outline) */
+  private readonly bandIndices: number;
 
   /** Refresh only the temperature attribute (a cooling member whose shape has not changed). */
   updateHeat(temp: Float32Array, n: number, ds: number): void {
@@ -432,6 +459,43 @@ export class SweptMesh {
     this.heat.fill(temp[0]!, this.capBase, this.capBase + nc);
     this.heat.fill(temp[n - 1]!, this.capBase + nc, this.capBase + 2 * nc);
     (this.geometry.getAttribute('aHeat') as THREE.BufferAttribute).needsUpdate = true;
+  }
+
+  /**
+   * Area-weighted vertex normals of the swept surface between rings k0 and k1 (the dented stretch;
+   * the rest keeps its analytic normals, the caps their own). Ring-major index layout: band b (rings
+   * b, b+1) owns indices [b·q, (b+1)·q).
+   */
+  private recomputeRingNormals(k0: number, k1: number): void {
+    const idx = this.geometry.getIndex()!.array as Uint16Array | Uint32Array;
+    const p = this.pos, n = this.nrm, m = this.outline.verts.length, q = this.bandIndices;
+    k0 = Math.max(0, k0);
+    k1 = Math.min(this.rings - 1, k1);
+    if (k1 <= k0) return;
+    n.fill(0, 3 * k0 * m, 3 * (k1 + 1) * m);
+    for (let t = k0 * q; t < k1 * q; t += 3) {
+      const i = idx[t]!, j = idx[t + 1]!, k = idx[t + 2]!;
+      const ax = p[3 * j]! - p[3 * i]!, ay = p[3 * j + 1]! - p[3 * i + 1]!, az = p[3 * j + 2]! - p[3 * i + 2]!;
+      const bx = p[3 * k]! - p[3 * i]!, by = p[3 * k + 1]! - p[3 * i + 1]!, bz = p[3 * k + 2]! - p[3 * i + 2]!;
+      const cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+      n[3 * i] = n[3 * i]! + cx;
+      n[3 * i + 1] = n[3 * i + 1]! + cy;
+      n[3 * i + 2] = n[3 * i + 2]! + cz;
+      n[3 * j] = n[3 * j]! + cx;
+      n[3 * j + 1] = n[3 * j + 1]! + cy;
+      n[3 * j + 2] = n[3 * j + 2]! + cz;
+      n[3 * k] = n[3 * k]! + cx;
+      n[3 * k + 1] = n[3 * k + 1]! + cy;
+      n[3 * k + 2] = n[3 * k + 2]! + cz;
+    }
+    for (let v = k0 * m; v < (k1 + 1) * m; v++) {
+      const l = Math.hypot(n[3 * v]!, n[3 * v + 1]!, n[3 * v + 2]!);
+      if (l > 0) {
+        n[3 * v] = n[3 * v]! / l;
+        n[3 * v + 1] = n[3 * v + 1]! / l;
+        n[3 * v + 2] = n[3 * v + 2]! / l;
+      }
+    }
   }
 
   /** Make every triangle's winding agree with its vertex normals (outline / cap orientation). */

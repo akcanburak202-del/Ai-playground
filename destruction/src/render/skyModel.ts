@@ -78,8 +78,25 @@ export function extinction(s: SkyState, dy: number, out: RGB = [0, 0, 0]): RGB {
   return out;
 }
 
-/** Sky radiance towards unit direction d (no sun disc, no clouds), shader units. */
-export function skyRadiance(s: SkyState, dx: number, dy: number, dz: number, out: RGB = [0, 0, 0]): RGB {
+/**
+ * Circumsolar lobe of the lighting copy of the sky: a Henyey–Greenstein lobe (g = 0.7) normalised
+ * to 1 towards the sun, ((1 − g)² / (1 + g² − 2g cos θ))^1.5. The Preetham sky at a low sun is ≈ 3.7×
+ * brighter than the CIE clear-sky indicatrix 3° from the sun and ≈ 2× at 10°, and matches it beyond
+ * ≈ 20° (CIE S 011/E:2003 standard clear sky, f(χ) = 1 + 10(e^−3χ − e^−3π/2) + 0.45 cos²χ); with
+ * k ≈ 0.75 this lobe removes about that excess. The sky shader (sky.ts) scales its lighting copy by
+ * 1 − k·lobe with k from deriveLighting.
+ */
+export const CIRCUMSOLAR_G = 0.7;
+export function circumsolarLobe(cosTheta: number): number {
+  const g = CIRCUMSOLAR_G;
+  return Math.pow(((1 - g) * (1 - g)) / (1 + g * g - 2 * g * Math.min(1, cosTheta)), 1.5);
+}
+
+/**
+ * Sky radiance towards unit direction d (no sun disc, no clouds), shader units. `circumsolar` is the
+ * attenuation k of the lighting copy (0 = the visible sky).
+ */
+export function skyRadiance(s: SkyState, dx: number, dy: number, dz: number, out: RGB = [0, 0, 0], circumsolar = 0): RGB {
   const Fex = extinction(s, dy, _fex);
   const cosTheta = dx * s.sun[0] + dy * s.sun[1] + dz * s.sun[2];
   // The shader feeds (cosθ·½+½) to the Rayleigh phase; kept verbatim so both skies match.
@@ -97,6 +114,12 @@ export function skyRadiance(s: SkyState, dx: number, dy: number, dz: number, out
     const L0 = 0.1 * Fex[i]!;
     out[i] = (lin + L0) * 0.04 + (i === 1 ? 0.0003 : i === 2 ? 0.00075 : 0);
   }
+  if (circumsolar > 0) {
+    const f = 1 - circumsolar * circumsolarLobe(cosTheta);
+    out[0] *= f;
+    out[1] *= f;
+    out[2] *= f;
+  }
   return out;
 }
 const _fex: RGB = [0, 0, 0];
@@ -105,7 +128,7 @@ const _fex: RGB = [0, 0, 0];
  * Cosine-weighted irradiance of the sky dome on a surface with unit normal n (upper hemisphere of
  * the sky only), shader units: E = ∫ L(ω) max(0, n·ω) dω, midpoint rule over elevation × azimuth.
  */
-export function skyIrradiance(s: SkyState, n: [number, number, number], rings = 24, sectors = 48): RGB {
+export function skyIrradiance(s: SkyState, n: [number, number, number], rings = 24, sectors = 48, circumsolar = 0): RGB {
   const out: RGB = [0, 0, 0];
   const L: RGB = [0, 0, 0];
   const dEl = Math.PI / 2 / rings;
@@ -120,7 +143,7 @@ export function skyIrradiance(s: SkyState, n: [number, number, number], rings = 
       const dz = ce * Math.cos(az);
       const cosN = dx * n[0] + se * n[1] + dz * n[2];
       if (cosN <= 0) continue;
-      skyRadiance(s, dx, se, dz, L);
+      skyRadiance(s, dx, se, dz, L, circumsolar);
       const w = cosN * ce * dEl * dAz; // dω = cos(el) dEl dAz
       out[0] += L[0] * w;
       out[1] += L[1] * w;
@@ -155,8 +178,17 @@ export interface SunLighting {
   sunIntensity: number;
   /** Multiplier from shader sky units to render units (applied to the visible sky and the env map) */
   skyScale: number;
-  /** Sky irradiance on a horizontal surface, render units, linear RGB */
+  /**
+   * Attenuation k of the circumsolar lobe in the lighting copy of the sky (radiance × (1 − k·lobe),
+   * see circumsolarLobe); the visible sky keeps its full glow.
+   */
+  circumsolar: number;
+  /** Irradiance of the lighting sky on a horizontal surface, render units, linear RGB */
   skyIrradiance: RGB;
+  /** Direct : diffuse luminance on a vertical wall facing the sun that this rig produces */
+  wallRatio: number;
+  /** Total luminance irradiance of that sun-lit wall (sun + sky + ground), render units: the exposure anchor */
+  wallIrradiance: number;
   /** Average horizon radiance (render units): colour of distant haze */
   horizon: RGB;
   /** Radiance of sunlit ground of the given albedo (render units), for the lower env hemisphere */
@@ -164,12 +196,29 @@ export interface SunLighting {
 }
 
 /**
+ * Target direct : diffuse luminance on a vertical wall facing a clear low sun (diffuse = sky + ground
+ * bounce). The Perez et al. anisotropic sky (Perez, Ineichen, Seals, Michalsky & Stewart 1990,
+ * "Modeling daylight availability and irradiance components from direct and global irradiance",
+ * Solar Energy 44(5), F1/F2 table) with clear-sky DNI / DHI ≈ 350–450 / 45–60 W m⁻² at 10° elevation
+ * and 750 / 90 W m⁻² at 30° (ground albedo 0.2) gives ≈ 2.8–3.4 and ≈ 3.9 in irradiance; the
+ * horizon band that holds the circumsolar glow is partly blocked by terrain, trees and neighbouring
+ * buildings, which the environment map does not know. 3.0 at a low sun, 3.5 by 30°. Above ≈ 30° the
+ * Preetham horizon term that causes the overshoot vanishes and the correction fades out.
+ */
+export function clearSkyWallRatio(elevationDeg: number): number {
+  return 3.0 + 0.5 * Math.min(1, Math.max(0, (elevationDeg - 15) / 15));
+}
+
+/**
  * Derive the light rig from the sun position. The Preetham sky radiance is not calibrated against
- * its own sun, so the sun is set from the clear-sky ratio of direct-normal to diffuse horizontal
- * illuminance, E_dn / E_dh ≈ 4.5 at low sun rising to ≈ 6 by 40° (clear-sky measurements, e.g.
- * Perez et al. 1990, "Modeling daylight availability", Solar Energy 44), and everything is scaled
- * so that the sun delivers `sunTarget` render units at 25°+ (the exposure anchor: a white wall
- * facing the sun renders ≈ 1.4). Lower suns are dimmer by their beam transmittance.
+ * its own sun, so the sky is scaled so that the clear-sky ratio of direct-normal to diffuse
+ * horizontal illuminance, E_dn / E_dh ≈ 4.5 at low sun rising to ≈ 6 by 40° (clear-sky
+ * measurements, e.g. Perez et al. 1990, "Modeling daylight availability", Solar Energy 44), holds in
+ * luminance — the low sun's colour carries only ≈ 0.6 of its intensity as luminance — and the sun
+ * delivers `sunTarget` render units at 25°+ (lower suns are dimmer by their beam transmittance).
+ * The lighting copy of the sky then has its circumsolar lobe attenuated until a wall facing the sun
+ * sees the Perez direct : diffuse ratio (clearSkyWallRatio); the solve is closed-form because the
+ * irradiance is linear in the attenuation.
  */
 export function deriveLighting(elevationDeg: number, azimuthDeg: number, p: SkyParams = GOLDEN_HOUR_SKY, groundAlbedo: RGB = [0.24, 0.22, 0.19], sunTarget = 6): SunLighting {
   // Keep the model defined for a sun at or below the horizon (dusk scenes): clamp to 1°.
@@ -183,9 +232,32 @@ export function deriveLighting(elevationDeg: number, azimuthDeg: number, p: SkyP
   const ratio = 4.5 + 1.5 * Math.min(1, Math.max(0, (elev - 5) / 35));
   const dim = Math.min(1, Math.max(0.2, luminance(tr) / luminance(sunTransmittance(25))));
   const sunIntensity = sunTarget * dim;
-  const skyScale = sunIntensity / (ratio * Math.max(luminance(eSkyRaw), 1e-9));
-  const skyIrr: RGB = [eSkyRaw[0] * skyScale, eSkyRaw[1] * skyScale, eSkyRaw[2] * skyScale];
-  // Haze colour: mean sky radiance a few degrees above the horizon over all azimuths.
+  const sunLum = sunIntensity * luminance(sunColor);
+  const skyScale = sunLum / (ratio * Math.max(luminance(eSkyRaw), 1e-9));
+  const sinH = Math.sin((elev * Math.PI) / 180);
+  const cosH = Math.cos((elev * Math.PI) / 180);
+  // Lambertian ground: L = ρ/π · (E_sun sin h + E_sky); a vertical wall sees half of it: E = π L / 2.
+  const ground = (sky: RGB): RGB => [0, 1, 2].map((i) => (groundAlbedo[i]! / Math.PI) * (sunIntensity * sunColor[i]! * sinH + sky[i]!)) as RGB;
+  const hz = Math.hypot(sun[0], sun[2]) || 1;
+  const wallN: [number, number, number] = [sun[0] / hz, 0, sun[2] / hz];
+  const direct = sunLum * cosH;
+  // Wall diffuse (luminance) as a function of the attenuation k: sky(k) + ground bounce(k).
+  const eWall0 = luminance(skyIrradiance(s, wallN)) * skyScale;
+  const eWall1 = luminance(skyIrradiance(s, wallN, 24, 48, 1)) * skyScale;
+  const eH0 = luminance(eSkyRaw) * skyScale;
+  const eH1 = luminance(skyIrradiance(s, [0, 1, 0], 24, 48, 1)) * skyScale;
+  const albedoLum = luminance(groundAlbedo);
+  const wallDiffuse = (k: number) => eWall0 - k * (eWall0 - eWall1) + 0.5 * albedoLum * (sunLum * sinH + eH0 - k * (eH0 - eH1));
+  // The renderer's diffuse IBL is the PMREM at roughness 1, a GGX lobe narrower than the cosine
+  // lobe integrated here: for a sun-facing normal it over-weights the bright circumsolar sky, by
+  // ≈ 20 % on the chapel's east wall at 9° (measured: sun-only vs ambient-only renders). Aim that
+  // much higher.
+  const target = direct / (clearSkyWallRatio(elev) * 1.2);
+  const slope = wallDiffuse(0) - wallDiffuse(1);
+  const fade = 1 - Math.min(1, Math.max(0, (elev - 30) / 20));
+  const circumsolar = slope > 1e-9 ? fade * Math.min(0.9, Math.max(0, (wallDiffuse(0) - target) / slope)) : 0;
+  const skyIrr = skyIrradiance(s, [0, 1, 0], 24, 48, circumsolar).map((x) => x * skyScale) as RGB;
+  // Haze colour: mean radiance of the visible sky a few degrees above the horizon over all azimuths.
   const horizon: RGB = [0, 0, 0];
   const L: RGB = [0, 0, 0];
   const n = 32;
@@ -198,8 +270,10 @@ export function deriveLighting(elevationDeg: number, azimuthDeg: number, p: SkyP
     horizon[1] += (L[1] * skyScale) / n;
     horizon[2] += (L[2] * skyScale) / n;
   }
-  // Lambertian ground: L = ρ/π · (E_sun sin h + E_sky).
-  const sinH = Math.sin((elev * Math.PI) / 180);
-  const groundRadiance: RGB = [0, 1, 2].map((i) => (groundAlbedo[i]! / Math.PI) * (sunIntensity * sunColor[i]! * sinH + skyIrr[i]!)) as RGB;
-  return { sunColor, sunIntensity, skyScale, skyIrradiance: skyIrr, horizon, groundRadiance };
+  const groundRadiance = ground(skyIrr);
+  const diffuse = wallDiffuse(circumsolar);
+  return {
+    sunColor, sunIntensity, skyScale, circumsolar, skyIrradiance: skyIrr, horizon, groundRadiance,
+    wallRatio: direct / Math.max(diffuse, 1e-9), wallIrradiance: direct + diffuse,
+  };
 }

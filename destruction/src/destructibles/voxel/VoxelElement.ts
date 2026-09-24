@@ -17,6 +17,7 @@ import { pickSeeds, planarCellDepth, splitSelection, type Piece, type Selection 
 import { VoxelLook, type DiscardUniforms } from './look.ts';
 import { buildBaseGeometry } from './baseMesh.ts';
 import { schedulerFor, type RemeshClient, type RemeshScheduler } from './scheduler.ts';
+import { GrowingBatch, type BatchClient, type BatchSlot } from './batch.ts';
 
 /**
  * A brittle structural element (concrete, stone, brick; optionally reinforced) backed by a sparse
@@ -60,8 +61,13 @@ const CONFINED_CRATER = 0.9;
 const CHECK_DELAY = 0.08;
 /** Low-cycle accumulation of free-field blast cracking (Carver.damage `accumulate`) */
 const BLAST_DAMAGE_ACCUMULATION = 0.2;
-/** Debris smaller than this (m³, ≈ a 10 cm cube) casts no shadow */
-const SHADOW_MIN_VOLUME = 1e-3;
+/** Most surface patches one element scans for one blast (larger charges use coarser patches) */
+const MAX_BLAST_PATCHES = 24000;
+/**
+ * Debris whose largest extent is under this (m) casts no shadow: at the sun's shadow-map texel
+ * size (≈ 5–10 cm near the camera) its shadow is a blur of a few texels.
+ */
+const SHADOW_MIN_SIZE = 0.3;
 /** Cantilever reach from one support, in element thicknesses */
 const CANTILEVER_FACTOR = 10;
 /** Largest span between two supports, in element thicknesses (RC slab span/depth ≈ 35) */
@@ -77,6 +83,9 @@ const _s = new THREE.Vector3();
 const _hit: TraceHit = { t: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, bar: -1 };
 const _vSnap = new THREE.Vector3();
 const _runs: RunSegment[] = [];
+const _bm = new THREE.Matrix4();
+const _one = new THREE.Vector3(1, 1, 1);
+const IDENTITY = new THREE.Matrix4();
 
 interface PieceInit {
   parent: VoxelElement;
@@ -111,7 +120,7 @@ function vec3(v: [number, number, number] | THREE.Vector3): THREE.Vector3 {
 
 let pieceCounter = 0;
 
-export class VoxelElement implements Destructible, Structural, RemeshClient {
+export class VoxelElement implements Destructible, Structural, RemeshClient, BatchClient {
   readonly id = allocateDestructibleId();
   readonly kind = 'voxel' as const;
   readonly name: string;
@@ -140,9 +149,19 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
   private readonly meshed: Uint8Array;
   private readonly chunkMask: Uint8Array;
   private maskTex: THREE.Data3DTexture | null = null;
-  private readonly chunkMeshes: (THREE.Mesh | null)[];
-  /** Pieces: per-chunk mesh data merged into chunkMeshes[0] */
+  /** Static elements: every re-meshed chunk is one slot of this element's batch (one draw per pass) */
+  private chunkBatch: GrowingBatch | null = null;
+  private readonly chunkSlots: (BatchSlot | null)[];
+  private readonly chunkTris: Uint32Array;
+  /** Dynamic elements: per-chunk mesh data, merged into one slot of the family's rubble batch */
   private pieceParts: (MeshData | null)[] | null = null;
+  private solidSlot: BatchSlot | null = null;
+  private solidBatch: GrowingBatch | null = null;
+  private barSlot: BatchSlot | null = null;
+  private barBatch: GrowingBatch | null = null;
+  private solidDirty = false;
+  private barsDirty = false;
+  private matrixDirty = false;
   private rebarMesh: THREE.InstancedMesh | null = null;
   private rebarLen: THREE.InstancedBufferAttribute | null = null;
   private rebarSeen = -1;
@@ -231,7 +250,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     this.grid.dirty.fill(0);
     this.meshed = new Uint8Array(this.grid.chunkCount);
     this.chunkMask = new Uint8Array(this.grid.chunkCount);
-    this.chunkMeshes = new Array(this.grid.chunkCount).fill(null);
+    this.chunkSlots = new Array(this.grid.chunkCount).fill(null);
+    this.chunkTris = new Uint32Array(this.grid.chunkCount);
     this.sampleBox = this.grid.solidSampleBounds() ?? [0, 0, 0, 0, 0, 0];
     this.owner = { kind: 'voxel', material: this.material, destructible: this, onContactForce: (i) => this.onContactForce(i) };
     this.computeHorizontal();
@@ -356,40 +376,34 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
       this.setPiecePart(ci, m);
       return;
     }
-    const old = this.chunkMeshes[ci];
-    if (old) this.stats.triangles -= (old.geometry.index?.count ?? 0) / 3;
+    const old = this.chunkSlots[ci];
+    this.stats.triangles -= this.chunkTris[ci]!;
+    this.chunkTris[ci] = 0;
     if (!m) {
       if (old) {
-        old.geometry.dispose();
-        this.root.remove(old);
-        this.chunkMeshes[ci] = null;
+        this.chunkBatch!.remove(old);
+        this.chunkSlots[ci] = null;
       }
       return;
     }
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
-    geom.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
-    geom.setAttribute('aDamage', new THREE.BufferAttribute(m.damage, 1));
-    geom.setAttribute('aDepth', new THREE.BufferAttribute(m.depth, 1));
-    geom.setAttribute('aSoot', new THREE.BufferAttribute(m.soot, 1));
-    geom.setIndex(new THREE.BufferAttribute(m.indices, 1));
-    geom.computeBoundingSphere();
+    const attrs = solidAttributes(m.positions, m.normals, m.damage, m.depth, m.soot);
+    const index = new THREE.BufferAttribute(m.indices, 1);
+    const batch = (this.chunkBatch ??= this.makeChunkBatch());
+    this.chunkSlots[ci] = old ? batch.update(old, attrs, index, IDENTITY) : batch.add(attrs, index, IDENTITY);
+    this.chunkTris[ci] = m.indexCount / 3;
     this.stats.triangles += m.indexCount / 3;
-    if (old) {
-      old.geometry.dispose();
-      old.geometry = geom;
-      return;
-    }
-    const mesh = new THREE.Mesh(geom, this.look.chunkMaterial);
-    mesh.castShadow = mesh.receiveShadow = true;
-    mesh.name = `${this.name}:chunk${ci}`;
-    this.chunkMeshes[ci] = mesh;
-    this.root.add(mesh);
+  }
+
+  /** The batch of a static element's re-meshed chunks, under its root (identity instances). */
+  private makeChunkBatch(): GrowingBatch {
+    const b = new GrowingBatch(this.look.batchedChunkMaterial(), `${this.name}:chunks`, true, 16, 1 << 13, 3 << 13);
+    this.root.add(b.mesh);
+    return b;
   }
 
   /**
-   * Debris pieces span only a few chunks: their chunk meshes are merged into one geometry so a
-   * rubble field costs one draw call per piece (and small pieces cast no shadow).
+   * Debris pieces span only a few chunks: their chunk meshes are merged into one geometry, one
+   * instance of the family's rubble batch (see batch.ts), pushed when the batch is next drawn.
    */
   private setPiecePart(ci: number, m: MeshData | null): void {
     const parts = (this.pieceParts ??= new Array(this.grid.chunkCount).fill(null));
@@ -397,15 +411,50 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     if (old) this.stats.triangles -= old.indexCount / 3;
     parts[ci] = m;
     if (m) this.stats.triangles += m.indexCount / 3;
+    this.solidDirty = true;
+    // The surface moved: bars may have been laid bare (or buried by a remesh of a fresh piece).
+    if (this.rebar) this.barsDirty = true;
+    this.requestBatchFlush();
+  }
+
+  /** Large pieces cast shadows, small ones do not (SHADOW_MIN_SIZE). */
+  private castsShadow(): boolean {
+    const b = this.sampleBox;
+    return Math.max(b[3] - b[0], b[4] - b[1], b[5] - b[2]) * this.grid.h >= SHADOW_MIN_SIZE;
+  }
+
+  /** Pending batch work: pushed in this piece's frameUpdate (or by flushMeshes). */
+  private requestBatchFlush(): void {
+    this.look.batches.markDirty(this);
+  }
+
+  /** BatchClient: push pending geometry and the current transform into the family batches. */
+  flushBatch(): void {
+    if (this.disposed) return;
+    const parent = this.root.parent ?? this.ctx.world;
+    _bm.compose(this.root.position, this.root.quaternion, _one);
+    if (this.solidDirty) {
+      this.solidDirty = false;
+      this.pushSolid(parent, _bm);
+    }
+    if (this.barsDirty) {
+      this.barsDirty = false;
+      this.pushBars(parent, _bm);
+    }
+    if (this.matrixDirty) {
+      this.matrixDirty = false;
+      if (this.solidSlot) this.solidBatch!.setMatrix(this.solidSlot, _bm);
+      if (this.barSlot) this.barBatch!.setMatrix(this.barSlot, _bm);
+    }
+  }
+
+  private pushSolid(parent: THREE.Object3D, matrix: THREE.Matrix4): void {
+    const parts = this.pieceParts ?? [];
     let nv = 0, ni = 0;
     for (const q of parts) if (q) { nv += q.vertexCount; ni += q.indexCount; }
-    const mesh = this.chunkMeshes[0];
     if (nv === 0) {
-      if (mesh) {
-        mesh.geometry.dispose();
-        this.root.remove(mesh);
-        this.chunkMeshes[0] = null;
-      }
+      if (this.solidSlot) this.solidBatch!.remove(this.solidSlot);
+      this.solidSlot = null;
       return;
     }
     const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3);
@@ -423,25 +472,100 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
       vo += q.vertexCount;
       io += q.indexCount;
     }
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geom.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
-    geom.setAttribute('aDamage', new THREE.BufferAttribute(dmg, 1));
-    geom.setAttribute('aDepth', new THREE.BufferAttribute(dep, 1));
-    geom.setAttribute('aSoot', new THREE.BufferAttribute(soot, 1));
-    geom.setIndex(new THREE.BufferAttribute(idx, 1));
-    geom.computeBoundingSphere();
-    if (mesh) {
-      mesh.geometry.dispose();
-      mesh.geometry = geom;
+    const attrs = solidAttributes(pos, nrm, dmg, dep, soot);
+    const index = new THREE.BufferAttribute(idx, 1);
+    const batch = this.look.batches.solid(this.castsShadow(), parent);
+    if (this.solidSlot && this.solidBatch === batch) {
+      this.solidSlot = batch.update(this.solidSlot, attrs, index, matrix);
     } else {
-      const mm = new THREE.Mesh(geom, this.look.debrisMaterial);
-      mm.receiveShadow = true;
-      mm.name = `${this.name}:chunks`;
-      this.chunkMeshes[0] = mm;
-      this.root.add(mm);
+      if (this.solidSlot) this.solidBatch!.remove(this.solidSlot);
+      this.solidSlot = batch.add(attrs, index, matrix);
+      this.solidBatch = batch;
     }
-    this.chunkMeshes[0]!.castShadow = this.grid.solidVolume() >= SHADOW_MIN_VOLUME;
+  }
+
+  /**
+   * Debris bars baked into one geometry in the element frame (8-sided open tubes, like the
+   * static elements' instanced bars) and added to the family's rebar batch. Only bars that can
+   * show are drawn: a segment whose axis lies deeper than its radius (plus a third of a voxel for
+   * the smoothing of the surface) below the concrete surface at both ends and mid-length stays
+   * hidden, as static elements hide bars in chunks that were never re-meshed. (A slab piece
+   * carries ~2 600 segments, ~40 k triangles, nearly all of them embedded.)
+   */
+  private pushBars(parent: THREE.Object3D, matrix: THREE.Matrix4): void {
+    const rb = this.rebar!;
+    const g = this.grid;
+    const segs: number[] = [];
+    const nn = rb.nodes;
+    for (let s = 0; s < rb.segCount; s++) {
+      if (rb.segGone[s] || rb.segCut[s]) continue;
+      // Density ramps from ISO at the surface to 255 one voxel inside (densityFromSdf).
+      const hidden = ISO + (ISO * (rb.radius(s) + 0.33 * g.h)) / g.h;
+      const a = rb.segA[s]! * 3, b = rb.segB[s]! * 3;
+      const ax = nn[a]!, ay = nn[a + 1]!, az = nn[a + 2]!, bx = nn[b]!, by = nn[b + 1]!, bz = nn[b + 2]!;
+      if (
+        g.densityAt(g.gx(ax), g.gy(ay), g.gz(az)) < hidden || g.densityAt(g.gx(bx), g.gy(by), g.gz(bz)) < hidden ||
+        g.densityAt(g.gx((ax + bx) / 2), g.gy((ay + by) / 2), g.gz((az + bz) / 2)) < hidden
+      ) segs.push(s);
+    }
+    const SIDES = 8;
+    const pos = new Float32Array(segs.length * SIDES * 2 * 3), nrm = new Float32Array(segs.length * SIDES * 2 * 3);
+    const along = new Float32Array(segs.length * SIDES * 2);
+    const idx = new Uint32Array(segs.length * SIDES * 6);
+    const n = rb.nodes;
+    let nv = 0, ni = 0;
+    for (const s of segs) {
+      const a = rb.segA[s]! * 3, b = rb.segB[s]! * 3;
+      _v.set(n[a]!, n[a + 1]!, n[a + 2]!);
+      _v2.set(n[b]!, n[b + 1]!, n[b + 2]!);
+      const L = _v.distanceTo(_v2);
+      if (L < 1e-5) continue;
+      const r = rb.radius(s);
+      const t = _s.subVectors(_v2, _v).divideScalar(L);
+      // Ring basis: u = t × (helper axis), w = t × u.
+      const hx = Math.abs(t.y) < 0.9 ? 0 : 1, hy = 1 - hx;
+      let ux = -t.z * hy, uy = t.z * hx, uz = t.x * hy - t.y * hx;
+      const ul = Math.hypot(ux, uy, uz) || 1;
+      ux /= ul; uy /= ul; uz /= ul;
+      const wx = t.y * uz - t.z * uy, wy = t.z * ux - t.x * uz, wz = t.x * uy - t.y * ux;
+      // Overlap the joints by 0.3 r at each end (as the instanced bars do).
+      const e = 0.3 * r;
+      const base = nv;
+      for (let end = 0; end < 2; end++) {
+        const cx = end ? _v2.x + t.x * e : _v.x - t.x * e;
+        const cy = end ? _v2.y + t.y * e : _v.y - t.y * e;
+        const cz = end ? _v2.z + t.z * e : _v.z - t.z * e;
+        for (let k = 0; k < SIDES; k++) {
+          const ang = (k / SIDES) * Math.PI * 2;
+          const c = Math.cos(ang), sn = Math.sin(ang);
+          const nx = ux * c + wx * sn, ny = uy * c + wy * sn, nz = uz * c + wz * sn;
+          pos[nv * 3] = cx + nx * r; pos[nv * 3 + 1] = cy + ny * r; pos[nv * 3 + 2] = cz + nz * r;
+          nrm[nv * 3] = nx; nrm[nv * 3 + 1] = ny; nrm[nv * 3 + 2] = nz;
+          along[nv] = end ? L : 0;
+          nv++;
+        }
+      }
+      for (let k = 0; k < SIDES; k++) {
+        const k1 = (k + 1) % SIDES;
+        const a0 = base + k, a1 = base + k1, b0 = base + SIDES + k, b1 = base + SIDES + k1;
+        idx[ni++] = a0; idx[ni++] = b0; idx[ni++] = a1;
+        idx[ni++] = a1; idx[ni++] = b0; idx[ni++] = b1;
+      }
+    }
+    const batch = this.look.batches.rebar(parent);
+    if (nv === 0) {
+      if (this.barSlot) batch.remove(this.barSlot);
+      this.barSlot = null;
+      return;
+    }
+    const attrs = {
+      position: new THREE.BufferAttribute(pos.subarray(0, nv * 3), 3),
+      normal: new THREE.BufferAttribute(nrm.subarray(0, nv * 3), 3),
+      aAlong: new THREE.BufferAttribute(along.subarray(0, nv), 1),
+    };
+    const index = new THREE.BufferAttribute(idx.subarray(0, ni), 1);
+    this.barSlot = this.barSlot ? batch.update(this.barSlot, attrs, index, matrix) : batch.add(attrs, index, matrix);
+    this.barBatch = batch;
   }
 
   /** Queue remeshing of every chunk the last edits dirtied, nearest to the camera first. */
@@ -459,14 +583,14 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
   }
 
   private buildRebarMesh(): void {
-    if (!this.rebar) return;
+    // Debris bars are baked into the family's rebar batch instead (pushBars).
+    if (!this.rebar || this.dynamic) return;
     const geo = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);
     this.rebarLen = new THREE.InstancedBufferAttribute(new Float32Array(this.rebar.segCount), 1);
     geo.setAttribute('aLen', this.rebarLen);
     this.rebarMesh = new THREE.InstancedMesh(geo, this.look.rebarMaterial, this.rebar.segCount);
     this.rebarMesh.count = 0;
-    // Bars in debris are too thin for their shadows to matter.
-    this.rebarMesh.castShadow = !this.dynamic;
+    this.rebarMesh.castShadow = true;
     this.rebarMesh.receiveShadow = true;
     this.rebarMesh.frustumCulled = false;
     this.rebarMesh.name = `${this.name}:rebar`;
@@ -475,9 +599,18 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
 
   /** Instance the bar segments that lie in re-meshed chunks (the rest are hidden in concrete). */
   private updateRebarInstances(): void {
-    const rb = this.rebar, mesh = this.rebarMesh;
-    if (!rb || !mesh || !this.rebarLen) return;
+    const rb = this.rebar;
+    if (!rb) return;
     if (!this.rebarDirty && this.rebarSeen === rb.version) return;
+    if (this.dynamic) {
+      this.rebarDirty = false;
+      this.rebarSeen = rb.version;
+      this.barsDirty = true;
+      this.requestBatchFlush();
+      return;
+    }
+    const mesh = this.rebarMesh;
+    if (!mesh || !this.rebarLen) return;
     this.rebarDirty = false;
     this.rebarSeen = rb.version;
     const stamp = rb.nextStamp();
@@ -499,11 +632,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
       this.rebarLen!.setX(n, L);
       n++;
     };
-    if (this.dynamic) {
-      for (let s = 0; s < rb.segCount; s++) place(s);
-    } else {
-      for (const [ci, list] of rb.chunkSegs) if (this.meshed[ci]) for (const s of list) place(s);
-    }
+    for (const [ci, list] of rb.chunkSegs) if (this.meshed[ci]) for (const s of list) place(s);
     mesh.count = n;
     mesh.instanceMatrix.needsUpdate = true;
     this.rebarLen.needsUpdate = true;
@@ -730,6 +859,10 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     this.root.quaternion.set(r.x, r.y, r.z, r.w);
     this.invQ.copy(this.root.quaternion).invert();
     this.updateBounds();
+    if (!b.isSleeping() && !this.matrixDirty) {
+      this.matrixDirty = true;
+      this.look.batches.markDirty(this);
+    }
   }
 
   private onContactForce(info: ContactForceInfo): void {
@@ -1148,32 +1281,60 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     // element within tens of metres).
     this.bounds.clampPoint(load.center, _v);
     const toC = _v2.copy(load.center).sub(_v);
-    if (toC.lengthSq() > 1e-6) {
-      toC.normalize();
-      if (load.overpressureAt(_v) < 15e3 || load.damageAt(_v, toC, this.material, 0.5 * this.shape.thickness) < 1) return this.shape.thickness;
-    }
+    const d0 = toC.length();
+    const tRef = 0.5 * this.shape.thickness;
+    if (d0 > 1e-3) {
+      toC.divideScalar(d0);
+      if (load.overpressureAt(_v) < 15e3 || load.damageAt(_v, toC, this.material, tRef) < 1) return this.shape.thickness;
+    } else toC.set(0, 1, 0);
+    // Reach of the load: the distance out to which a face turned to the charge, at the same
+    // reference thickness, still sees ≥ 15 kPa and a damage number ≥ 1 (both fall monotonically
+    // with distance). Only patches inside that sphere can be realised, so the scan is bounded by
+    // it instead of evaluating the Kingery–Bulmash fits at every patch of every element in range
+    // (measured: 1.0–1.6 s of realisation per 2.3 kg charge among the pavilion's elements, most
+    // of it in the fits).
+    const away = toC.negate();
+    const reach = blastReach(load, away, (q) => load.overpressureAt(q) >= 15e3 && load.damageAt(q, toC, this.material, tRef) >= 1, Math.max(d0, 1e-3));
+    toC.negate();
     const g = this.grid, h = g.h, conn = this.conn;
     const F = conn.F;
-    // Coarse surface patches (~10 cm) facing the charge.
-    const P = Math.max(1, Math.round(0.1 / (F * h)));
+    // Coarse surface patches (~10 cm) facing the charge; coarser when the sphere of reach would
+    // hold more than MAX_BLAST_PATCHES of them (very large charges), so the work stays bounded.
+    let P = Math.max(1, Math.round(0.1 / (F * h)));
+    const span = (lo: number, hi: number, n: number, cell: number) => Math.max(0, Math.min(n - 1, Math.ceil(hi / cell)) - Math.max(0, Math.floor(lo / cell)) + 1);
+    const R0 = reach + 1.6 * F * h * P;
+    const cellsIn = (Pp: number) => {
+      const cs = F * h * Pp;
+      return span(c.x - R0 - g.ox, c.x + R0 - g.ox, Math.ceil(conn.nx / Pp), cs) * span(c.y - R0 - g.oy, c.y + R0 - g.oy, Math.ceil(conn.ny / Pp), cs) * span(c.z - R0 - g.oz, c.z + R0 - g.oz, Math.ceil(conn.nz / Pp), cs);
+    };
+    const count = cellsIn(P);
+    if (count > MAX_BLAST_PATCHES) P = Math.ceil(P * Math.cbrt(count / MAX_BLAST_PATCHES));
     const cellSize = F * h * P;
     const nx = Math.ceil(conn.nx / P), ny = Math.ceil(conn.ny / P), nz = Math.ceil(conn.nz / P);
+    // Patches whose centre can lie within reach of the charge (the facing surface point is found
+    // within ~1.5 patch sizes of the centre).
+    const Rm = reach + 1.6 * cellSize;
+    const Rm2 = Rm * Rm;
+    const cell = (v: number, o: number) => (v - o) / cellSize - 0.5;
+    const I0 = Math.max(0, Math.floor(cell(c.x - Rm, g.ox))), I1 = Math.min(nx - 1, Math.ceil(cell(c.x + Rm, g.ox)));
+    const J0 = Math.max(0, Math.floor(cell(c.y - Rm, g.oy))), J1 = Math.min(ny - 1, Math.ceil(cell(c.y + Rm, g.oy)));
+    const K0 = Math.max(0, Math.floor(cell(c.z - Rm, g.oz))), K1 = Math.min(nz - 1, Math.ceil(cell(c.z + Rm, g.oz)));
     const wp = new THREE.Vector3(), wn = new THREE.Vector3(), n = new THREE.Vector3(), pc = new THREE.Vector3();
     let tSum = 0, tN = 0;
     const breaches: { p: THREE.Vector3; a: THREE.Vector3; t: number; r: number; v: number }[] = [];
     // Damage splats (x, y, z, R, peak), applied together after the scan.
     const splats: number[] = [];
-    for (let K = 0; K < nz; K++)
-      for (let J = 0; J < ny; J++)
-        for (let I = 0; I < nx; I++) {
+    for (let K = K0; K <= K1; K++)
+      for (let J = J0; J <= J1; J++)
+        for (let I = I0; I <= I1; I++) {
           // Patch centre sample.
           const si = Math.min(g.nx - 1, Math.round((I + 0.5) * P * F)), sj = Math.min(g.ny - 1, Math.round((J + 0.5) * P * F)), sk = Math.min(g.nz - 1, Math.round((K + 0.5) * P * F));
           pc.set(g.lx(si), g.ly(sj), g.lz(sk));
-          // Too far from the charge to matter (checked at the patch centre, with some margin)?
-          if (load.overpressureAt(this.toWorld(pc.x, pc.y, pc.z, wp)) < 12e3) continue;
           // Is there a surface in this patch? Look for a solid sample with an air neighbour towards the charge.
           const toC = _v.copy(c).sub(pc);
-          const dist = toC.length();
+          const d2 = toC.lengthSq();
+          if (d2 > Rm2) continue;
+          const dist = Math.sqrt(d2);
           if (dist < 1e-6) continue;
           toC.divideScalar(dist);
           // Trace from the charge side to the patch to find its facing surface.
@@ -1968,6 +2129,9 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     if (this.disposed) return;
     this.scheduler.tick(this);
     if (this.rebar) this.updateRebarInstances();
+    // After the shared remesh budget ran (the first element of the frame spends it), so a new
+    // piece shows the same frame its parent loses the material.
+    if (this.dynamic) this.look.batches.flushClient(this);
   }
 
   /**
@@ -1992,17 +2156,20 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     this.flushDirty();
     for (let ci = 0; ci < this.grid.chunkCount; ci++) if (this.grid.dirty[ci]) this.remesh(ci);
     this.updateRebarInstances();
+    this.look.batches.flush();
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.root.parent?.remove(this.root);
-    for (let ci = 0; ci < this.chunkMeshes.length; ci++) {
-      const m = this.chunkMeshes[ci];
-      if (m) m.geometry.dispose();
-      this.chunkMeshes[ci] = null;
-    }
+    this.chunkBatch?.dispose();
+    this.chunkBatch = null;
+    this.chunkSlots.fill(null);
+    this.look.batches.forget(this);
+    if (this.solidSlot) this.solidBatch!.remove(this.solidSlot);
+    if (this.barSlot) this.barBatch!.remove(this.barSlot);
+    this.solidSlot = this.barSlot = null;
     if (this.baseMesh) this.baseMesh.geometry.dispose();
     this.baseMaterial?.dispose();
     this.depthMats?.depth.dispose();
@@ -2033,3 +2200,35 @@ function lobeNoise(x: number, y: number, z: number): number {
   return Math.sin(x * 1.7 + Math.sin(y * 2.3 + z * 0.7) * 1.9) * 0.6 + Math.sin(y * 3.1 - x * 1.3 + Math.sin(z * 2.9) * 1.4) * 0.4;
 }
 
+/** The attribute set of Surface Nets geometry (every solid batch carries exactly these). */
+function solidAttributes(pos: Float32Array, nrm: Float32Array, dmg: Float32Array, dep: Float32Array, soot: Float32Array): Record<string, THREE.BufferAttribute> {
+  return {
+    position: new THREE.BufferAttribute(pos, 3),
+    normal: new THREE.BufferAttribute(nrm, 3),
+    aDamage: new THREE.BufferAttribute(dmg, 1),
+    aDepth: new THREE.BufferAttribute(dep, 1),
+    aSoot: new THREE.BufferAttribute(soot, 1),
+  };
+}
+
+/**
+ * Largest distance r ≤ 400 m from the charge along `dir` at which `loaded(point)` still holds,
+ * for a predicate that holds near the charge and fails beyond some range (bisection, 24 steps).
+ * `known` is a distance where it is known to hold.
+ */
+function blastReach(load: BlastLoad, dir: THREE.Vector3, loaded: (p: THREE.Vector3) => boolean, known: number): number {
+  const q = new THREE.Vector3();
+  const at = (r: number) => loaded(q.copy(load.center).addScaledVector(dir, r));
+  let lo = known, hi = Math.max(2 * known, 1);
+  while (hi < 400 && at(hi)) {
+    lo = hi;
+    hi *= 2;
+  }
+  if (hi >= 400) return 400;
+  for (let i = 0; i < 24; i++) {
+    const mid = 0.5 * (lo + hi);
+    if (at(mid)) lo = mid;
+    else hi = mid;
+  }
+  return hi;
+}

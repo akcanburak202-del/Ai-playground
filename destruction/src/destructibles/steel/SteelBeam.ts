@@ -7,7 +7,10 @@ import type { BlastLoad, ImpactEvent, ProbeSegment, ThicknessProbe } from '../..
 import type { PhysicsOwner } from '../../physics/PhysicsWorld.ts';
 import { BeamSim } from './beamSim.ts';
 import { sectionProps, type SectionPlate, type SectionProps } from './section.ts';
-import { diffusivity, maxBlastMomentum, sheetHeatLoss, steelParams, plugShearHeat, TAYLOR_QUINNEY, AMBIENT_C, type SteelParams } from './steelMaterial.ts';
+import {
+  accumulateDish, contactImpulse, diffusivity, dishStrain, fractureStrain, maxBlastMomentum, panelDish, sheetHeatLoss, steelParams, plugShearHeat,
+  TAYLOR_QUINNEY, AMBIENT_C, type SteelParams,
+} from './steelMaterial.ts';
 import { createSteelMaterial, type SteelFinish, type SteelUniforms } from './look.ts';
 import { DetailMap } from './detailMap.ts';
 import { offsetOutline, profileOutline, SweptMesh, type Dent, type Outline } from './profileMesh.ts';
@@ -15,6 +18,41 @@ import { offsetOutline, profileOutline, SweptMesh, type Dent, type Outline } fro
 const G = 9.80665;
 /** Below this the surface shows nothing of the heat (temper colours ≈ 200 °C, glow ≈ 500 °C), °C. */
 const VISIBLE_HEAT_C = 150;
+/**
+ * Sleep: a member whose fastest node moves slower than this (m/s) — a vibration of v/ω ≲ 0.1 mm at
+ * the 20–50 Hz of a member's first modes — with no plastic flow, no load being brought on and
+ * nothing growing, for SLEEP_TIME, is at rest; it costs nothing until something touches it.
+ */
+const SLEEP_SPEED = 0.02;
+const SLEEP_TIME = 0.25;
+/** Node travel (m) since the last mesh build below which the drawn shape is not rebuilt */
+const MESH_TOL = 1e-3;
+/**
+ * Work all members may do together in one fixed step, in node-substeps (Σ nodes × substeps; one
+ * costs ≈ 3 µs, more while hinges yield). A blast that wakes dozens of members shares it: each
+ * gets its wanted substeps scaled by budget / demand, never fewer than MIN_SUBSTEPS.
+ */
+const NODE_SUBSTEP_BUDGET = 12000;
+const MIN_SUBSTEPS = 2;
+/** Members barely moving (m/s) step at MIN_SUBSTEPS: the exact implicit solve needs no more for a quasi-static state */
+const QUIET_SPEED = 0.05;
+const budget = { time: -1, demand: 0, prevDemand: 0, used: 0 };
+/** Wall-clock time all members may spend rebuilding meshes per rendered frame, ms (the rest waits a frame) */
+const MESH_BUDGET_MS = 6;
+const meshBudget = { time: -1, spent: 0 };
+
+function budgetAt(now: number): typeof budget {
+  if (budget.time !== now) {
+    budget.time = now;
+    budget.prevDemand = budget.demand;
+    budget.demand = 0;
+    budget.used = 0;
+  }
+  return budget;
+}
+/** At most this many dents per member (smallest dropped first) and dish patches */
+const MAX_DENTS = 64;
+const MAX_PATCHES = 24;
 const _o = new THREE.Vector3();
 const _d = new THREE.Vector3();
 const _v = new THREE.Vector3();
@@ -66,6 +104,32 @@ interface BeamInit {
   length: number;
   detail: DetailMap;
   dents: Dent[];
+  patches: DishPatch[];
+}
+
+/**
+ * Accumulated local damage of one spot of one profile plate (a flange, web or wall panel): the
+ * permanent dish, the membrane strain it cost and how much thinner the plate is there (thinning
+ * and scabs). Later loads on the same spot are resolved against what is left.
+ */
+interface DishPatch {
+  plate: number;
+  s: number;
+  y: number;
+  z: number;
+  /** Panel radius the dish spans, m */
+  R: number;
+  /** Permanent dish depth, m */
+  dish: number;
+  /** Mean membrane strain of the dish */
+  strain: number;
+  /** Thickness lost (thinning + scabs), m */
+  tLoss: number;
+  hits: number;
+  torn: boolean;
+  /** The tear has been cut into the section and drawn */
+  tornDrawn?: boolean;
+  dent: Dent;
 }
 
 /**
@@ -90,7 +154,7 @@ export class SteelBeam implements Destructible, Structural {
   readonly section: SectionProps;
   readonly sim: BeamSim;
   mode: 'fixed' | 'rigid' = 'fixed';
-  stats = { lastStepMs: 0, lastMeshMs: 0, lastImpactMs: 0, awake: false, hottest: AMBIENT_C };
+  stats = { lastStepMs: 0, lastMeshMs: 0, lastImpactMs: 0, lastBlastMs: 0, awake: false, hottest: AMBIENT_C, substeps: 0, meshBuilds: 0, maxDish: 0 };
 
   private readonly ctx: SimContext;
   private readonly outline: Outline;
@@ -101,6 +165,13 @@ export class SteelBeam implements Destructible, Structural {
   private coat: { swept: SweptMesh; mesh: THREE.Mesh; look: { material: THREE.MeshStandardMaterial; depth: THREE.MeshDepthMaterial; uniforms: SteelUniforms } } | null = null;
   readonly detail: DetailMap;
   private readonly dents: Dent[];
+  private readonly patches: DishPatch[];
+  /** Node positions the mesh was last built for */
+  private meshX: Float64Array | null = null;
+  private stillMin = Infinity;
+  /** Sim time at which this member's substep demand was counted (see noteDemand) */
+  private demandTime = -1;
+  private demandNodes = 0;
   /**
    * Arc length of node 0 in the original member (= sim.s0[0]: a piece's nodes keep the original
    * member's arc coordinates), and this piece's length
@@ -125,6 +196,8 @@ export class SteelBeam implements Destructible, Structural {
   private version = 0;
   private hitCache: BeamHit | null = null;
   private hot = false;
+  /** The last close-in / contact load as realised (diagnostics and the sandbox readout) */
+  lastContact: { tntKg: number; kind: string; t: number; dish: number; dishR: number; breach: boolean; breachR: number; scab: number; impulse?: number; r0?: number } | null = null;
   /** Sim time since the member's temperatures were last integrated (coarse steps when not visible) */
   private coolClock = 0;
   private heatDirty = false;
@@ -149,6 +222,7 @@ export class SteelBeam implements Destructible, Structural {
       this.detail = init.detail;
       this.detail.refs++;
       this.dents = init.dents;
+      this.patches = init.patches;
     } else {
       this.sim = new BeamSim({
         start: arr(spec.start), end: arr(spec.end), up: spec.up ? arr(spec.up) : [0, 1, 0], section: this.section, params: this.params,
@@ -162,6 +236,7 @@ export class SteelBeam implements Destructible, Structural {
       const floatLinear = !!ctx.renderer?.extensions?.has?.('OES_texture_float_linear');
       this.detail = new DetailMap(tw, th, Math.max(16, tw >> 2), Math.max(16, th >> 2), floatLinear);
       this.dents = [];
+      this.patches = [];
     }
     this.root.name = `beam:${spec.name}`;
     const finish: SteelFinish = spec.finish === 'fireproofed' ? 'mill-scale' : spec.finish === 'chrome' ? 'chrome' : spec.finish;
@@ -294,14 +369,27 @@ export class SteelBeam implements Destructible, Structural {
   private wake(): void {
     this.awake = true;
     this.still = 0;
+    this.stillMin = Infinity;
   }
 
   fixedUpdate(dt: number): void {
     if (this.disposed || this.mode === 'rigid' || !this.awake) return;
     const t0 = performance.now();
+    // Bound the cost of one fixed step over all members: a blast that wakes dozens of them at once
+    // shares NODE_SUBSTEP_BUDGET; each takes its wanted substeps scaled by budget / demand (still
+    // the exact implicit solve, just coarser in time), so a heavy step cannot run away.
+    const want = this.noteDemand(dt);
+    const b = budgetAt(this.ctx.time.now);
+    const scale = Math.min(1, NODE_SUBSTEP_BUDGET / Math.max(1, b.demand, b.prevDemand));
+    let nsub = Math.max(MIN_SUBSTEPS, Math.floor(want * scale));
+    // Hard stop well past the budget (an estimate was off): the rest take the minimum.
+    if (b.used + nsub * this.sim.n > 1.5 * NODE_SUBSTEP_BUDGET) nsub = MIN_SUBSTEPS;
+    this.sim.maxSubsteps = Math.min(want, nsub);
     const st = this.sim.step(dt);
+    b.used += st.substeps * this.sim.n;
+    this.stats.substeps = st.substeps;
     this.version++;
-    this.dirtyMesh = true;
+    if (this.movedSinceMesh(MESH_TOL)) this.dirtyMesh = true;
     for (const e of this.sim.events.splice(0)) {
       const i = e.node;
       _v.set(this.sim.x[3 * i]!, this.sim.x[3 * i + 1]!, this.sim.x[3 * i + 2]!);
@@ -316,11 +404,28 @@ export class SteelBeam implements Destructible, Structural {
       this.toRigid();
       return;
     }
-    // Sleep once the member is still (no per-frame cost until something hits it again).
-    if (st.maxSpeed < 2e-3) {
-      this.still += dt;
-      if (this.still > 0.4) this.awake = false;
-    } else this.still = 0;
+    // Sleep once the member is at rest (no per-step cost until something touches it again): slow,
+    // no plastic flow, the imposed load fully on, and the motion not growing (a column creeping
+    // into a buckle starts slow but accelerates — that must keep running).
+    const s = this.sim;
+    const loading = Math.abs(s.applied - s.imposed) > 1e-6 * Math.max(1, s.imposed);
+    if (!loading && st.maxSpeed < SLEEP_SPEED && st.plasticWork < 0.5) {
+      if (st.maxSpeed > Math.max(2 * this.stillMin, 2e-3)) {
+        this.still = 0;
+        this.stillMin = st.maxSpeed;
+      } else {
+        this.stillMin = Math.min(this.stillMin, st.maxSpeed);
+        this.still += dt;
+      }
+      if (this.still >= SLEEP_TIME) {
+        this.awake = false;
+        s.v.fill(0);
+        s.xp.set(s.x);
+      }
+    } else {
+      this.still = 0;
+      this.stillMin = Infinity;
+    }
     // Debris must collide with the member where it is now, not where it stood: refresh the static
     // colliders when it has moved by more than a few centimetres (at most every 0.25 s while
     // moving, and once more when it comes to rest).
@@ -372,7 +477,7 @@ export class SteelBeam implements Destructible, Structural {
       const sub = s.slice(i0, i1);
       sub.imposed = 0;
       const beam = new SteelBeam(this.ctx, { ...this.spec, name: `${this.name}-${i0 === 0 ? 'a' : 'b'}` }, {
-        sim: sub, s0: s.s0[i0]!, length: sub.ds * (sub.n - 1), detail: this.detail, dents: this.dents,
+        sim: sub, s0: s.s0[i0]!, length: sub.ds * (sub.n - 1), detail: this.detail, dents: this.dents, patches: this.patches,
       });
       beam.failed = true;
       this.ctx.addDestructible(beam);
@@ -405,8 +510,24 @@ export class SteelBeam implements Destructible, Structural {
         if (visible) this.heatDirty = true;
       }
     }
-    if (this.dirtyMesh && this.mode === 'fixed') this.updateMesh();
-    else if (this.heatDirty) {
+    let rebuild = this.dirtyMesh && this.mode === 'fixed';
+    if (rebuild) {
+      // Share MESH_BUDGET_MS of rebuilds per frame across members; one that has to wait keeps a
+      // conservative node-based box so ray tests still find it where it is.
+      const now = this.ctx.time.now;
+      if (meshBudget.time !== now) {
+        meshBudget.time = now;
+        meshBudget.spent = 0;
+      }
+      if (meshBudget.spent > MESH_BUDGET_MS) {
+        rebuild = false;
+        this.nodeBounds();
+      }
+    }
+    if (rebuild) {
+      this.updateMesh();
+      meshBudget.spent += this.stats.lastMeshMs;
+    } else if (this.heatDirty) {
       this.swept.updateHeat(this.sim.temp, this.sim.n, this.sim.ds);
       this.coat?.swept.updateHeat(this.sim.temp, this.sim.n, this.sim.ds);
     }
@@ -416,8 +537,54 @@ export class SteelBeam implements Destructible, Structural {
     if (this.coat) this.coat.look.uniforms.uTime.value = this.ctx.time.now;
   }
 
+  /**
+   * Count this member's wanted work for the current fixed step (once per step) and return its
+   * wanted substep count. Also called when a load wakes it (blasts and impacts arrive before the
+   * members step), so the members stepping first already see the whole demand of a blast.
+   */
+  private noteDemand(dt = this.ctx.time.fixedDt || 1 / 60): number {
+    const s = this.sim;
+    // A quiet member only needs the implicit solve's equilibrium: MIN_SUBSTEPS per step.
+    s.minSubstepDt = s.maxNodeSpeed() < QUIET_SPEED ? dt / MIN_SUBSTEPS : 1 / 480;
+    s.maxSubsteps = 96;
+    const want = s.desiredSubsteps(dt);
+    const b = budgetAt(this.ctx.time.now);
+    if (this.demandTime !== b.time) {
+      this.demandTime = b.time;
+      this.demandNodes = 0;
+    }
+    const nodes = want * s.n;
+    if (nodes > this.demandNodes) {
+      b.demand += nodes - this.demandNodes;
+      this.demandNodes = nodes;
+    }
+    return want;
+  }
+
+  /** Bounds from the node positions, padded by the section and the deepest dent. */
+  private nodeBounds(): void {
+    const s = this.sim;
+    this.bounds.makeEmpty();
+    for (let i = 0; i < s.n; i++) this.bounds.expandByPoint(_v.set(s.x[3 * i]!, s.x[3 * i + 1]!, s.x[3 * i + 2]!));
+    this.bounds.expandByScalar(Math.hypot(this.section.cy, this.section.cz) + 0.01);
+  }
+
+  /** Has any node moved more than `tol` since the mesh was last built? */
+  private movedSinceMesh(tol: number): boolean {
+    const x = this.sim.x, c = this.meshX;
+    if (!c || c.length !== x.length) return true;
+    const t2 = tol * tol;
+    for (let i = 0; i < x.length; i += 3) {
+      if ((x[i]! - c[i]!) ** 2 + (x[i + 1]! - c[i + 1]!) ** 2 + (x[i + 2]! - c[i + 2]!) ** 2 > t2) return true;
+    }
+    return false;
+  }
+
   private updateMesh(): void {
     const t0 = performance.now();
+    if (!this.meshX || this.meshX.length !== this.sim.x.length) this.meshX = new Float64Array(this.sim.x.length);
+    this.meshX.set(this.sim.x);
+    this.stats.meshBuilds++;
     const s = this.sim;
     const plast = new Float64Array(s.n);
     for (let i = 0; i < s.n; i++) plast[i] = Math.max(s.bendPlast[2 * i]!, s.bendPlast[2 * i + 1]!);
@@ -462,6 +629,15 @@ export class SteelBeam implements Destructible, Structural {
   }
 
   raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
+    return this.rayTest(origin, dir, maxDist, false);
+  }
+
+  /**
+   * Ray test against the profile plates. `throughHoles: false` skips surface points where a hole
+   * has been cut (projectiles pass through them); a blast front loads the whole plate facing it,
+   * holes or not, so blasts look for the struck face with `true`.
+   */
+  private rayTest(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, solidPlates: boolean): RayHit | null {
     if (this.disposed) return null;
     this.ensureSegs();
     this.rayToSim(origin, dir);
@@ -491,7 +667,7 @@ export class SteelBeam implements Destructible, Structural {
         const sArc = g.s + hs;
         // Through an existing hole?
         const pu = this.perimeterAt(hy, hz);
-        if (!this.detail.solid(pu, sArc / L)) continue;
+        if (!solidPlates && !this.detail.solid(pu, sArc / L)) continue;
         best = hit.t;
         bestSeg = k;
         bestPlate = p;
@@ -646,9 +822,19 @@ export class SteelBeam implements Destructible, Structural {
       const pl = this.section.plates[c.plate]!;
       this.detail.dimple(pu, v, rc / per, rc / L, Math.min(1, depth / Math.max(0.005, this.maxPlateT())));
       this.detail.scar(pu, v, (1.8 * rc) / per, (1.8 * rc) / L, 1, seed);
-      const bigDent = Math.min(0.6 * pl.t + 0.5 * depth, (0.05 * Math.sqrt(e.energyAbsorbed)) / Math.sqrt(P.fy * 1e-6 * pl.t * 1000));
-      if (bigDent > 0.002) this.addDent(c, Math.max(rc * 2, e.damageRadius * 0.5), bigDent);
-      if (bigDent > 0.3 * pl.t) this.removeSection(node, c.plate, (0.3 * (bigDent / pl.t) * (2 * rc)) / Math.max(pl.hz * 2, pl.hy * 2, 1e-3), rc);
+      // The momentum the round leaves in the plate dishes the panel it struck: Nurick & Martin's
+      // localised-impulse relation (panelDish) with the crater as the loaded radius. Rifle rounds
+      // leave nothing visible; heavy rounds and big fragments dish a flange by millimetres.
+      const Rp = this.panelRadius(c.plate);
+      const tLoc = this.localThickness(c);
+      const dishAdd = panelDish(P, e.momentum.length(), Rp, Math.max(rc, d), tLoc);
+      if (dishAdd > 0.001) {
+        const patch = this.dish(c, Math.min(Rp, Math.max(2 * rc, 0.5 * e.damageRadius)), dishAdd, 0);
+        if (patch.torn && !patch.tornDrawn) {
+          patch.tornDrawn = true;
+          this.tearPatch(c, patch, seed);
+        }
+      }
       const V = Math.PI * rc * rc * Math.max(depth, 5e-4) * 0.5;
       const dT = Math.min(1450, (TAYLOR_QUINNEY * Math.min(e.energyAbsorbed, 12 * P.fy * V)) / (P.rho * V * 3 * P.c));
       this.detail.heatSpot(pu, v, (1.5 * rc) / per, (1.5 * rc) / L, dT, time, rc, diffusivity(P));
@@ -664,6 +850,7 @@ export class SteelBeam implements Destructible, Structural {
     else if (Pm > 0) {
       this.sim.addImpulse(c.s - this.s0, J.x, J.y, J.z);
       this.wake();
+      this.noteDemand();
     }
     const sparkN = Math.round(Math.min(60, 4 + Math.sqrt(e.kineticEnergy) / 12));
     this.ctx.fx.sparks({ position: e.point, direction: e.outcome === 'ricochet' && e.residualDirection ? e.residualDirection : e.normal, count: sparkN, speed: Math.min(60, 8 + e.speed * 0.03), hot: 0.6 });
@@ -714,12 +901,106 @@ export class SteelBeam implements Destructible, Structural {
     this.ctx.structure.touch(this);
   }
 
-  /** A dent pushing the struck face inward (rest coordinates, so it rides along when the member bends). */
-  private addDent(c: BeamHit, R: number, depth: number): void {
-    const f = this.faceAt(c.y, c.z);
-    this.dents.push({ s: c.s, y: c.y, z: c.z, dy: -f.ny, dz: -f.nz, R, depth });
-    if (this.dents.length > 64) this.dents.shift();
+  /**
+   * The dish patch of the struck plate at this spot (within half a dish radius of an earlier one),
+   * or null. Loads on a patch are resolved against the thinned plate and deepen its dish.
+   */
+  private patchAt(c: BeamHit, R: number): DishPatch | null {
+    let best: DishPatch | null = null, bd = Infinity;
+    for (const p of this.patches) {
+      if (p.plate !== c.plate) continue;
+      const reach = 0.5 * Math.max(p.R, R);
+      const d = Math.hypot(c.s - p.s, c.y - p.y, c.z - p.z);
+      if (d < reach && d < bd) {
+        bd = d;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  /** Panel radius of profile plate p: half its width between the edges that hold it, m. */
+  private panelRadius(p: number): number {
+    const pl = this.section.plates[p]!;
+    if (pl.kind === 'arc') return Math.max(0.5 * pl.r1, (pl.r1 * (pl.a1 - pl.a0)) / 2);
+    return Math.max(pl.hy, pl.hz, 2 * pl.t);
+  }
+
+  /** Remaining thickness of the struck plate under this spot (thinning and scabs of earlier loads), m. */
+  private localThickness(c: BeamHit): number {
+    const pl = this.section.plates[c.plate]!;
+    const patch = this.patchAt(c, this.panelRadius(c.plate));
+    return Math.max(0.1 * pl.t, pl.t - (patch?.tLoss ?? 0));
+  }
+
+  /**
+   * A permanent dish of the struck plate: deepens the patch at this spot (Jones' δ ∝ √(Σ E)
+   * accumulation, see accumulateDish), thins it by the membrane strain it costs (volume constancy)
+   * plus any scab, and draws it as an inward dent of the face (rest coordinates, so it rides along
+   * when the member bends). Returns the patch; `torn` when the accumulated strain has reached the
+   * fracture strain of the plate — an earlier dish is required, a single load's tearing is the
+   * ballistics module's breach verdict.
+   */
+  private dish(c: BeamHit, R: number, add: number, scab: number): DishPatch {
+    const pl = this.section.plates[c.plate]!;
+    let patch = this.patchAt(c, R);
+    const before = patch ? patch.dish : 0;
+    if (!patch) {
+      const f = this.faceAt(c.y, c.z);
+      const dent: Dent = { s: c.s, y: c.y, z: c.z, dy: -f.ny, dz: -f.nz, R, depth: 0 };
+      patch = { plate: c.plate, s: c.s, y: c.y, z: c.z, R, dish: 0, strain: 0, tLoss: 0, hits: 0, torn: false, dent };
+      this.dents.push(dent);
+      this.patches.push(patch);
+      if (this.patches.length > MAX_PATCHES) {
+        let k = 0;
+        for (let i = 1; i < this.patches.length; i++) if (this.patches[i]!.dish < this.patches[k]!.dish) k = i;
+        this.patches.splice(k, 1);
+      }
+    }
+    patch.hits++;
+    patch.R = Math.max(patch.R, R);
+    patch.dish = accumulateDish(patch.dish, add);
+    const eps = dishStrain(patch.dish, patch.R);
+    const dEps = Math.max(0, eps - patch.strain);
+    patch.strain = Math.max(patch.strain, eps);
+    const tLeft = pl.t - patch.tLoss;
+    patch.tLoss = Math.min(pl.t, patch.tLoss + tLeft * (1 - 1 / (1 + dEps)) + Math.max(0, scab));
+    // Fracture at the element-size regularised strain (GL criterion, steelMaterial.fractureStrain)
+    // with the dish radius as the "element": the strain is a mean over it.
+    if (!patch.torn && before > 0 && (eps >= fractureStrain(this.params, pl.t, patch.R) || patch.tLoss >= 0.9 * pl.t)) patch.torn = true;
+    // Drawn dish: the plate cannot pass through the far side of the section.
+    patch.dent.R = patch.R;
+    patch.dent.depth = Math.min(patch.dish, 0.45 * Math.min(2 * this.section.cy, 2 * this.section.cz));
+    this.stats.maxDish = Math.max(this.stats.maxDish, patch.dish);
+    this.pruneDents();
     this.dirtyMesh = true;
+    return patch;
+  }
+
+  /**
+   * A dish whose accumulated strain reached fracture tears open: a petalled hole of ≈ 0.4 of the
+   * dish radius through the struck plate (its share of the section goes with it).
+   */
+  private tearPatch(c: BeamHit, patch: DishPatch, seed: number): void {
+    const pl = this.section.plates[c.plate]!;
+    const rb = 0.4 * patch.R;
+    this.paintHoleAlong(c, rb, 0.5, seed + 7, pl.t * 1.5 + 0.002);
+    this.removeSection(this.nodeAt(c.s), c.plate, holeArea(pl, pl.t, rb, c.dy, c.dz) / Math.max(pl.A, 1e-9), rb);
+    this.ctx.fx.sparks({ position: c.hit.point.clone(), direction: c.hit.normal.clone(), count: 30, speed: 14, hot: 0.8 });
+  }
+
+  /** Keep at most MAX_DENTS dents: the shallowest go first (never a live dish patch). */
+  private pruneDents(): void {
+    while (this.dents.length > MAX_DENTS) {
+      let k = -1;
+      for (let i = 0; i < this.dents.length; i++) {
+        const d = this.dents[i]!;
+        if (this.patches.some((p) => p.dent === d)) continue;
+        if (k < 0 || d.depth < this.dents[k]!.depth) k = i;
+      }
+      if (k < 0) k = 0;
+      this.dents.splice(k, 1);
+    }
   }
 
   private faceAt(y: number, z: number): OutlineFace {
@@ -739,6 +1020,7 @@ export class SteelBeam implements Destructible, Structural {
 
   applyBlast(load: BlastLoad): void {
     if (this.disposed) return;
+    const t0 = performance.now();
     const s = this.sim;
     if (this.mode === 'rigid') {
       if (this.body) {
@@ -795,71 +1077,130 @@ export class SteelBeam implements Destructible, Structural {
       Jb[3 * i + 2] = dir.z * Jn;
       Jsum += Jn;
     }
-    // Never more momentum than the charge's products can deliver (maxBlastMomentum).
-    const Jscale = Math.min(1, maxBlastMomentum(load.tntKg, load.kind) / Math.max(Jsum, 1e-9));
     const standoff = Math.sqrt(nd) - Math.max(this.section.cy, this.section.cz);
     const contact = load.contactTargetId === this.id || ((load.kind === 'contact' || load.kind === 'hesh') && standoff < 0.35 * w3);
+    // Never more momentum than the charge's products can deliver (maxBlastMomentum); a charge in
+    // contact gives the member the impulse its dish is computed from (contactImpulse).
+    const Jcap = contact ? contactImpulse(load.tntKg, load.kind) : maxBlastMomentum(load.tntKg, load.kind);
+    const Jscale = Math.min(1, Jcap / Math.max(Jsum, 1e-9));
     // A distant blast that cannot move any node by more than a few cm/s, beyond the fireball's
     // reach, changes nothing: do not wake the member for it.
     if (!contact && standoff > 2 * w3) {
       let dv = 0;
       for (let i = 0; i < s.n; i++) dv = Math.max(dv, (Math.hypot(Jb[3 * i]!, Jb[3 * i + 1]!, Jb[3 * i + 2]!) * Jscale) / Math.max(s.mass[i]!, 1e-9));
-      if (dv < 0.05) return;
+      if (dv < 0.05) {
+        this.stats.lastBlastMs = performance.now() - t0;
+        return;
+      }
     }
     for (let i = 0; i < s.n; i++) {
       if (Jb[3 * i] === 0 && Jb[3 * i + 1] === 0 && Jb[3 * i + 2] === 0) continue;
       s.addImpulse(s.s0[i]! - this.s0, Jb[3 * i]! * Jscale, Jb[3 * i + 1]! * Jscale, Jb[3 * i + 2]! * Jscale);
     }
-    // Face towards the charge at the nearest node: where soot, dents and breaches go.
+    // Face towards the charge at the nearest node: where soot, dishes and breaches go.
     const probeFrom = load.center.clone();
     const toNode = new THREE.Vector3(s.x[3 * nearest]!, s.x[3 * nearest + 1]!, s.x[3 * nearest + 2]!).sub(probeFrom).normalize();
-    const hit = this.raycast(probeFrom, toNode, Math.sqrt(nd) + 1);
+    const hit = this.rayTest(probeFrom, toNode, Math.sqrt(nd) + 1, true);
     const c = hit ? this.hitCache : null;
     const seed = this.ctx.rng.next() * 100;
     const L = this.detailLength(), per = this.outline.perimeter;
-    if (c) {
+    if (c && hit) {
       const pu = this.perimeterAt(c.y, c.z), v = c.s / L;
+      const pl = this.section.plates[c.plate]!;
+      const Rp = this.panelRadius(c.plate);
       // Soot only within reach of the fireball (see SteelPlate.applyBlast).
       const rs = Math.min(1.5, 0.3 * w3 + 0.4 * Math.max(0, standoff));
       if (standoff < 2 * w3) this.detail.soot(pu, v, rs / per, rs / L, Math.min(0.9, (0.35 * w3) / Math.max(0.2, standoff)), seed);
+      // What is left of the struck plate here (earlier dishes thinned it, scabs took its back).
+      const tLoc = this.localThickness(c);
+      let dishAdd = 0, dishR = Rp, breach = false, rb = 0, scabR = 0, scabD = 0, crater = 0;
       if (contact) {
-        const pl = this.section.plates[c.plate]!;
-        const cd = load.contactDamage(this.material, pl.t);
-        // Local flange / web dish under the charge.
-        this.addDent(c, Math.max(0.1, cd.craterRadius), Math.min(0.12, cd.craterDepth + 0.5 * pl.t));
-        if (cd.breach) {
-          const rb = cd.breachRadius;
-          this.paintHoleAlong(c, rb, 0.45, seed, pl.t * 3 + 0.002);
-          const node = this.nodeAt(c.s);
-          // The breach takes the struck plate over 2·r_b, and the plates behind it if it is wider
-          // than the struck plate is thick (the jet of detonation products shears through).
-          const run = this.runThrough(c, 4 * rb);
-          for (const seg of run) {
-            const p = this.section.plates[seg.plate]!;
-            const chord = (seg.t1 - seg.t0) * Math.hypot(c.dy, c.dz);
-            this.removeSection(node, seg.plate, holeArea(p, Math.max(p.t, 0.5 * chord), rb, c.dy, c.dz) / Math.max(p.A, 1e-9), rb);
+        // The ballistics module's contact numbers for the plate as it is now, realised in full.
+        const cd = load.contactDamage(this.material, tLoc);
+        dishAdd = cd.craterDepth;
+        dishR = Math.min(Rp, Math.max(0.05, cd.craterRadius));
+        breach = cd.breach && cd.breachRadius > 0;
+        rb = cd.breachRadius;
+        crater = cd.craterRadius;
+        if (cd.spallRadius > 0 && !breach) {
+          // Hopkinson scab off the far side of the struck plate, bounded by the charge footprint
+          // ≈ 0.1 W^⅓ as for plates (Held 1981, see SteelPlate.applyBlast).
+          scabR = Math.min(cd.spallRadius, 0.1 * w3);
+          scabD = Math.min(tLoc, cd.spallDepth);
+        }
+        this.lastContact = { tntKg: load.tntKg, kind: load.kind, t: tLoc, dish: cd.craterDepth, dishR: cd.craterRadius, breach: cd.breach, breachR: cd.breachRadius, scab: cd.spallDepth };
+      } else if (standoff < 2 * w3) {
+        // Close-in air burst (a delay-fuzed shell that went off behind the flange it holed, a
+        // charge beside the member): the reflected impulse over the panel dishes it — Nurick &
+        // Martin's localised-impulse relation with the impulse integrated over the panel disc
+        // (rings of radius r ≤ R_p about the point nearest the charge) and the loaded radius r0
+        // where the specific impulse has fallen to half its peak.
+        const g = this.segs[Math.min(c.seg, this.segs.length - 1)]!;
+        const n = hit.normal;
+        const K = 6;
+        let I = 0, i0 = 0, r0 = Rp, prevI = 0;
+        for (let k = 0; k <= K; k++) {
+          const r = (Rp * k) / K;
+          // Average of the two sides along the member axis (the charge may sit off the patch).
+          _w.copy(hit.point).addScaledVector(g.a, r);
+          let ik = load.reflectedImpulseAt(_w, n);
+          _w.copy(hit.point).addScaledVector(g.a, -r);
+          ik = 0.5 * (ik + load.reflectedImpulseAt(_w, n));
+          if (k === 0) i0 = ik;
+          else {
+            const dr = Rp / K;
+            I += Math.PI * dr * (prevI * (r - dr) + ik * r); // trapezoid of ∫ i(r) 2πr dr
+            if (r0 === Rp && ik < 0.5 * i0) r0 = r - dr * ((0.5 * i0 - ik) / Math.max(prevI - ik, 1e-9));
           }
-          this.ctx.fx.chips({ position: load.center, direction: toNode, spread: 0.7, speed: 150, count: 30, size: 0.02, color: 0x3a3d40, kind: 'metal' });
+          prevI = ik;
         }
+        // The panel cannot take more than the member's share of the charge's momentum.
+        I = Math.min(I * Jscale, Jcap);
+        dishAdd = panelDish(this.params, I, Rp, Math.max(r0, 0.053 * w3), tLoc);
+        this.lastContact = { tntKg: load.tntKg, kind: load.kind, t: tLoc, dish: dishAdd, dishR: Rp, breach: false, breachR: 0, scab: 0, impulse: I, r0 };
+      }
+      if (dishAdd > 5e-4 || breach || scabD > 0) {
+        const patch = this.dish(c, dishR, dishAdd, scabD);
+        if (!breach && patch.torn) {
+          breach = true;
+          rb = Math.max(rb, 0.4 * patch.R);
+        }
+        if (breach) patch.torn = patch.tornDrawn = true;
+      }
+      if (breach) {
+        this.paintHoleAlong(c, rb, 0.45, seed, pl.t * 3 + 0.002);
+        const node = this.nodeAt(c.s);
+        // The breach takes the struck plate over 2·r_b, and the plates behind it if it is wider
+        // than the struck plate is thick (the jet of detonation products shears through).
+        const run = this.runThrough(c, contact ? 4 * rb : pl.t * 1.5);
+        for (const seg of run) {
+          const p = this.section.plates[seg.plate]!;
+          const chord = (seg.t1 - seg.t0) * Math.hypot(c.dy, c.dz);
+          this.removeSection(node, seg.plate, holeArea(p, Math.max(p.t, 0.5 * chord), rb, c.dy, c.dz) / Math.max(p.A, 1e-9), rb);
+        }
+        this.ctx.fx.chips({ position: hit.point.clone(), direction: toNode, spread: 0.7, speed: 150, count: 30, size: 0.02, color: 0x3a3d40, kind: 'metal' });
+      }
+      if (contact) {
         // The charge strips coating and scale under its footprint on the struck face.
-        this.detail.scar(pu, v, cd.craterRadius / per, cd.craterRadius / L, 0.8, seed + 2);
-        if (cd.spallRadius > 0) {
-          // Hopkinson scab off the far side of the struck plate (a flange's inner face), bounded by
-          // the charge footprint ≈ 0.1 W^⅓ as for plates (Held 1981, see SteelPlate.applyBlast); it
-          // takes its depth out of that plate's section.
-          const rs = Math.min(cd.spallRadius, 0.1 * w3);
-          const f = this.faceAt(c.y, c.z);
-          const pr = this.perimeterAt(c.y - f.ny * pl.t * 1.05, c.z - f.nz * pl.t * 1.05);
-          this.detail.scab(pr, v, rs / per, rs / L, Math.min(1, cd.spallDepth / Math.max(0.005, this.maxPlateT())), seed + 1);
-          if (!cd.breach) this.removeSection(this.nodeAt(c.s), c.plate, (2 * rs * Math.min(pl.t, cd.spallDepth)) / Math.max(pl.A, 1e-9), rs);
-        }
+        this.detail.scar(pu, v, crater / per, crater / L, 0.8, seed + 2);
         this.detail.heatSpot(pu, v, (0.06 * w3) / per, (0.06 * w3) / L, 500, this.ctx.time.now, 0.004, diffusivity(this.params), false);
+      } else if (dishAdd > 2e-3) {
+        // A dished panel sheds its paint and mill scale where it stretched.
+        this.detail.scar(pu, v, (0.6 * Rp) / per, (0.6 * Rp) / L, Math.min(0.8, dishAdd / pl.t), seed + 2);
+      }
+      if (scabD > 0) {
+        const f = this.faceAt(c.y, c.z);
+        const pr = this.perimeterAt(c.y - f.ny * pl.t * 1.05, c.z - f.nz * pl.t * 1.05);
+        this.detail.scab(pr, v, scabR / per, scabR / L, Math.min(1, scabD / Math.max(0.005, this.maxPlateT())), seed + 1);
+        if (!breach) this.removeSection(this.nodeAt(c.s), c.plate, (2 * scabR * scabD) / Math.max(pl.A, 1e-9), scabR);
       }
     }
     this.warm();
     this.dirtyMesh = true;
     this.wake();
+    if (!this.disposed) this.noteDemand();
     this.checkSever();
+    this.stats.lastBlastMs = performance.now() - t0;
   }
 
   /** Heat was added: check the temperatures on the next frame. */
