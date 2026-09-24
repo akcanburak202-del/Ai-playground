@@ -34,9 +34,13 @@ const _n = new THREE.Vector3();
 
 /**
  * Merge foliage clumps and woody parts into one geometry with vertex colours. `centre` and
- * `axisScale` define the crown's own ellipsoid, used to bend the normals outwards.
+ * `axisScale` define the crown's own ellipsoid, used to bend the normals outwards. A lite crown
+ * (20-face clumps) is displaced less and bent further towards the crown's radial direction: its
+ * twelve vertices per clump would otherwise read as faceted stones instead of foliage masses.
  */
-function assemble(clumps: Clump[], wood: THREE.BufferGeometry[], centre: THREE.Vector3, axisScale: THREE.Vector3, seed: number): THREE.BufferGeometry {
+function assemble(clumps: Clump[], wood: THREE.BufferGeometry[], centre: THREE.Vector3, axisScale: THREE.Vector3, seed: number, lite = false): THREE.BufferGeometry {
+  const rough = lite ? 0.2 : 0.32;
+  const [own, radial] = lite ? [0.28, 0.72] : [0.45, 0.55];
   const n = new Noise3(seed);
   const parts: THREE.BufferGeometry[] = [];
   const bark = new THREE.Color(0x4a3b2e);
@@ -61,7 +65,7 @@ function assemble(clumps: Clump[], wood: THREE.BufferGeometry[], centre: THREE.V
     for (let i = 0; i < pos.count; i++) {
       _v.fromBufferAttribute(pos, i);
       // Ragged foliage surface: two octaves of displacement at leaf-mass scale.
-      const d = 1 + 0.32 * n.fbm(_v.x * 1.9 + k * 7.3, _v.y * 1.9 + k * 1.7, _v.z * 1.9, 2);
+      const d = 1 + rough * n.fbm(_v.x * 1.9 + k * 7.3, _v.y * 1.9 + k * 1.7, _v.z * 1.9, 2);
       const up = _v.y;
       pos.setXYZ(i, c.x + _v.x * c.rx * d, c.y + _v.y * c.ry * d, c.z + _v.z * c.rz * d);
       // Self-shadowing inside the crown: lighter tops, darker undersides and hollows.
@@ -77,7 +81,7 @@ function assemble(clumps: Clump[], wood: THREE.BufferGeometry[], centre: THREE.V
     for (let i = 0; i < pos.count; i++) {
       _v.fromBufferAttribute(pos, i);
       _r.subVectors(_v, centre).divide(axisScale).normalize();
-      _n.fromBufferAttribute(nor, i).multiplyScalar(0.45).addScaledVector(_r, 0.55).normalize();
+      _n.fromBufferAttribute(nor, i).multiplyScalar(own).addScaledVector(_r, radial).normalize();
       nor.setXYZ(i, _n.x, _n.y, _n.z);
     }
     const flat = g.toNonIndexed();
@@ -113,19 +117,23 @@ function srgb(hex: number, jitter: number, rng: Rng): THREE.Color {
  * Italian cypress (Cupressus sempervirens 'Stricta'): a dense, very dark flame 1/7 as wide as it
  * is tall, foliage almost to the ground, slightly irregular outline from its fastigiate branches.
  */
-function cypress(seed: number): THREE.BufferGeometry {
+function cypress(seed: number, lite: boolean): THREE.BufferGeometry {
   const rng = new Rng(seed);
   const clumps: Clump[] = [];
-  const N = 14;
+  const N = lite ? 10 : 14;
+  const detail = lite ? 0 : 1;
   const lean = rng.range(-0.012, 0.012), leanZ = rng.range(-0.012, 0.012);
   for (let i = 0; i < N; i++) {
-    const t = 0.05 + (i / (N - 1)) * 0.9;
+    const t = 0.05 + (i / (N - 1)) * (lite ? 0.85 : 0.9);
     // Widest a quarter of the way up, then an ogival taper to the point.
     const R = t < 0.25 ? 0.062 + 0.1 * t : 0.087 * Math.pow((1 - t) / 0.75, 0.75);
     const cx = lean * t + rng.range(-0.18, 0.18) * R, cz = leanZ * t + rng.range(-0.18, 0.18) * R;
-    clumps.push({ x: cx, y: t, z: cz, rx: R * 1.05, ry: Math.max(0.035, R * 1.7), rz: R * 1.05, color: srgb(0x223019, 0.12, rng), detail: 1 });
+    // Fewer, taller column masses in the lite variant, each reaching about to its neighbours'
+    // centres (spacing 0.094): the column stays closed up to its point instead of pinching.
+    const ry = lite ? Math.max(0.09, R * 2.2) : Math.max(0.035, R * 1.7);
+    clumps.push({ x: cx, y: t, z: cz, rx: R * 1.05, ry, rz: R * 1.05, color: srgb(0x223019, 0.12, rng), detail });
     // Branch tips standing out of the column break the outline.
-    const sides = t > 0.9 ? 0 : 2;
+    const sides = t > 0.9 ? 0 : lite ? 1 : 2;
     for (let s = 0; s < sides; s++) {
       const a = rng.range(0, Math.PI * 2);
       clumps.push({
@@ -135,14 +143,14 @@ function cypress(seed: number): THREE.BufferGeometry {
     }
   }
   const trunk = limb(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0.1, 0), 0.012, 0.009);
-  return assemble(clumps, [trunk], new THREE.Vector3(0, 0.4, 0), new THREE.Vector3(0.09, 0.5, 0.09), seed);
+  return assemble(clumps, [trunk], new THREE.Vector3(0, 0.4, 0), new THREE.Vector3(0.09, 0.5, 0.09), seed, lite);
 }
 
 /**
  * Italian stone pine (Pinus pinea): a bare, often leaning trunk forking into a few limbs under a
  * broad, flat-topped umbrella of foliage masses ~0.9× the tree's height across.
  */
-function stonePine(seed: number): THREE.BufferGeometry {
+function stonePine(seed: number, lite: boolean): THREE.BufferGeometry {
   const rng = new Rng(seed);
   const clumps: Clump[] = [];
   const lean = new THREE.Vector3(rng.range(-0.08, 0.08), 0, rng.range(-0.08, 0.08));
@@ -168,15 +176,15 @@ function stonePine(seed: number): THREE.BufferGeometry {
       const s = size * rng.range(0.8, 1.2);
       clumps.push({
         x: ctr.x + Math.cos(a) * rr, y: y + rng.range(-0.02, 0.02), z: ctr.z + Math.sin(a) * rr,
-        rx: s, ry: s * rng.range(0.42, 0.55), rz: s, color: srgb(rad < 0.2 ? 0x34431f : 0x3b4a24, 0.14, rng), detail: 1,
+        rx: s, ry: s * rng.range(0.42, 0.55), rz: s, color: srgb(rad < 0.2 ? 0x34431f : 0x3b4a24, 0.14, rng), detail: lite ? 0 : 1,
       });
     }
   }
-  return assemble(clumps, wood, ctr, new THREE.Vector3(0.4, 0.12, 0.4), seed);
+  return assemble(clumps, wood, ctr, new THREE.Vector3(0.4, 0.12, 0.4), seed, lite);
 }
 
 /** Olive / holm oak: a short trunk and a rounded, lumpy, grey-green crown. */
-function olive(seed: number): THREE.BufferGeometry {
+function olive(seed: number, lite: boolean): THREE.BufferGeometry {
   const rng = new Rng(seed);
   const clumps: Clump[] = [];
   const top = new THREE.Vector3(rng.range(-0.04, 0.04), 0.38, rng.range(-0.04, 0.04));
@@ -188,16 +196,22 @@ function olive(seed: number): THREE.BufferGeometry {
     const s = rng.range(0.12, 0.19);
     clumps.push({
       x: ctr.x + Math.cos(a) * rr * Math.cos(e), y: ctr.y + rr * Math.sin(e) * 0.8, z: ctr.z + Math.sin(a) * rr * Math.cos(e),
-      rx: s, ry: s * 0.82, rz: s, color: srgb(0x4d5638, 0.14, rng), detail: 1,
+      rx: s, ry: s * 0.82, rz: s, color: srgb(0x4d5638, 0.14, rng), detail: lite ? 0 : 1,
     });
   }
-  return assemble(clumps, wood, ctr, new THREE.Vector3(0.3, 0.25, 0.3), seed);
+  return assemble(clumps, wood, ctr, new THREE.Vector3(0.3, 0.25, 0.3), seed, lite);
 }
 
-/** Two variants of each kind, so neighbouring trees do not repeat. */
-export function treeGeometry(kind: TreeKind, variant: number): THREE.BufferGeometry {
+/**
+ * Two variants of each kind, so neighbouring trees do not repeat. `lite` (quality 0: tablets and
+ * phones) builds every foliage clump as a 20-face icosahedron instead of an 80-face one and the
+ * cypress from fewer, taller masses: about a quarter of the triangles (cypress ≈ 390 instead of
+ * 1650, stone pine ≈ 380 instead of 1400, olive ≈ 230 instead of 890) for the same silhouette
+ * and crown shading at the 80–300 m these trees stand at. The full variant is unchanged.
+ */
+export function treeGeometry(kind: TreeKind, variant: number, lite = false): THREE.BufferGeometry {
   const seed = 101 + variant * 977 + TREE_KINDS.indexOf(kind) * 31;
-  return kind === 'cypress' ? cypress(seed) : kind === 'pine' ? stonePine(seed) : olive(seed);
+  return kind === 'cypress' ? cypress(seed, lite) : kind === 'pine' ? stonePine(seed, lite) : olive(seed, lite);
 }
 
 /** Typical heights, m (min, max): cypress 12–18, stone pine 10–15, olive / holm oak 5–8. */

@@ -15,6 +15,22 @@ import { hasGroundProvider } from '../fx/ground.ts';
 
 export type Quality = 0 | 1 | 2;
 
+/**
+ * `scene.userData` key under which the pipeline publishes its current quality level (read-only for
+ * everyone else). It is set in `setup`, which runs before a scene's build, and again on
+ * `setQuality`, so scene dressing and terrain can size their geometry to the device.
+ */
+export const RENDER_QUALITY_KEY = 'renderQuality';
+
+/**
+ * Quality level the scene is built and drawn at: the one the production pipeline published on it,
+ * or `fallback` when none did (BasicPipeline, headless tests), which keeps full detail.
+ */
+export function renderQualityOf(scene: THREE.Object3D, fallback: Quality = 2): Quality {
+  const q = scene.userData[RENDER_QUALITY_KEY] as unknown;
+  return q === 0 || q === 1 || q === 2 ? q : fallback;
+}
+
 /** Default mood: low warm sun raking across the facades from the south-west. */
 export const DEFAULT_SUN = { elevation: 13, azimuth: 232 };
 
@@ -218,6 +234,7 @@ export class Pipeline implements RenderPipelineApi {
     const q = QUALITY[this.quality];
     const ctx = this.ctx;
     if (!ctx || !this.composer) return;
+    ctx.scene.userData[RENDER_QUALITY_KEY] = this.quality;
     const r = ctx.renderer;
     const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
     const pr = Math.min(q.pixelRatio, Math.max(1, dpr));
@@ -342,6 +359,7 @@ export class Pipeline implements RenderPipelineApi {
     this.sun.removeFromParent();
     this.hemi.removeFromParent();
     this.ground.removeFromParent();
+    if (this.ctx) delete this.ctx.scene.userData[RENDER_QUALITY_KEY];
     this.ctx = null;
     this.composer = null;
   }

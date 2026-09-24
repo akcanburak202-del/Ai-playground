@@ -5,6 +5,7 @@ import type { SimContext } from '../app/contracts.ts';
 import { Rng } from '../core/rng.ts';
 import { Noise3 } from '../core/noise.ts';
 import { TREE_HEIGHT, TREE_KINDS, treeGeometry } from './flora.ts';
+import { renderQualityOf } from '../render/Pipeline.ts';
 
 /**
  * Non-destructible scene dressing: reflecting-pool water, a distant tree line, painted signs and
@@ -94,7 +95,16 @@ export class Decor {
    * Distant planting: groves of Italian cypress, stone pine and olive / holm oak scattered in a
    * ring (or a rectangle) around the site, plus optional straight cypress alleys. Instanced (two
    * variants per species), unshadowed — it stands beyond the sun-shadow range — and hazed by the
-   * pipeline's aerial perspective like any geometry.
+   * pipeline's aerial perspective like any geometry. The instances are split into angular sectors
+   * around the centre: one instanced mesh holding a whole ring has a bounding sphere around the
+   * camera and is never frustum-culled, while a sector outside the view (or the pool reflection's
+   * view) is skipped whole.
+   *
+   * At render quality 0 (tablets, phones) the planting keeps its layout but uses the lite tree
+   * variants (flora.ts) and thins the outer part of a ring: from 35 % of the way out a tree is
+   * kept with a probability falling smoothly to 35 % at the outer edge, where the haze already
+   * dims it and a grove's remaining trees still carry its outline. The trees that stay are exactly
+   * where they are at the higher levels (the keep draw uses its own random stream).
    */
   trees(o: {
     center?: [number, number]; inner?: number; outer?: number; count: number; seed?: number;
@@ -117,6 +127,15 @@ export class Decor {
     const [cx, cz] = o.center ?? [0, 0];
     const mix = o.mix ?? [0.4, 0.35, 0.25];
     const inner = o.inner ?? 100, outer = o.outer ?? 250;
+    const lite = renderQualityOf(this.ctx.scene) === 0;
+    const thin = new Rng((o.seed ?? 7) * 7919 + 13);
+    const thinFrom = inner + 0.35 * (outer - inner);
+    /** Quality 0: chance a ring tree at (x, z) is planted (1 inside `thinFrom`, 0.35 at `outer`). */
+    const keep = (x: number, z: number): boolean => {
+      if (!lite || o.rect) return true;
+      const f = Math.min(1, Math.max(0, (Math.hypot(x - cx, z - cz) - thinFrom) / (outer - thinFrom)));
+      return thin.next() < 1 - 0.65 * f * f * (3 - 2 * f);
+    };
     const place = (out: THREE.Vector3): boolean => {
       if (o.rect) {
         const [x0, z0, x1, z1] = o.rect;
@@ -137,18 +156,24 @@ export class Decor {
         g++;
       }
     }
-    const lists: THREE.Matrix4[][] = TREE_KINDS.flatMap(() => [[], []]);
-    const tints: THREE.Color[][] = TREE_KINDS.flatMap(() => [[], []]);
+    const slots = 2 * TREE_KINDS.length;
+    const lists: THREE.Matrix4[][] = Array.from({ length: TREE_SECTORS * slots }, () => []);
+    const tints: THREE.Color[][] = Array.from({ length: TREE_SECTORS * slots }, () => []);
     const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
-    const plant = (kind: number, at: THREE.Vector3) => {
+    const plant = (kind: number, at: THREE.Vector3, kept = true) => {
       const [h0, h1] = TREE_HEIGHT[TREE_KINDS[kind]!];
       const h = rng.range(h0, h1) * (o.scale ?? 1);
       q.setFromAxisAngle(UP, rng.range(0, Math.PI * 2));
       const wide = rng.range(0.85, 1.15);
       s.set(h * wide, h, h * wide);
       const slot = 2 * kind + (rng.next() < 0.5 ? 0 : 1);
-      lists[slot]!.push(m.compose(at.clone().setY(-0.15), q, s).clone());
-      tints[slot]!.push(new THREE.Color().setScalar(rng.range(0.82, 1.12)));
+      const tint = rng.range(0.82, 1.12);
+      // A thinned tree still consumes its draws, so the planting stays the same at every quality.
+      if (!kept) return;
+      const turn = Math.atan2(at.z - cz, at.x - cx) / (2 * Math.PI);
+      const key = Math.min(TREE_SECTORS - 1, Math.floor((turn - Math.floor(turn)) * TREE_SECTORS)) * slots + slot;
+      lists[key]!.push(m.compose(at.clone().setY(-0.15), q, s).clone());
+      tints[key]!.push(new THREE.Color().setScalar(tint));
     };
     for (let i = 0; i < o.count; i++) {
       const u = rng.next();
@@ -159,7 +184,7 @@ export class Decor {
         p.set(g.x + rng.gaussian(0, r), 0, g.z + rng.gaussian(0, r));
         if (!o.rect && Math.hypot(p.x - cx, p.z - cz) < inner * 0.9) continue;
       } else if (!place(p)) continue;
-      plant(kind, p);
+      plant(kind, p, keep(p.x, p.z));
     }
     for (const [x0, z0, x1, z1, spacing] of o.alleys ?? []) {
       const len = Math.hypot(x1 - x0, z1 - z0);
@@ -170,13 +195,15 @@ export class Decor {
       }
     }
     const mat = this.track(new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0, vertexColors: true, envMapIntensity: 0.7 }));
-    lists.forEach((list, slot) => {
+    const geos: THREE.BufferGeometry[] = [];
+    lists.forEach((list, key) => {
       if (!list.length) return;
-      const geo = this.track(treeGeometry(TREE_KINDS[slot >> 1]!, slot & 1));
+      const slot = key % slots;
+      const geo = (geos[slot] ??= this.track(treeGeometry(TREE_KINDS[slot >> 1]!, slot & 1, lite)));
       const im = new THREE.InstancedMesh(geo, mat, list.length);
       list.forEach((mm, i) => {
         im.setMatrixAt(i, mm);
-        im.setColorAt(i, tints[slot]![i]!);
+        im.setColorAt(i, tints[key]![i]!);
       });
       im.instanceMatrix.needsUpdate = true;
       if (im.instanceColor) im.instanceColor.needsUpdate = true;
@@ -336,6 +363,8 @@ export class Decor {
   }
 }
 
+/** Angular sectors a planting is split into for frustum culling (8: ≈ 3 in a 60° view) */
+const TREE_SECTORS = 8;
 const UP = new THREE.Vector3(0, 1, 0);
 const ORIGIN = new THREE.Vector3();
 const ONE = new THREE.Vector3(1, 1, 1);

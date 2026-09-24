@@ -14,6 +14,7 @@ import { createGroundNoise, createPockAtlas } from './textures.ts';
 import { PockDecals } from './pocks.ts';
 import { RELIEF_DEEP, RELIEF_SPAN } from './relief.ts';
 import { setGroundProvider, type GroundProvider } from '../../fx/ground.ts';
+import { renderQualityOf } from '../../render/Pipeline.ts';
 
 export interface TerrainOptions {
   /** Total side length of the walkable ground, m (default 600) */
@@ -60,6 +61,8 @@ interface PaintJob {
 
 const _v = new THREE.Vector3();
 const _nv = new THREE.Vector3();
+/** Scratch copy of one tile's heights for `levelErrors` */
+const _tileHeights = new Float32Array((TILE + 1) * (TILE + 1));
 const _n: number[] = [0, 1, 0];
 
 interface Tile {
@@ -72,11 +75,27 @@ interface Tile {
   lod: number;
   /** Has been cratered: keep it finer at distance */
   scarred: boolean;
+  /**
+   * Largest vertical gap between each LOD level's surface and the full-resolution grid over this
+   * tile, m (made non-decreasing with the level); null until needed or after the tile changed.
+   */
+  err: Float32Array | null;
 }
 
-/** Render LOD steps (cells per quad) and the camera distance up to which each is used, m. */
-const LOD_STEPS = [1, 2, 4, 8];
+/**
+ * Render LOD steps (cells per quad). Quality 1–2 choose among the first four by camera distance
+ * (LOD_RANGE, m); quality 0 may use all of them, by geometric error (see `updateLod`).
+ */
+const LOD_STEPS = [1, 2, 4, 8, 16, 64];
 const LOD_RANGE = [28, 55, 110, Infinity];
+/**
+ * Quality 0: largest angle a tile's simplification may subtend at the camera, rad — its vertical
+ * error δ over the distance d, the screen-space error bound of chunked terrain LOD (Lindstrom et
+ * al. 1996; Ulrich 2002). 2 mrad ≈ 1.4 px at 720 px over a 60° field of view: an undisturbed
+ * plaza (δ = 0) is two triangles per 16 m tile, the gentle swales coarsen within a few metres,
+ * and a crater keeps full resolution while it is near enough to show it.
+ */
+const LITE_ANGULAR_ERROR = 0.002;
 /**
  * Vertical skirt hung below every tile edge, m (plus half the tile's relief). Neighbouring tiles at
  * different LODs meet in T-junctions, which leave pixel cracks (sky specks at grazing angles) even
@@ -125,6 +144,8 @@ export class Terrain implements Destructible {
   private splatData: Uint8Array;
   private splat: THREE.DataTexture;
   private splatDirty: { x0: number; x1: number; y0: number; y1: number } | null = null;
+  /** The GPU has received the whole splat image once (row updates are only valid after that) */
+  private splatResident = false;
   private paintJobs: PaintJob[] = [];
   private pocks: PockDecals;
   private pockAtlas: THREE.DataTexture;
@@ -187,6 +208,9 @@ export class Terrain implements Destructible {
     this.splat.magFilter = THREE.LinearFilter;
     this.splat.colorSpace = THREE.NoColorSpace;
     this.splat.needsUpdate = true;
+    this.splat.onUpdate = () => {
+      this.splatResident = true;
+    };
     this.material = createGroundMaterial({
       noise: this.noiseTex,
       splat: this.splat,
@@ -194,6 +218,7 @@ export class Terrain implements Destructible {
       plaza: this.plaza,
     });
 
+    const lite = renderQualityOf(ctx.scene) === 0;
     for (let tj = 0; tj < this.tilesPerSide; tj++) {
       for (let ti = 0; ti < this.tilesPerSide; ti++) {
         const mesh = new THREE.Mesh(this.buildTileGeometry(ti * TILE, tj * TILE), this.material);
@@ -204,7 +229,9 @@ export class Terrain implements Destructible {
         // while the open field (most of the triangles) stays out of the shadow passes.
         mesh.castShadow = this.tileNearPlaza(ti * TILE, tj * TILE);
         this.root.add(mesh);
-        this.tiles.push({ i0: ti * TILE, j0: tj * TILE, mesh, collider: null, dirty: false, lod: 0, scarred: false });
+        // Quality 0 selects levels by their error: measure it now, inside the scene build.
+        const err = lite ? this.levelErrors(ti * TILE, tj * TILE) : null;
+        this.tiles.push({ i0: ti * TILE, j0: tj * TILE, mesh, collider: null, dirty: false, lod: 0, scarred: false, err });
       }
     }
     // The ring reaches 2 m under the detailed field (whose last 2 m are exactly flat at 0), dipping
@@ -487,19 +514,30 @@ export class Terrain implements Destructible {
     }
   }
 
-  /** Pick each tile's index buffer from its distance to the camera. */
+  /**
+   * Pick each tile's index buffer. Quality 1–2: from the camera distance (cratered tiles stay
+   * fine). Quality 0 (tablets): the coarsest level whose error δ stays within LITE_ANGULAR_ERROR·d
+   * — the render mesh only; colliders, ray casts and craters always use the full grid.
+   */
   private updateLod(): void {
     const cam = this.ctx.camera.position;
     const f = this.field;
     const span = TILE * f.cell;
+    const lite = renderQualityOf(this.ctx.scene) === 0;
     for (const t of this.tiles) {
       const cx = f.x0 + t.i0 * f.cell + span / 2, cz = f.z0 + t.j0 * f.cell + span / 2;
       const dx = Math.max(0, Math.abs(cam.x - cx) - span / 2), dz = Math.max(0, Math.abs(cam.z - cz) - span / 2);
       const d = Math.hypot(dx, dz, cam.y);
       let lod = 0;
-      while (lod < LOD_RANGE.length - 1 && d > LOD_RANGE[lod]!) lod++;
-      // Cratered tiles keep their full detail wherever the crater can still be resolved.
-      if (t.scarred) lod = d > LOD_RANGE[2]! ? Math.min(lod, 1) : 0;
+      if (lite) {
+        const err = (t.err ??= this.levelErrors(t.i0, t.j0));
+        const tol = LITE_ANGULAR_ERROR * Math.max(d, 1);
+        while (lod < LOD_STEPS.length - 1 && err[lod + 1]! <= tol) lod++;
+      } else {
+        while (lod < LOD_RANGE.length - 1 && d > LOD_RANGE[lod]!) lod++;
+        // Cratered tiles keep their full detail wherever the crater can still be resolved.
+        if (t.scarred) lod = d > LOD_RANGE[2]! ? Math.min(lod, 1) : 0;
+      }
       if (lod !== t.lod) {
         t.lod = lod;
         t.mesh.geometry.setIndex(this.indices[lod]!);
@@ -513,7 +551,11 @@ export class Terrain implements Destructible {
     if (this.splatDirty) {
       const { y0, y1, x0, x1 } = this.splatDirty;
       // three uploads each update range as a single row (texSubImage2D height 1): one per row.
-      for (let y = y0; y <= y1; y++) this.splat.addUpdateRange((y * SPLAT + x0) * 4, (x1 - x0 + 1) * 4);
+      // Until the GPU holds the image, the whole of it goes up: three's first upload of a
+      // DataTexture with update ranges fills only those rows of the fresh storage (a crater made
+      // before the terrain was first drawn left the rest of the field at relief −2 m).
+      if (this.splatResident) for (let y = y0; y <= y1; y++) this.splat.addUpdateRange((y * SPLAT + x0) * 4, (x1 - x0 + 1) * 4);
+      else this.splat.clearUpdateRanges();
       this.splat.needsUpdate = true;
       this.splatDirty = null;
     }
@@ -545,6 +587,7 @@ export class Terrain implements Destructible {
       this.rebuildCollider(t);
       t.mesh.castShadow = true;
       t.scarred = true;
+      t.err = null;
     }
     if (any) this.updateBounds();
   }
@@ -555,6 +598,41 @@ export class Terrain implements Destructible {
     const x0 = f.x0 + i0 * f.cell, z0 = f.z0 + j0 * f.cell, x1 = x0 + TILE * f.cell, z1 = z0 + TILE * f.cell;
     const hx = p ? p.halfX + 3 : 10, hz = p ? p.halfZ + 3 : 10;
     return x1 >= -hx && x0 <= hx && z1 >= -hz && z0 <= hz;
+  }
+
+  /**
+   * Per LOD level, the largest |h_level − h| over the tile's full-resolution vertices, where
+   * h_level interpolates the level's corner heights on the same diagonal split as the grid
+   * (≈ 0.3 ms per tile: the tile's heights are copied out once, then each level scans them).
+   */
+  private levelErrors(i0: number, j0: number): Float32Array {
+    const f = this.field, n = f.n, stride = n + 1, h = f.h, S = TILE + 1, T = _tileHeights;
+    for (let j = 0; j <= TILE; j++) {
+      const row = Math.min(j0 + j, n) * stride;
+      for (let i = 0; i <= TILE; i++) T[j * S + i] = h[row + Math.min(i0 + i, n)]!;
+    }
+    const err = new Float32Array(LOD_STEPS.length);
+    for (let l = 1; l < LOD_STEPS.length; l++) {
+      const s = LOD_STEPS[l]!, inv = 1 / s;
+      let e = err[l - 1]!;
+      for (let cj = 0; cj < TILE; cj += s) {
+        for (let ci = 0; ci < TILE; ci += s) {
+          const a = cj * S + ci;
+          const h00 = T[a]!, h10 = T[a + s]!, h01 = T[a + s * S]!, h11 = T[a + s * S + s]!;
+          for (let j = 0; j <= s; j++) {
+            const v = j * inv, r = a + j * S;
+            for (let i = 0; i <= s; i++) {
+              const u = i * inv;
+              const hc = u >= v ? h00 + u * (h10 - h00) + v * (h11 - h10) : h00 + v * (h01 - h00) + u * (h11 - h01);
+              const d = Math.abs(hc - T[r + i]!);
+              if (d > e) e = d;
+            }
+          }
+        }
+      }
+      err[l] = e;
+    }
+    return err;
   }
 
   private buildTileGeometry(i0: number, j0: number): THREE.BufferGeometry {

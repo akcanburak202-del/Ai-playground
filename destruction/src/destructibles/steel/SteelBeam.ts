@@ -28,6 +28,24 @@ const SLEEP_TIME = 0.25;
 /** Node travel (m) since the last mesh build below which the drawn shape is not rebuilt */
 const MESH_TOL = 1e-3;
 /**
+ * Level of detail. A pristine member is drawn with a coarse sweep: the outline's corners and fillet
+ * arcs only (flat faces are not split, see profileOutline's maxSeg) and a ring every
+ * COARSE_RING_SPACING along the smoothed axis. Silhouette, normals and texture coordinates are the
+ * same as the fine sweep's (the dropped vertices are collinear, so the perimeter parameter is
+ * unchanged), and every mark that does not move the surface (holes, craters, scars, soot, hot
+ * spots) lives in the detail texture, so it shows the same at 5–7 % of the triangles. The first
+ * dent, plastic hinge, plastic-work heat or bow the coarse rings cannot follow switches the member
+ * to the fine sweep for good (built then, the coarse one disposed).
+ */
+const FINE_RING_SPACING = 0.05;
+const COARSE_RING_SPACING = 0.5;
+/** Longest straight outline segment of the coarse sweep, m (larger than any profile face: faces stay whole) */
+const COARSE_MAX_SEG = 100;
+/** Deviation of a node from the coarse rings' chord (m), plastic hinge rotation (rad) and node heat (°C) that need the fine sweep */
+const LOD_BOW_TOL = 2e-3;
+const LOD_PLAST_TOL = 2e-3;
+const LOD_HEAT_C = AMBIENT_C + 30;
+/**
  * Work all members may do together in one fixed step, in node-substeps (Σ nodes × substeps; one
  * costs ≈ 3 µs, more while hinges yield). A blast that wakes dozens of members shares it: each
  * gets its wanted substeps scaled by budget / demand, never fewer than MIN_SUBSTEPS.
@@ -162,7 +180,9 @@ export class SteelBeam implements Destructible, Structural {
   private readonly outline: Outline;
   private readonly faces: OutlineFace[] = [];
   private readonly mesh: THREE.Mesh;
-  private readonly swept: SweptMesh;
+  /** The drawn sweep: coarse while the member is pristine, fine from its first deformation (see COARSE_RING_SPACING) */
+  private swept: SweptMesh;
+  private fine: boolean;
   private readonly look: { material: THREE.MeshStandardMaterial; depth: THREE.MeshDepthMaterial; uniforms: SteelUniforms };
   private coat: { swept: SweptMesh; mesh: THREE.Mesh; look: { material: THREE.MeshStandardMaterial; depth: THREE.MeshDepthMaterial; uniforms: SteelUniforms } } | null = null;
   readonly detail: DetailMap;
@@ -250,7 +270,9 @@ export class SteelBeam implements Destructible, Structural {
       finish, paintColor: spec.paintColor, detail: this.detail.tex, heat: this.detail.heatTex, size: [this.outline.perimeter, this.totalLength()],
       split: false, dimpleScale: Math.max(0.005, this.maxPlateT()), diffusivity: diffusivity(this.params), seed: (this.id * 31) % 97,
     });
-    this.swept = new SweptMesh(this.outline, this.length, this.s0, Math.min(0.05, this.sim.ds / 3));
+    // A piece of a cut member carries its damage: fine from the start.
+    this.fine = !!init;
+    this.swept = this.makeSweep();
     this.remapV();
     this.mesh = new THREE.Mesh(this.swept.geometry, this.look.material);
     this.mesh.customDepthMaterial = this.look.depth;
@@ -281,7 +303,7 @@ export class SteelBeam implements Destructible, Structural {
   private remapV(): void {
     const L = this.detailLength();
     const g = this.swept.geometry.getAttribute('aDUv') as THREE.BufferAttribute;
-    const m = this.outline.verts.length;
+    const m = this.swept.outline.verts.length;
     for (let k = 0; k < this.swept.rings; k++) {
       const v = (this.s0 + (k / (this.swept.rings - 1)) * this.length) / L;
       for (let i = 0; i < m; i++) g.setY(k * m + i, v);
@@ -295,13 +317,33 @@ export class SteelBeam implements Destructible, Structural {
     return t;
   }
 
+  /** Ring spacing of the drawn sweep at the current level of detail, m. */
+  private ringSpacing(): number {
+    return this.fine ? Math.min(FINE_RING_SPACING, this.sim.ds / 3) : Math.max(this.sim.ds, COARSE_RING_SPACING);
+  }
+
+  /** The steel sweep at the current level of detail (the fine one uses the analytic outline itself). */
+  private makeSweep(): SweptMesh {
+    const outline = this.fine ? this.outline : profileOutline(this.spec.profile, this.section.rootRadius, COARSE_MAX_SEG);
+    return new SweptMesh(outline, this.length, this.s0, this.ringSpacing());
+  }
+
+  /** The coat's sweep over the current steel sweep (same vertex layout, so it takes its texture coordinates). */
+  private makeCoatSweep(): SweptMesh {
+    const swept = new SweptMesh(offsetOutline(this.swept.outline, 0.025), this.length, this.s0, this.ringSpacing());
+    swept.dentShift = 0.025;
+    const g = swept.geometry.getAttribute('aDUv') as THREE.BufferAttribute;
+    const src = this.swept.geometry.getAttribute('aDUv') as THREE.BufferAttribute;
+    for (let i = 0; i < Math.min(g.count, src.count); i++) g.setXY(i, src.getX(i), src.getY(i));
+    g.needsUpdate = true;
+    return swept;
+  }
+
   /** Sprayed fireproofing: a 25 mm coat swept over the steel, gone wherever the steel is scarred. */
   private buildCoat(): void {
-    const out = offsetOutline(this.outline, 0.025);
-    const swept = new SweptMesh(out, this.length, this.s0, Math.min(0.05, this.sim.ds / 3));
-    swept.dentShift = 0.025;
+    const swept = this.makeCoatSweep();
     const look = createSteelMaterial({
-      finish: 'fireproofed', detail: this.detail.tex, heat: this.detail.heatTex, size: [out.perimeter, this.detailLength()],
+      finish: 'fireproofed', detail: this.detail.tex, heat: this.detail.heatTex, size: [swept.outline.perimeter, this.detailLength()],
       split: false, dimpleScale: 0.02, diffusivity: diffusivity(this.params), seed: (this.id * 17) % 89, coat: true,
     });
     const mesh = new THREE.Mesh(swept.geometry, look.material);
@@ -309,10 +351,65 @@ export class SteelBeam implements Destructible, Structural {
     mesh.castShadow = mesh.receiveShadow = true;
     this.root.add(mesh);
     this.coat = { swept, mesh, look };
-    const g = swept.geometry.getAttribute('aDUv') as THREE.BufferAttribute;
-    const src = this.swept.geometry.getAttribute('aDUv') as THREE.BufferAttribute;
-    for (let i = 0; i < Math.min(g.count, src.count); i++) g.setXY(i, src.getX(i), src.getY(i));
-    g.needsUpdate = true;
+  }
+
+  /** Switch to the fine sweep for good (see COARSE_RING_SPACING): built now, the coarse one disposed. */
+  private refine(): void {
+    if (this.fine) return;
+    this.fine = true;
+    const old = this.swept;
+    this.swept = this.makeSweep();
+    this.remapV();
+    this.mesh.geometry = this.swept.geometry;
+    old.dispose();
+    if (this.coat) {
+      const oldCoat = this.coat.swept;
+      this.coat.swept = this.makeCoatSweep();
+      this.coat.mesh.geometry = this.coat.swept.geometry;
+      oldCoat.dispose();
+    }
+  }
+
+  /**
+   * Does the member need the fine sweep: a dent, a plastic hinge, heat from plastic work (drawn per
+   * node), or a node further from the coarse rings' chord than LOD_BOW_TOL (the coarse rings sit on
+   * the node polyline every COARSE_RING_SPACING; an elastic bow is far inside that, a kink is not).
+   */
+  private needsFine(): boolean {
+    if (this.dents.length) return true;
+    const s = this.sim, n = s.n;
+    for (let i = 0; i < n; i++) {
+      if (s.bendPlast[2 * i]! > LOD_PLAST_TOL || s.bendPlast[2 * i + 1]! > LOD_PLAST_TOL || s.temp[i]! > LOD_HEAT_C) return true;
+    }
+    const L = s.ds * (n - 1), R = this.swept.rings, h = L / Math.max(1, R - 1);
+    // Node polyline at arc position a (0..L), into out[0..2].
+    const at = (a: number, out: number[]) => {
+      const f = Math.min(n - 1 - 1e-9, Math.max(0, a / s.ds));
+      const i = Math.floor(f), t = f - i, j = Math.min(n - 1, i + 1);
+      for (let c = 0; c < 3; c++) out[c] = s.x[3 * i + c]! + t * (s.x[3 * j + c]! - s.x[3 * i + c]!);
+    };
+    const A = [0, 0, 0], B = [0, 0, 0];
+    const tol2 = LOD_BOW_TOL * LOD_BOW_TOL;
+    for (let i = 1; i < n - 1; i++) {
+      const a = i * s.ds, k = Math.min(R - 2, Math.floor(a / h)), t = (a - k * h) / h;
+      at(k * h, A);
+      at((k + 1) * h, B);
+      let d2 = 0;
+      for (let c = 0; c < 3; c++) d2 += (s.x[3 * i + c]! - (A[c]! + t * (B[c]! - A[c]!))) ** 2;
+      if (d2 > tol2) return true;
+    }
+    return false;
+  }
+
+  /** Is the member drawn with the fine sweep (diagnostics, tests)? */
+  get fineMesh(): boolean {
+    return this.fine;
+  }
+
+  /** Triangles of the drawn member (steel and coat), for budgets and tests. */
+  get triangles(): number {
+    const count = (g: THREE.BufferGeometry) => (g.index ? g.index.count : 0) / 3;
+    return count(this.swept.geometry) + (this.coat ? count(this.coat.swept.geometry) : 0);
   }
 
   // ─── structural ─────────────────────────────────────────────────────────────────────────────
@@ -749,6 +846,7 @@ export class SteelBeam implements Destructible, Structural {
 
   private updateMesh(): void {
     const t0 = performance.now();
+    if (!this.fine && this.needsFine()) this.refine();
     if (!this.meshX || this.meshX.length !== this.sim.x.length) this.meshX = new Float64Array(this.sim.x.length);
     this.meshX.set(this.sim.x);
     this.stats.meshBuilds++;

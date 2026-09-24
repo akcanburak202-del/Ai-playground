@@ -198,3 +198,48 @@ test('terrain: crater removes the pock marks it blew away and re-seats the rest;
   for (let i = 0; i < idx.count; i++) assert.ok(idx.getX(i) < pos.count);
   t.dispose();
 });
+
+test('terrain LOD at render quality 0: error-bounded render mesh, full-resolution craters and colliders', async () => {
+  const ctx = await makeCtx();
+  ctx.scene.userData.renderQuality = 0;
+  const t = new Terrain(ctx, { size: 200, detail: 64, plaza: { halfX: 20, halfZ: 20, finish: 'pavers' } });
+  ctx.addDestructible(t);
+  type TileView = { i0: number; j0: number; lod: number; mesh: THREE.Mesh };
+  const tiles = (t as unknown as { tiles: TileView[] }).tiles;
+  const tris = () => tiles.reduce((s, x) => s + x.mesh.geometry.getIndex()!.count / 3, 0);
+  ctx.camera.position.set(3, 1.7, 2);
+  t.frameUpdate();
+  // The flat plaza is exact at any level: every tile under and around the camera is at its coarsest.
+  const coarsest = 5;
+  // (detail 64 m at 0.25 m: 4 × 4 tiles of 16 m from x, z = −32; this one spans x, z ∈ [0, 16].)
+  const under = tiles.find((x) => x.i0 === 128 && x.j0 === 128)!;
+  assert.equal(under.lod, coarsest, 'flat plaza tile under the camera');
+  const lite = tris();
+  // Full detail (no published quality) for comparison: the tile under the camera is at full resolution.
+  delete ctx.scene.userData.renderQuality;
+  t.frameUpdate();
+  assert.equal(under.lod, 0);
+  const full = tris();
+  assert.ok(lite < full / 20, `quality-0 terrain ${lite} vs ${full} triangles`);
+
+  // A crater near the camera brings its tiles back to full resolution at quality 0.
+  ctx.scene.userData.renderQuality = 0;
+  t.applyBlast(createBlastLoad({ center: new THREE.Vector3(4, 0.02, 3), tntKg: 8, kind: 'he', normal: new THREE.Vector3(0, 1, 0), contactTargetId: t.id }, 0));
+  t.fixedUpdate();
+  t.frameUpdate();
+  assert.equal(under.lod, 0, 'cratered tile near the camera is at full resolution');
+  // Far away its simplification is allowed again, within the angular error bound.
+  ctx.camera.position.set(3, 400, 2);
+  t.frameUpdate();
+  assert.ok(under.lod > 0, 'distant crater tile is simplified');
+  // Physics is unaffected by the render LOD: the collider floor matches the height field.
+  ctx.physics.step(1 / 60);
+  const floor = t.heightAt(4, 3);
+  const ray = ctx.physics.castRay(new THREE.Vector3(4, 5, 3), new THREE.Vector3(0, -1, 0), 20);
+  assert.ok(ray && Math.abs(ray.point.y - floor) < 0.05 && floor < -0.2, `collider floor ${ray?.point.y} vs ${floor}`);
+  for (const x of tiles) {
+    const idx = x.mesh.geometry.getIndex()!;
+    for (let i = 0; i < idx.count; i++) assert.ok(idx.getX(i) < 65 * 65 + 4 * 65);
+  }
+  t.dispose();
+});
