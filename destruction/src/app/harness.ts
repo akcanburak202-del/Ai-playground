@@ -22,9 +22,16 @@ export interface Harness {
    * `zero: false` to fire straight down the line of sight.
    */
   fire(o: { ammo: string; from: [number, number, number]; at: [number, number, number]; count?: number; interval?: number; spreadMOA?: number; settle?: number; zero?: boolean }): void;
-  detonate(o: { at: [number, number, number]; tntKg: number; kind?: BlastKind; normal?: [number, number, number] }): void;
-  /** Summary of the last impacts (outcome, depth, target) for assertions */
-  impacts(n?: number): { ammo: string; target: string; material: string; outcome: string; depth: number; speed: number; residual: number; summary: string }[];
+  /**
+   * Detonate a charge. `target` (a destructible's name, name prefix or id) makes it a true contact
+   * charge on that element (contactTargetId), as a placed demolition charge would be.
+   */
+  detonate(o: { at: [number, number, number]; tntKg: number; kind?: BlastKind; normal?: [number, number, number]; target?: string | number }): void;
+  /**
+   * Summary of the last impacts for assertions. `agent` tells rounds from fragments and HEAT jets;
+   * `prior` counts targets the round had already perforated (0 = primary hit).
+   */
+  impacts(n?: number): { ammo: string; agent: string; projectileId: number | null; prior: number; target: string; material: string; outcome: string; depth: number; speed: number; residual: number; summary: string }[];
   stats(): Record<string, number>;
 }
 
@@ -70,12 +77,24 @@ export function installHarness(sim: Simulation): Harness {
       }
       if (settle > 0) sim.advance(settle);
     },
-    detonate({ at, tntKg, kind = 'he', normal }) {
-      sim.ctx.blasts.detonate({ center: v(at), tntKg, kind, normal: normal ? v(normal).normalize() : undefined });
+    detonate({ at, tntKg, kind = 'he', normal, target }) {
+      let contactTargetId: number | undefined;
+      if (target !== undefined) {
+        const all = sim.ctx.registry.all();
+        const hit = typeof target === 'number'
+          ? all.find((d) => d.id === target)
+          : all.find((d) => d.name === target) ?? all.find((d) => d.name.startsWith(target));
+        contactTargetId = hit?.id;
+      }
+      sim.ctx.blasts.detonate({
+        center: v(at), tntKg, kind: target !== undefined && kind === 'he' ? 'contact' : kind,
+        normal: normal ? v(normal).normalize() : undefined, contactTargetId,
+      });
     },
     impacts(n = 20) {
       return sim.impactLog.slice(-n).map((e) => ({
-        ammo: e.ammo.id, target: e.targetName ?? e.targetKind, material: e.material.id, outcome: e.outcome,
+        ammo: e.ammo.id, agent: e.agent, projectileId: e.projectileId ?? null, prior: e.priorPerforations ?? 0,
+        target: e.targetName ?? e.targetKind, material: e.material.id, outcome: e.outcome,
         depth: e.depth, speed: e.speed, residual: e.residualSpeed, summary: e.summary,
       }));
     },

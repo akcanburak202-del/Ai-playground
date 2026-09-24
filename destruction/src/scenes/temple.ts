@@ -91,7 +91,7 @@ export const temple: SceneDef = {
       const neck = r0 * (1 - taper), rEch = 0.95 * (ABA / 2);
       const ech = site.voxel({
         name: `Ekinus ${n + 1}`, ...marble, shape: echinusShape(neck, rEch, ECH_H),
-        position: [x, base + shaftH + ECH_H / 2, z], voxelSize: 0.025, dynamic: true,
+        position: [x, base + shaftH + ECH_H / 2, z], voxelSize: 0.03, dynamic: true,
       }, box(x, base + shaftH, z, rEch, base + shaftH + ECH_H));
       shapes.set(ech, drumShape((neck + rEch) / 2, ECH_H));
       const aba = site.box(`Abaküs ${n + 1}`, { ...marble, size: [ABA, ABA_H, ABA], at: [x, base + shaftH + ECH_H + ABA_H / 2, z], voxel: 0.03, dynamic: true });
