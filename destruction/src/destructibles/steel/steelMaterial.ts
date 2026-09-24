@@ -1,4 +1,6 @@
 import type { MaterialProps } from '../../physics/materials.ts';
+import type { BlastKind } from '../../physics/ballistics/types.ts';
+import { SHAPED_CONTACT_COUPLING } from '../../physics/ballistics/blast.ts';
 
 /**
  * Constitutive numbers for the ductile-steel elements, derived from the shared material table.
@@ -141,6 +143,9 @@ export function plugShearHeat(p: SteelParams, t: number): number {
  * J ≤ C √(2E) (N·s, C in kg TNT-equivalent). Kingery–Bulmash impulses extrapolated to contact
  * distances overshoot it; loads are scaled back to this bound.
  */
-export function maxBlastMomentum(tntKg: number): number {
-  return Math.max(0, tntKg) * 2440;
+export function maxBlastMomentum(tntKg: number, kind?: BlastKind): number {
+  // A shaped-charge warhead puts most of its fill into the liner (jet and slug) and fires at
+  // stand-off; the blast module couples only SHAPED_CONTACT_COUPLING of it to the struck face, and
+  // the same share bounds the momentum its products can push the target with.
+  return Math.max(0, tntKg) * 2440 * (kind === 'shaped' ? SHAPED_CONTACT_COUPLING : 1);
 }

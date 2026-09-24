@@ -43,6 +43,22 @@ function vnoise2(x: number, y: number, s: number): number {
 }
 const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
 
+/** 64 × 64 periodic value-noise lattice for mottling large stamps (a lookup per texel). */
+const MOTTLE_N = 64;
+const MOTTLE = (() => {
+  const t = new Float32Array(MOTTLE_N * MOTTLE_N);
+  for (let y = 0; y < MOTTLE_N; y++) for (let x = 0; x < MOTTLE_N; x++) t[y * MOTTLE_N + x] = hash2(x, y, 9173);
+  return t;
+})();
+function mottle(x: number, y: number): number {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const fx = x - xi, fy = y - yi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const x0 = xi & (MOTTLE_N - 1), y0 = yi & (MOTTLE_N - 1), x1 = (x0 + 1) & (MOTTLE_N - 1), y1 = (y0 + 1) & (MOTTLE_N - 1);
+  const a = MOTTLE[y0 * MOTTLE_N + x0]!, b = MOTTLE[y0 * MOTTLE_N + x1]!, c = MOTTLE[y1 * MOTTLE_N + x0]!, d = MOTTLE[y1 * MOTTLE_N + x1]!;
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
 /** Dirty rectangle of one texture (texels, inclusive). */
 interface Dirty {
   x0: number;
@@ -113,6 +129,13 @@ export class DetailMap {
     this.heatTex.needsUpdate = true;
   }
 
+  private mark(d: Dirty, x0: number, y0: number, x1: number, y1: number): void {
+    d.x0 = Math.min(d.x0, x0);
+    d.x1 = Math.max(d.x1, x1);
+    d.y0 = Math.min(d.y0, y0);
+    d.y1 = Math.max(d.y1, y1);
+  }
+
   /**
    * Visit texels within an ellipse around (cu, cv) with radii (ru, rv); f gets the texel index, r/R,
    * the angle and the normalised offsets. `heat` selects the heat map's resolution.
@@ -123,11 +146,7 @@ export class DetailMap {
     const x0 = Math.max(0, Math.floor((cu - ru) * w)), x1 = Math.min(w - 1, Math.ceil((cu + ru) * w));
     const y0 = Math.max(0, Math.floor((cv - rv) * h)), y1 = Math.min(h - 1, Math.ceil((cv + rv) * h));
     if (x1 < x0 || y1 < y0) return;
-    const d = heat ? this.dirtyHeat : this.dirtyDetail;
-    d.x0 = Math.min(d.x0, x0);
-    d.x1 = Math.max(d.x1, x1);
-    d.y0 = Math.min(d.y0, y0);
-    d.y1 = Math.max(d.y1, y1);
+    this.mark(heat ? this.dirtyHeat : this.dirtyDetail, x0, y0, x1, y1);
     for (let y = y0; y <= y1; y++) {
       const dv = ((y + 0.5) / h - cv) / rv;
       for (let x = x0; x <= x1; x++) {
@@ -203,32 +222,52 @@ export class DetailMap {
    * centre), and the edge is ragged. Successive films darken asymptotically: B ← 1 − (1 − B)(1 − v).
    */
   soot(cu: number, cv: number, ru: number, rv: number, amount: number, seed: number): void {
-    const E1 = ring(0, seed + 11, 1.8), E2 = ring(1, seed + 17, 6), S1 = ring(2, seed, 12), S2 = ring(3, seed + 3, 31);
-    const s0 = Math.floor(seed * 7919);
-    this.each(cu, cv, ru, rv, false, (i, rr, ang, du, dv) => {
-      const edge = 0.78 + 0.16 * around(E1, ang) + 0.06 * around(E2, ang);
-      const x = rr / edge;
-      if (x >= 1) return;
-      const org = clamp01((x - 0.25) / 0.5);
-      const streak = 1 + org * org * (3 - 2 * org) * (0.45 * around(S1, ang) + 0.25 * around(S2, ang));
-      const mottle = 0.75 + 0.5 * vnoise2(du * 3.5 + 11, dv * 3.5 + 5, s0);
-      const p = 1 - x * x;
-      const v = clamp01(amount * p * Math.sqrt(p) * streak * mottle);
-      const k = 4 * i + 2;
-      const b = this.data[k]! / 255;
-      this.data[k] = Math.round(255 * (1 - (1 - b) * (1 - v)));
-    });
+    // Written out (no per-texel callback): a soot stamp is the largest there is (~10⁵ texels).
+    const E1 = ring(0, seed + 11, 1.8), E2 = ring(1, seed + 17, 6), S1 = ring(2, seed, 5), S2 = ring(3, seed + 3, 13);
+    const w = this.w, h = this.h, data = this.data;
+    if (!(ru > 0 && rv > 0)) return;
+    const x0 = Math.max(0, Math.floor((cu - ru) * w)), x1 = Math.min(w - 1, Math.ceil((cu + ru) * w));
+    const y0 = Math.max(0, Math.floor((cv - rv) * h)), y1 = Math.min(h - 1, Math.ceil((cv + rv) * h));
+    if (x1 < x0 || y1 < y0) return;
+    this.mark(this.dirtyDetail, x0, y0, x1, y1);
+    const ox = (seed * 13.7) % MOTTLE_N, oy = (seed * 7.3) % MOTTLE_N;
+    for (let y = y0; y <= y1; y++) {
+      const dv = ((y + 0.5) / h - cv) / rv;
+      for (let x = x0; x <= x1; x++) {
+        const du = ((x + 0.5) / w - cu) / ru;
+        const rr = Math.sqrt(du * du + dv * dv);
+        if (rr > 1) continue;
+        const ang = Math.atan2(dv, du);
+        const edge = 0.78 + 0.16 * around(E1, ang) + 0.06 * around(E2, ang);
+        const xr = rr / edge;
+        if (xr >= 1) continue;
+        // Radial streaks only where the outflow has organised, away from the centre.
+        const org = clamp01((xr - 0.35) / 0.55);
+        const streak = 1 + org * org * (3 - 2 * org) * (0.35 * around(S1, ang) + 0.18 * around(S2, ang));
+        const mot = 0.75 + 0.5 * mottle(du * 3.5 + ox, dv * 3.5 + oy);
+        const p = 1 - xr * xr;
+        const v = clamp01(amount * p * Math.sqrt(p) * streak * mot);
+        const k = 4 * (y * w + x) + 2;
+        const b = data[k]! / 255;
+        data[k] = Math.round(255 * (1 - (1 - b) * (1 - v)));
+      }
+    }
   }
 
-  /** Crater depth in [0, 1] (× the material's dimple scale): a smooth bowl with a raised lip. */
+  /**
+   * Crater of `depth` in [0, 1] (× the material's dimple scale): a smooth bowl with a raised lip,
+   * added to what is there. A round striking an existing crater is resolved against the thinner
+   * steel under it (probe) and its penetration starts at the crater floor, so repeated hits on one
+   * spot deepen the crater until the ballistics says it perforates.
+   */
   dimple(cu: number, cv: number, ru: number, rv: number, depth: number): void {
     this.each(cu, cv, ru * 1.3, rv * 1.3, false, (i, rr) => {
       const x = rr * 1.3;
       const bowl = x < 1 ? 1 - x * x : 0;
       const lip = x >= 0.85 ? -0.25 * Math.exp(-((x - 1.05) ** 2) / 0.01) : 0;
-      const v = depth * (bowl + lip);
       const k = 4 * i + 3;
-      this.data[k] = Math.max(0, Math.min(255, Math.max(this.data[k]!, Math.round(v * 255))));
+      const v = this.data[k]! / 255 + depth * (bowl + lip);
+      this.data[k] = Math.max(0, Math.min(255, Math.round(v * 255)));
     });
   }
 

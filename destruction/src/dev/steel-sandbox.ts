@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import { createSandbox } from './sandboxKit.ts';
 import { Pipeline } from '../render/Pipeline.ts';
-import type { FxApi, SceneDef, SimContext, SteelBeamSpec, SteelPlateSpec } from '../app/contracts.ts';
+import type { SceneDef, SimContext, SteelBeamSpec, SteelPlateSpec, System } from '../app/contracts.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import { createSteelBeam, createSteelPlate, SteelBeam, SteelPlate } from '../destructibles/steel/index.ts';
 import { installBallistics } from '../systems/index.ts';
+import { installFx } from '../fx/index.ts';
 import { createBlastLoad } from '../physics/ballistics/blast.ts';
 import { getAmmo } from '../physics/ballistics/ammo.ts';
 import type { ImpactEvent } from '../physics/ballistics/types.ts';
@@ -12,73 +13,14 @@ import type { ImpactEvent } from '../physics/ballistics/types.ts';
 /**
  * Steel sandbox: a 2 × 2 m, 20 mm S355 plate welded into a test frame, a 12 mm Corten facade
  * panel, an 8 mm RHA plate, an HEB 300 column carrying 3 MN, a chrome cruciform column (Mies) and
- * an IPE 300 beam across two piers. Real projectiles and blasts come from the ballistics module;
- * `window.__steelDemo` drives scripted scenarios for scripts/shot.ts.
+ * an IPE 300 beam across two piers. Real projectiles and blasts come from the ballistics module and
+ * the effects from the FX module (`?nofx` leaves them out); `window.__steelDemo` drives scripted
+ * scenarios for scripts/shot.ts (`clearFx()` removes lingering smoke before a close-up).
  */
 
-/** Tiny spark renderer (the FX module owns the real one): hot streaks with drag and gravity. */
-class Sparks {
-  private readonly max = 3000;
-  private pos = new Float32Array(3 * this.max);
-  private vel = new Float32Array(3 * this.max);
-  private life = new Float32Array(this.max);
-  private heat = new Float32Array(this.max);
-  private n = 0;
-  readonly points: THREE.Points;
-  private colors = new Float32Array(3 * this.max);
-  constructor() {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
-    g.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
-    this.points = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.035, vertexColors: true, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, sizeAttenuation: true }));
-    this.points.frustumCulled = false;
-  }
-  emit(p: THREE.Vector3, d: THREE.Vector3, count: number, speed: number, hot: number, rng: () => number): void {
-    for (let k = 0; k < count && this.n < this.max; k++) {
-      const i = this.n++;
-      const dir = new THREE.Vector3(rng() - 0.5, rng() - 0.5, rng() - 0.5).multiplyScalar(1.4).add(d).normalize();
-      const s = speed * (0.3 + rng());
-      this.pos.set([p.x, p.y, p.z], 3 * i);
-      this.vel.set([dir.x * s, dir.y * s, dir.z * s], 3 * i);
-      this.life[i] = 0.3 + rng() * 0.9;
-      this.heat[i] = hot;
-    }
-  }
-  update(dt: number): void {
-    let w = 0;
-    for (let i = 0; i < this.n; i++) {
-      this.life[i]! -= dt;
-      if (this.life[i]! <= 0) continue;
-      const k = 3 * i, o = 3 * w;
-      const drag = Math.exp(-1.5 * dt);
-      this.vel[k] = this.vel[k]! * drag;
-      this.vel[k + 1] = this.vel[k + 1]! * drag - 9.81 * dt;
-      this.vel[k + 2] = this.vel[k + 2]! * drag;
-      this.pos[o] = this.pos[k]! + this.vel[k]! * dt;
-      this.pos[o + 1] = Math.max(0.01, this.pos[k + 1]! + this.vel[k + 1]! * dt);
-      this.pos[o + 2] = this.pos[k + 2]! + this.vel[k + 2]! * dt;
-      this.vel[o] = this.vel[k]!;
-      this.vel[o + 1] = this.vel[k + 1]!;
-      this.vel[o + 2] = this.vel[k + 2]!;
-      this.life[w] = this.life[i]!;
-      this.heat[w] = this.heat[i]!;
-      const b = Math.min(1, this.life[w]!) * (2 + 4 * this.heat[w]!);
-      this.colors[o] = b;
-      this.colors[o + 1] = b * 0.55;
-      this.colors[o + 2] = b * 0.18;
-      w++;
-    }
-    this.n = w;
-    const g = this.points.geometry;
-    g.setDrawRange(0, w);
-    (g.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
-    (g.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true;
-  }
-}
-
-const sparks = new Sparks();
 const els: Record<string, Destructible> = {};
-let floorBlock: THREE.Mesh | null = null;
+/** Stand-ins for what the two columns carry: they ride on the column heads (no structure graph here). */
+const carried: { column: string; block: THREE.Mesh; lift: number }[] = [];
 
 function plate(ctx: SimContext, spec: SteelPlateSpec): SteelPlate {
   const p = createSteelPlate(ctx, spec) as SteelPlate;
@@ -143,25 +85,18 @@ const kit = await createSandbox({
   camera: { position: [2.2, 2.4, 9.5], lookAt: [1.6, 1.4, 0] },
   install(sim) {
     installBallistics(sim);
-    const fx: FxApi = {
-      ...sim.ctx.fx,
-      sparks(o) {
-        sparks.emit(o.position, o.direction, Math.min(80, o.count), o.speed, o.hot ?? 0.5, () => sim.ctx.rng.next());
-      },
-    };
-    sim.ctx.fx = fx;
-    sim.onFrame((realDt) => {
-      sparks.update(sim.manual ? 1 / 60 : Math.min(realDt, 0.05) * sim.ctx.time.scale);
-      const col = els['HEB 300 column'] as SteelBeam | undefined;
-      if (col && floorBlock && !col.disposed) {
+    // Real effects (sparks, flashes, smoke, chips); `?nofx` keeps the stubs for clean close-ups.
+    if (!new URLSearchParams(location.search).has('nofx')) installFx(sim);
+    sim.onFrame(() => {
+      for (const c of carried) {
+        const col = els[c.column] as SteelBeam | undefined;
+        if (!col || col.disposed || col.mode !== 'fixed') continue;
         const s = col.sim, top = s.n - 1;
-        floorBlock.position.set(s.x[3 * top]!, s.x[3 * top + 1]! + 0.2, s.x[3 * top + 2]!);
+        c.block.position.set(s.x[3 * top]!, s.x[3 * top + 1]! + c.lift, s.x[3 * top + 2]!);
       }
     });
   },
   build(ctx) {
-    ctx.scene.add(sparks.points);
-
     // 1. 2 × 2 m, 20 mm S355 plate welded into a test frame on a concrete plinth.
     block(ctx, [3.2, 0.3, 1.2], [0, 0.15, 0]);
     beam(ctx, { name: 'frame left', material: 'steel_s355', profile: RHS, start: [-1.06, 0.3, 0], end: [-1.06, 2.66, 0], ends: { start: 'fixed', end: 'free' }, finish: 'painted', paintColor: 0x1d2a24 });
@@ -195,13 +130,13 @@ const kit = await createSandbox({
     block(ctx, [1.0, 0.1, 1.0], [6.2, 0.05, -0.5]);
     const col = beam(ctx, { name: 'HEB 300 column', material: 'steel_s355', profile: { type: 'I', h: 0.3, b: 0.3, tw: 0.011, tf: 0.019 }, start: [6.2, 0.1, -0.5], end: [6.2, 4.1, -0.5], up: [0, 0, 1], ends: { start: 'fixed', end: 'pinned' }, finish: 'painted', paintColor: 0x8a2a1c });
     col.setImposedLoad(3.0e6);
-    floorBlock = block(ctx, [1.6, 0.4, 1.6], [6.2, 4.3, -0.5]);
+    carried.push({ column: 'HEB 300 column', block: block(ctx, [1.6, 0.4, 1.6], [6.2, 4.3, -0.5]), lift: 0.2 });
 
     // 5. Chrome cruciform column (Barcelona Pavilion), 3.1 m, carrying a roof share.
     block(ctx, [0.8, 0.08, 0.8], [8.4, 0.04, 0.4]);
     const cr = beam(ctx, { name: 'chrome cruciform', material: 'stainless', profile: { type: 'cruciform', arm: 0.08, t: 0.02 }, start: [8.4, 0.08, 0.4], end: [8.4, 3.18, 0.4], up: [0, 0, 1], ends: { start: 'fixed', end: 'pinned' }, finish: 'chrome' });
     cr.setImposedLoad(1.2e5);
-    block(ctx, [1.2, 0.2, 1.2], [8.4, 3.28, 0.4]);
+    carried.push({ column: 'chrome cruciform', block: block(ctx, [1.2, 0.2, 1.2], [8.4, 3.28, 0.4]), lift: 0.1 });
 
     // 6. IPE 300 beam across two piers.
     block(ctx, [0.6, 2.2, 0.6], [-1.9, 1.1, -3.6]);
@@ -293,6 +228,10 @@ const demo = {
     const t0 = performance.now();
     el.applyBlast(load);
     return { ms: performance.now() - t0 };
+  },
+  /** Clear lingering smoke, sparks and camera shake (for unobstructed screenshots). */
+  clearFx() {
+    sim.getSystem<System & { reset(): void }>('fx')?.reset();
   },
   advance(s: number) {
     const t0 = performance.now();

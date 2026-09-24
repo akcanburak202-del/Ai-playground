@@ -64,6 +64,9 @@ export class ParticleLayer {
   private head = 0;
   private dirtyStart = -1;
   private dirtyEnd = -1;
+  /** Slots written since the GPU last received them (union over frames stepped without a draw) */
+  private pendStart = -1;
+  private pendEnd = -1;
   /** Particles emitted since creation (telemetry) */
   emitted = 0;
   /** Latest death time among live particles (lets the layer skip drawing when idle) */
@@ -86,6 +89,10 @@ export class ParticleLayer {
     }
     g.instanceCount = capacity;
     [this.a0, this.a1, this.a2, this.a3, this.a4, this.a5] = this.arrays as [Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array];
+    // All six attributes go up in the same draw; the first one reports it.
+    this.attrs[0]!.onUpload(() => {
+      this.pendStart = this.pendEnd = -1;
+    });
     this.geometry = g;
     this.mesh = new THREE.Mesh(g, material);
     this.mesh.name = name;
@@ -121,10 +128,17 @@ export class ParticleLayer {
     this.mesh.visible = true;
   }
 
-  /** Push this frame's new particles to the GPU; hide the draw when every particle is dead. */
+  /**
+   * Queue this frame's new particles for the GPU; hide the draw when every particle is dead.
+   * three.js uploads (and forgets) an attribute's update ranges only when the mesh is drawn, and
+   * frames can be stepped without a draw (Simulation.advance, scripted runs), so the range queued
+   * is the union of everything written since the last actual upload.
+   */
   flush(now: number): void {
     if (this.dirtyStart >= 0) {
-      const start = this.dirtyStart * 4, count = (this.dirtyEnd - this.dirtyStart + 1) * 4;
+      this.pendStart = this.pendStart < 0 ? this.dirtyStart : Math.min(this.pendStart, this.dirtyStart);
+      this.pendEnd = Math.max(this.pendEnd, this.dirtyEnd);
+      const start = this.pendStart * 4, count = (this.pendEnd - this.pendStart + 1) * 4;
       for (const a of this.attrs) {
         a.clearUpdateRanges();
         a.addUpdateRange(start, count);
@@ -139,8 +153,13 @@ export class ParticleLayer {
   clear(): void {
     const a0 = this.arrays[0]!;
     for (let i = 0; i < this.capacity; i++) a0[i * 4 + 3] = 1e9;
-    this.attrs[0]!.clearUpdateRanges();
-    this.attrs[0]!.needsUpdate = true;
+    this.pendStart = 0;
+    this.pendEnd = this.capacity - 1;
+    for (const a of this.attrs) {
+      a.clearUpdateRanges();
+      a.addUpdateRange(0, this.capacity * 4);
+      a.needsUpdate = true;
+    }
     this.lastDeath = -Infinity;
     this.mesh.visible = false;
     this.dirtyStart = this.dirtyEnd = -1;

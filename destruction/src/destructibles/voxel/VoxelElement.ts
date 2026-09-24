@@ -948,7 +948,10 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
     const pad = 0.05;
     rb.query(this.grid, Math.min(p.x, ex) - pad, Math.min(p.y, ey) - pad, Math.min(p.z, ez) - pad, Math.max(p.x, ex) + pad, Math.max(p.y, ey) + pad, Math.max(p.z, ez) + pad, list);
     const k = e.ammo.kind;
-    const eff = k === 'ball' ? (e.ammo.deformable ? 0.15 : 0.35) : k === 'ap' ? 0.6 : 1.0;
+    // Lead-core ball flattens on a bar and barely nicks it (FM 3-06.11: 5.56 mm does not cut
+    // reinforcing bars), so it gets a low efficiency and cannot take a bar below 60 % of its area.
+    const softBall = k === 'ball' && e.ammo.deformable;
+    const eff = k === 'ball' ? (softBall ? 0.03 : 0.35) : k === 'ap' ? 0.6 : 1.0;
     const uc = 3e9; // J/m³
     let hitPoint: THREE.Vector3 | null = null;
     for (const s of list) {
@@ -961,7 +964,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient {
       const width = Math.max(e.ammo.diameter, 2 * e.tunnelRadius, 0.004);
       const vol = (eff * e.kineticEnergy) / uc;
       const area0 = Math.PI * rb.segR[s]! ** 2;
-      const frac = Math.min(1, vol / width / area0);
+      let frac = Math.min(1, vol / width / area0);
+      if (softBall) frac = Math.min(frac, Math.max(0, rb.segArea[s]! - 0.6));
       rb.nick(s, frac, this.ctx.rng.range(-1, 1));
       hitPoint = new THREE.Vector3((n[a]! + n[b]!) / 2, (n[a + 1]! + n[b + 1]!) / 2, (n[a + 2]! + n[b + 2]!) / 2);
       break;

@@ -7,7 +7,7 @@ import { fmtDistance, fmtLength, fmtScale, fmtSpeed, num } from './format.ts';
 import { CATEGORY_SHORT_TR, CATEGORY_TR, HELP_DESKTOP, HELP_TOUCH, NAME_TR, ROLE_TR, caliberTr, upperTr } from './i18n.ts';
 import { Menu } from './menu.ts';
 import { ensureFonts, ensureStyle } from './theme.ts';
-import { ammoLine, blastRow, impactRow, weaponSpecs, type ImpactRow } from './telemetry.ts';
+import { HitGroups, ammoLine, blastRow, groupLine, impactRow, weaponSpecs, type ImpactRow } from './telemetry.ts';
 import { buildSlots, slotOf, type Slot } from '../player/slots.ts';
 
 export interface HudOptions {
@@ -23,6 +23,9 @@ export interface HudOptions {
 const ROWS = 5;
 /** 1 MOA in radians */
 const MOA = Math.PI / (180 * 60);
+/** Depth-chart viewBox of the hit group */
+const SPARK_W = 240;
+const SPARK_H = 28;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string, parent?: HTMLElement): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag);
@@ -31,6 +34,9 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
   parent?.appendChild(e);
   return e;
 }
+
+let reducedMq: MediaQueryList | null = null;
+const REDUCED_MOTION = (): boolean => (reducedMq ??= matchMedia('(prefers-reduced-motion: reduce)')).matches;
 
 /** Write text only when it changed (DOM writes are the HUD's main cost). */
 function setText(e: HTMLElement, s: string): void {
@@ -42,6 +48,7 @@ interface RowEls {
   idx: HTMLSpanElement;
   ammo: HTMLSpanElement;
   mat: HTMLSpanElement;
+  cnt: HTMLSpanElement;
   tag: HTMLSpanElement;
   v: HTMLSpanElement[];
 }
@@ -81,6 +88,13 @@ export class Hud implements HudHooks {
   private sumTr!: HTMLDivElement;
   private sumModel!: HTMLDivElement;
   private summary!: HTMLDivElement;
+  private groupEl!: HTMLDivElement;
+  private groupHead!: HTMLSpanElement;
+  private groupDepth!: HTMLSpanElement;
+  private groupNote!: HTMLDivElement;
+  private groupBand!: HTMLDivElement;
+  private groupSvg!: SVGSVGElement;
+  private readonly groups = new HitGroups();
   private blastBox!: HTMLDivElement;
   private blastVals: HTMLSpanElement[] = [];
   private blastNote!: HTMLDivElement;
@@ -136,6 +150,9 @@ export class Hud implements HudHooks {
   private hudVisible = true;
   private scoped = false;
   private layoutDirty = true;
+  private vw = 1280;
+  private vh = 720;
+  private canvasH = 720;
   /** Wall-clock ms of the HUD's own per-frame work (exponential average) */
   frameMs = 0;
 
@@ -180,7 +197,10 @@ export class Hud implements HudHooks {
       sim.onFrame((dt) => this.frame(dt)),
     );
     const onKey = (e: KeyboardEvent) => this.onKey(e);
-    const onResize = () => (this.layoutDirty = true);
+    const onResize = () => {
+      this.layoutDirty = true;
+      this.measure();
+    };
     window.addEventListener('keydown', onKey);
     window.addEventListener('resize', onResize);
     this.unsub.push(() => {
@@ -188,8 +208,19 @@ export class Hud implements HudHooks {
       window.removeEventListener('resize', onResize);
     });
     this.bridge.hud = this;
+    this.measure();
     this.onScene();
     this.showMenu(opts.startWithMenu ?? true);
+  }
+
+  /**
+   * Viewport and canvas size, read once per resize: reading layout in the per-frame path after
+   * the frame's text writes would force a synchronous reflow every frame.
+   */
+  private measure(): void {
+    this.vw = this.root.clientWidth || window.innerWidth;
+    this.vh = this.root.clientHeight || window.innerHeight;
+    this.canvasH = this.sim.ctx.renderer.domElement.clientHeight || this.vh;
   }
 
   // ─── HudHooks ──────────────────────────────────────────────────────────────────────────────
@@ -296,15 +327,29 @@ export class Hud implements HudHooks {
       const idx = el('span', 'dx-num dx-dim', '', l1);
       const ammo = el('span', 'dx-ammo', '', l1);
       const mat = el('span', 'dx-mat', '', l1);
+      const cnt = el('span', 'dx-cnt dx-num', '', l1);
       const tag = el('span', 'dx-tag', '', l1);
       const l2 = el('div', 'dx-row-2', undefined, root);
       const v: HTMLSpanElement[] = [];
       for (let k = 0; k < 5; k++) v.push(el('span', 'dx-v', '', l2));
       root.style.display = 'none';
-      this.rows.push({ root, idx, ammo, mat, tag, v });
+      this.rows.push({ root, idx, ammo, mat, cnt, tag, v });
     }
     this.summary = el('div', 'dx-summary', undefined, p);
     this.sumTr = el('div', 'dx-tr', '', this.summary);
+    this.groupEl = el('div', 'dx-group', undefined, this.summary);
+    const gh = el('div', 'dx-group-head', undefined, this.groupEl);
+    this.groupHead = el('span', 'dx-lbl', '', gh);
+    this.groupDepth = el('span', 'dx-num', '', gh);
+    // Section through the spot: hatched material, the cavity cut into it (SVG), the back face.
+    const sec = el('div', 'dx-section', undefined, this.groupEl);
+    this.groupBand = el('div', 'dx-band', undefined, sec);
+    this.groupSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    this.groupSvg.setAttribute('viewBox', `0 0 ${SPARK_W} ${SPARK_H}`);
+    this.groupSvg.setAttribute('preserveAspectRatio', 'none');
+    sec.appendChild(this.groupSvg);
+    this.groupNote = el('div', 'dx-group-note', '', this.groupEl);
+    this.groupEl.style.display = 'none';
     this.sumModel = el('div', 'dx-model', '', this.summary);
     this.summary.style.display = 'none';
     this.blastBox = el('div', 'dx-blast', undefined, p);
@@ -429,12 +474,19 @@ export class Hud implements HudHooks {
       return;
     }
     this.menu.setLoading(true);
-    void this.load(id)
-      .catch((err) => console.error('scene load failed', err))
-      .finally(() => {
+    void this.load(id).then(
+      () => {
         this.menu.setLoading(false);
         this.showMenu(false);
-      });
+      },
+      (err) => {
+        // Stay on the sheet: dropping the viewer into a half-built world helps nobody.
+        console.error('scene load failed', err);
+        this.menu.setLoading(false);
+        if (document.pointerLockElement) document.exitPointerLock();
+        this.toast('Sahne yüklenemedi', true);
+      },
+    );
   }
 
   /** Scene loader call that also turns a synchronous throw into a rejection. */
@@ -485,11 +537,27 @@ export class Hud implements HudHooks {
       this.blastDirty = true;
       return;
     }
-    this.impacts.unshift(impactRow(e));
+    // Rows are the latest distinct results: a burst on concrete is one row (×60) with the newest
+    // numbers, so the rounds that went through and skipped off the ground behind do not push
+    // the wall's own row out of the panel. While a spot is being worked, results elsewhere (those
+    // same rounds landing behind it) go in under its row, so the top row and the description stay
+    // with what the viewer is shooting at.
+    // A dispersed weapon's burst is still one spot: its 95 % group radius (2.45 σ) at this range.
+    const sigma = this.weapons.current.dispersionMOA * MOA;
+    const g = this.groups.add(e, 2.45 * sigma * e.point.distanceTo(this.sim.ctx.camera.position));
+    const cur = this.groups.current;
+    const secondary = !!cur && g !== cur && cur.activityAt(e.time) > 1.5;
+    const row = impactRow(e);
+    const i = this.impacts.findIndex((r) => r.key === row.key);
+    if (i >= 0) {
+      row.count = this.impacts[i]!.count + 1;
+      this.impacts.splice(i, 1);
+    }
+    this.impacts.splice(secondary && this.impacts.length ? 1 : 0, 0, row);
     if (this.impacts.length > ROWS) this.impacts.length = ROWS;
     this.impactsDirty = true;
     const now = performance.now();
-    if (e.agent === 'projectile' && now - this.lastHitFlash > 60) {
+    if (e.agent === 'projectile' && !secondary && now - this.lastHitFlash > 60) {
       this.lastHitFlash = now;
       this.reticle.flashHit();
     }
@@ -498,6 +566,7 @@ export class Hud implements HudHooks {
   private onScene(): void {
     setText(this.sceneName, this.sim.currentScene?.nameTr ?? '');
     this.impacts = [];
+    this.groups.reset();
     this.impactsDirty = true;
     this.lastBlast = null;
     this.blastDirty = true;
@@ -640,11 +709,10 @@ export class Hud implements HudHooks {
   private renderImpacts(): void {
     this.impactsDirty = false;
     const list = this.impacts;
-    // Restart the arrival flash on the newest row.
-    const first = this.rows[0]!.root;
-    first.classList.remove('dx-flash');
-    void first.offsetWidth;
-    first.classList.add('dx-flash');
+    // Arrival flash on the newest row (Web Animations: no forced reflow to restart it).
+    if (list.length && !REDUCED_MOTION()) {
+      this.rows[0]!.root.animate?.([{ backgroundColor: 'rgba(255, 181, 71, 0.2)' }, { backgroundColor: 'rgba(255, 181, 71, 0)' }], { duration: 450, easing: 'ease-out' });
+    }
     this.emptyEl.style.display = list.length ? 'none' : '';
     this.colsEl.style.display = list.length ? '' : 'none';
     for (let i = 0; i < ROWS; i++) {
@@ -659,6 +727,7 @@ export class Hud implements HudHooks {
       setText(r.idx, String(i + 1).padStart(2, '0'));
       setText(r.ammo, d.ammo);
       setText(r.mat, d.material);
+      setText(r.cnt, d.count > 1 ? `×${num(d.count, 0)}` : '');
       setText(r.tag, d.outcomeTr);
       r.tag.className = `dx-tag dx-${d.outcome}`;
       const vals = [d.speed, d.obliquity, d.depth, d.residual, d.energy];
@@ -670,6 +739,40 @@ export class Hud implements HudHooks {
       setText(this.sumTr, top.description);
       setText(this.sumModel, top.model);
     }
+    this.renderGroup();
+  }
+
+  /**
+   * The hit group as a section drawing through the spot: hatched material under the original
+   * surface (the top rule), the cavity cut into it stepping down round by round from left (first
+   * hit) to right (latest), and the member's back face as a dashed rule once a round went through.
+   */
+  private renderGroup(): void {
+    const g = this.groups.current;
+    const line = groupLine(g);
+    this.groupEl.style.display = line ? '' : 'none';
+    if (!line || !g) return;
+    setText(this.groupHead, line.head);
+    setText(this.groupDepth, line.depth);
+    setText(this.groupNote, line.note);
+    this.groupNote.style.display = line.note ? '' : 'none';
+    const prof = g.profile;
+    const thick = Number.isFinite(g.thickness) ? g.thickness : 0;
+    const scale = Math.max(g.deepest, thick, 1e-3) * 1.12;
+    const top = 1, H = SPARK_H - top;
+    const y = (d: number) => (top + (d / scale) * H).toFixed(2);
+    // Material band: down to the back face when known, else fading out below the cavity.
+    const band = thick > 0 ? `${((top + (thick / scale) * H) / SPARK_H) * 100}%` : '100%';
+    if (this.groupBand.style.height !== band) this.groupBand.style.height = band;
+    this.groupBand.classList.toggle('dx-back', thick > 0);
+    let px = 0;
+    let d = `M0 ${top}`;
+    for (let j = 0; j < prof.length; j++) {
+      const x = (Math.min((j + 1) * g.stride, g.count) / g.count) * SPARK_W;
+      d += `L${px.toFixed(1)} ${y(prof[j]!)}L${x.toFixed(1)} ${y(prof[j]!)}`;
+      px = x;
+    }
+    this.groupSvg.innerHTML = `<path class="c" d="${d}L${SPARK_W} ${top}Z"/><path class="p" d="${d}"/><path class="s" d="M0 ${top}H${SPARK_W}"/>`;
   }
 
   private renderBlast(): void {
@@ -689,8 +792,7 @@ export class Hud implements HudHooks {
   private updateReticle(): void {
     const w = this.weapons.current;
     const cam = this.sim.ctx.camera;
-    const h = this.sim.ctx.renderer.domElement.clientHeight || window.innerHeight;
-    const pxPerRad = h / 2 / Math.tan((cam.fov * Math.PI) / 360);
+    const pxPerRad = this.canvasH / 2 / Math.tan((cam.fov * Math.PI) / 360);
     // 2σ ring: 86 % of rounds (circular normal) land inside.
     const sigma = w.dispersionMOA * MOA;
     this.reticle.setSpread(2 * sigma * pxPerRad);
@@ -708,8 +810,7 @@ export class Hud implements HudHooks {
     const p = this.bridge.player;
     const ads = p?.ads ?? 0;
     const scopeKind = scopeFor(w);
-    const vw = this.root.clientWidth || window.innerWidth, vh = this.root.clientHeight || window.innerHeight;
-    this.scope.update(scopeKind, ads, vw, vh, cam.fov, Number.isFinite(range) ? `${fmtDistance(range)} · ${num(w.zoom, 0)}×` : `${num(w.zoom, 0)}×`);
+    this.scope.update(scopeKind, ads, this.vw, this.vh, cam.fov, Number.isFinite(range) ? `${fmtDistance(range)} · ${num(w.zoom, 0)}×` : `${num(w.zoom, 0)}×`);
     const scoped = !!scopeKind && ads > 0.6;
     this.scoped = scoped;
     this.root.classList.toggle('dx-scoped', scoped);

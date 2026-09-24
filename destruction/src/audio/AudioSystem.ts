@@ -56,6 +56,8 @@ interface Rotary {
   lastShot: number;
   interval: number;
   gau8: boolean;
+  /** Time scale the loop was last tuned to */
+  scale: number;
 }
 
 const _p = new THREE.Vector3();
@@ -337,17 +339,19 @@ export class AudioSystem implements AudioApi, System {
     v.out.gain.linearRampToValueAtTime(gain, t + 0.012);
     const buffer = engine.bank.rotaryLoop(rot.rpm, rot.bodyTau);
     const handle = S.rotaryLoopVoice(v, { buffer, rpm: rot.rpm, lowpass: rot.lowpass, rate: this.scale });
-    this.rotary = { weaponId: e.weapon.id, voice: v, handle, profile: p, lastShot: t, interval: 60 / rot.rpm, gau8: e.weapon.sound === 'gau8' };
+    this.rotary = { weaponId: e.weapon.id, voice: v, handle, profile: p, lastShot: t, interval: 60 / rot.rpm, gau8: e.weapon.sound === 'gau8', scale: this.scale };
   }
 
   private updateRotary(): void {
     const rot = this.rotary;
     if (!rot) return;
     const now = this.ac!.currentTime;
-    const src = rot.handle.sources[0] as AudioBufferSourceNode;
-    src.playbackRate.setTargetAtTime(this.scale, now, 0.05);
-    const sub = rot.handle.sources[1] as OscillatorNode;
-    sub.frequency.setTargetAtTime(this.scale / rot.interval, now, 0.05);
+    // Follow the time scale (the loop is the rounds' real spacing); only schedule on a change.
+    if (Math.abs(this.scale - rot.scale) > 1e-3) {
+      rot.scale = this.scale;
+      (rot.handle.sources[0] as AudioBufferSourceNode).playbackRate.setTargetAtTime(this.scale, now, 0.05);
+      (rot.handle.sources[1] as OscillatorNode).frequency.setTargetAtTime(this.scale / rot.interval, now, 0.05);
+    }
     // Stop once no round has come for a few firing intervals (in real time at this time scale).
     if (now > rot.lastShot + Math.max(0.07, (3 * rot.interval) / this.scale)) this.endRotary();
   }

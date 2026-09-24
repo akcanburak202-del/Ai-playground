@@ -24,13 +24,14 @@ export function gurneySphere(sqrt2E: number, casingMass: number, chargeMass: num
 
 /**
  * Mott (1947) scale mass μ (half the mean fragment mass) for a cylindrical steel casing:
- * √μ = B t^(5/16) d_i^(1/3) (1 + t/d_i), μ in lb, t and d_i in inches; B ≈ 0.0646 lb^½·in^(−7/6)
- * for TNT, 0.0554 for Comp B (NAVORD 2022 / Mott 1947). Returned in kg.
+ * √μ = B t^(5/6) d_i^(1/3) (1 + t/d_i), μ in lb, t and d_i in inches; B ≈ 0.0646 lb^½·in^(−7/6)
+ * for TNT, 0.0554 for Comp B (NAVORD Report 2022; Mott 1947). (t^(5/6)·d^(1/3) is what makes B's
+ * in^(−7/6) come out in lb^½.) Returned in kg.
  */
 export function mottScaleMass(wall: number, innerDiameter: number, B = 0.0646): number {
   const t = Math.max(wall, 1e-4) / 0.0254;
   const di = Math.max(innerDiameter, 1e-3) / 0.0254;
-  const sq = B * Math.pow(t, 5 / 16) * Math.cbrt(di) * (1 + t / di);
+  const sq = B * Math.pow(t, 5 / 6) * Math.cbrt(di) * (1 + t / di);
   return sq * sq * 0.45359237;
 }
 

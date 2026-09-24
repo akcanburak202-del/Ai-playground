@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Simulation } from './Simulation.ts';
-import type { BlastKind } from '../physics/ballistics/types.ts';
+import type { AmmoSpec, BlastKind } from '../physics/ballistics/types.ts';
+import { stepFlight } from '../physics/ballistics/flight.ts';
 
 /**
  * Scripting surface exposed as `window.__sim` for automated tests and screenshots
@@ -17,8 +18,10 @@ export interface Harness {
   /**
    * Fire `count` rounds of `ammoId` from `from` towards `at`, one every `interval` seconds of sim
    * time (the harness advances time between shots). Spread is a normal angular jitter in MOA.
+   * Unguided rounds are zeroed (superelevated) so they arrive at `at` despite drop; pass
+   * `zero: false` to fire straight down the line of sight.
    */
-  fire(o: { ammo: string; from: [number, number, number]; at: [number, number, number]; count?: number; interval?: number; spreadMOA?: number; settle?: number }): void;
+  fire(o: { ammo: string; from: [number, number, number]; at: [number, number, number]; count?: number; interval?: number; spreadMOA?: number; settle?: number; zero?: boolean }): void;
   detonate(o: { at: [number, number, number]; tntKg: number; kind?: BlastKind; normal?: [number, number, number] }): void;
   /** Summary of the last impacts (outcome, depth, target) for assertions */
   impacts(n?: number): { ammo: string; target: string; material: string; outcome: string; depth: number; speed: number; residual: number; summary: string }[];
@@ -48,10 +51,10 @@ export function installHarness(sim: Simulation): Harness {
         c.updateProjectionMatrix();
       }
     },
-    fire({ ammo, from, at, count = 1, interval = 0.075, spreadMOA = 0, settle = 0.5 }) {
+    fire({ ammo, from, at, count = 1, interval = 0.075, spreadMOA = 0, settle = 0.5, zero = true }) {
       const spec = sim.ctx.ammo(ammo);
       const origin = v(from);
-      const aim = v(at).sub(origin).normalize();
+      const aim = zero ? zeroedDirection(spec, origin, v(at)) : v(at).sub(origin).normalize();
       const rng = sim.ctx.rng;
       const sigma = (spreadMOA / 60) * (Math.PI / 180);
       for (let i = 0; i < count; i++) {
@@ -92,4 +95,41 @@ export function installHarness(sim: Simulation): Harness {
   };
   (window as unknown as { __sim: Harness }).__sim = h;
   return h;
+}
+
+/**
+ * Launch direction that makes an unguided round pass through `at` (bisection on the elevation
+ * over a fine-step trajectory). Guided/lofted rounds and very short ranges aim straight.
+ */
+export function zeroedDirection(spec: AmmoSpec, from: THREE.Vector3, at: THREE.Vector3): THREE.Vector3 {
+  const flat = at.clone().sub(from);
+  const range = Math.hypot(flat.x, flat.z);
+  const straight = flat.clone().normalize();
+  if (spec.guidance || range < 1) return straight;
+  const horiz = new THREE.Vector3(flat.x, 0, flat.z).normalize();
+  const dirFor = (elev: number) => {
+    const pitch = Math.atan2(flat.y, range) + elev;
+    return horiz.clone().multiplyScalar(Math.cos(pitch)).setY(Math.sin(pitch));
+  };
+  const heightAt = (elev: number): number => {
+    const b = { position: from.clone(), velocity: dirFor(elev).multiplyScalar(spec.muzzleVelocity), mass: spec.mass, age: 0, burning: false };
+    const prev = new THREE.Vector3();
+    for (let i = 0; i < 20000; i++) {
+      prev.copy(b.position);
+      stepFlight(b, spec, 1 / 240);
+      const r0 = Math.hypot(prev.x - from.x, prev.z - from.z);
+      const r1 = Math.hypot(b.position.x - from.x, b.position.z - from.z);
+      if (r1 >= range) return prev.y + ((b.position.y - prev.y) * (range - r0)) / Math.max(r1 - r0, 1e-9);
+      if (b.velocity.lengthSq() < 1) break;
+    }
+    return -1e9;
+  };
+  let lo = -0.05;
+  let hi = 0.35;
+  for (let i = 0; i < 32; i++) {
+    const mid = 0.5 * (lo + hi);
+    if (heightAt(mid) < at.y) lo = mid;
+    else hi = mid;
+  }
+  return dirFor(0.5 * (lo + hi));
 }

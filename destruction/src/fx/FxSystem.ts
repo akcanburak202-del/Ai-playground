@@ -6,6 +6,7 @@ import type {
 import type { ImpactEvent } from '../physics/ballistics/types.ts';
 import { rangeForOverpressure, KB } from '../physics/ballistics/blast.ts';
 import type { Rng } from '../core/rng.ts';
+import { TNT_ENERGY } from '../core/units.ts';
 import { getAtmosphere, type Atmosphere } from '../render/atmosphere.ts';
 import { ParticleLayer, newRecord, type ParticleRecord } from './ParticleLayer.ts';
 import { Chips, type ChipKind } from './Chips.ts';
@@ -24,6 +25,21 @@ export const BUDGET = { smoke: 9000, fire: 2500, sparks: 5000, chips: 3500, trac
 /** Exposure time of the virtual camera for motion streaks, s (a 180° shutter at 60 fps). */
 const SHUTTER = 1 / 120;
 
+/**
+ * Peak luminous intensity of a detonation fireball per kg^⅔ of TNT, render candela (see onBlast).
+ * One render unit of illuminance is roughly 5–15 klux (the golden-hour sun is ≈ 6).
+ */
+const FIREBALL_CD = 300;
+
+/**
+ * Flash of gas burning with chemical energy E (J): the fireball law (I ∝ W^⅔, cube-root scaling of
+ * the luminous radius, Baker et al. 1983) applied to its TNT equivalent. For daylight this keeps a
+ * rifle's muzzle flash at ≈ 2 cd (it lights nothing visibly in the sun) and a tank gun at ≈ 500 cd.
+ */
+function flashCandela(energyJ: number): number {
+  return FIREBALL_CD * Math.pow(Math.max(energyJ, 0) / TNT_ENERGY, 2 / 3);
+}
+
 interface Emitter { x: number; y: number; z: number; radius: number; until: number; color: number; rise: number; acc: number; rate: number }
 interface Mark { t: number; x: number; y: number; z: number; bits: number }
 const MARK_CHIPS = 1, MARK_DUST = 2, MARK_SPARKS = 4;
@@ -33,6 +49,7 @@ const _v = new THREE.Vector3();
 const _d = new THREE.Vector3();
 const _u = new THREE.Vector3();
 const _w = new THREE.Vector3();
+const _j = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _e = new THREE.Euler();
 const UP = new THREE.Vector3(0, 1, 0);
@@ -230,6 +247,39 @@ export class FxSystem implements System, FxApi {
     }
   }
 
+  /**
+   * The fast cone of pulverised material a hit throws out of its crater — the first ~50 ms of
+   * slow-motion footage of rifle and cannon hits on masonry or soil: fine dust leaving at tens of
+   * m/s that air drag stops within about a metre (v₀/k), after which it billows like any dust.
+   * Without it an impact reads as a cotton ball appearing on the wall.
+   */
+  emitDustJet(p: THREE.Vector3, axis: THREE.Vector3, halfAngle: number, speed: number, count: number, radius: number, color: number, t0 = this.now): void {
+    const P = this.P;
+    const rng = this.rng;
+    _c.setHex(color);
+    for (let i = 0; i < count; i++) {
+      rng.inCone(axis, halfAngle, _j);
+      const v = speed * rng.range(0.45, 1.0);
+      P.x = p.x + _j.x * 0.02; P.y = p.y + _j.y * 0.02; P.z = p.z + _j.z * 0.02;
+      P.vx = _j.x * v; P.vy = _j.y * v; P.vz = _j.z * v;
+      P.t0 = t0 + rng.range(0, 0.006);
+      P.life = rng.range(1.2, 2.6) * (0.7 + Math.min(1.5, radius / 0.5));
+      // A turbulent puff punching through still air loses its momentum in ≈ 0.1 s.
+      P.drag = rng.range(9, 15);
+      P.gravity = rng.range(-0.01, 0.02);
+      P.floor = -1e4; P.tLand = -1;
+      P.size0 = radius * rng.range(0.3, 0.5);
+      P.size1 = radius * rng.range(0.9, 1.5);
+      P.growth = rng.range(0.1, 0.3);
+      P.spin = rng.range(-1, 1);
+      const shade = rng.range(0.9, 1.1);
+      P.r = _c.r * shade; P.g = _c.g * shade; P.b = _c.b * shade;
+      P.opacity = rng.range(0.45, 0.7);
+      P.seed = rng.next(); P.variant = rng.int(8, 16); P.heat = 0; P.extra = 1;
+      this.smokeLayer.emit(P);
+    }
+  }
+
   /** Solid chips thrown from p within a cone around dir (half-angle `spread` rad). */
   emitChips(p: THREE.Vector3, dir: THREE.Vector3, spread: number, speed: number, count: number, size: number, color: number, kind: ChipKind, t0 = this.now): void {
     const rng = this.rng;
@@ -325,7 +375,10 @@ export class FxSystem implements System, FxApi {
         const v = rng.range(20, 45) * Math.sqrt(s);
         this.emitFlame(o.x + d.x * f, o.y + d.y * f, o.z + d.z * f, d.x * v, d.y * v, d.z * v, size * 0.6, size * 1.1, rng.range(0.025, 0.045), 2000, rng.int(0, 12), t0, 25, 0);
       }
-      this.lights.fire(t0, o, 0xffb77a, 25 * s * s, 4 + 3 * s, 0.03 + 0.01 * s);
+      // A gun turns ≈ 30 % of the propellant's energy into muzzle energy (interior-ballistics
+      // energy balance) and roughly that share again afterburns visibly at the muzzle (estimate):
+      // the visible flash carries about the muzzle energy.
+      this.lights.fire(t0, o, 0xffb77a, flashCandela(E), 4 + 3 * s, 0.03 + 0.01 * s);
     }
     // Propellant smoke: a faint puff for rifles, a real cloud for cannon.
     const smokeN = cannon ? 8 : 2;
@@ -353,7 +406,9 @@ export class FxSystem implements System, FxApi {
     }
     if (!soft) {
       this.emitFlame(o.x - d.x * 0.9, o.y - d.y * 0.9, o.z - d.z * 0.9, -d.x * 30, -d.y * 30, -d.z * 30, 0.35, 1.2, 0.07, 2200, rng.int(0, 12), t0, 12, 0);
-      this.lights.fire(t0, o, 0xffc58a, 300, 12, 0.06);
+      // The booster burns out inside the tube and vents backwards (≈ 10 % efficient): ~3× the flash.
+      _v.copy(o).addScaledVector(d, -1.2);
+      this.lights.fire(t0, _v, 0xffc58a, flashCandela(3 * 0.5 * e.ammo.mass * e.ammo.muzzleVelocity ** 2), 12, 0.06);
     }
   }
 
@@ -395,6 +450,12 @@ export class FxSystem implements System, FxApi {
         const r = Math.min(1.5, Math.max(0.05, (e.craterRadius || 0.02) * 2.5, 0.14 * s) * (soil ? 1.3 : 1));
         this.emitDust(p, _v.copy(_d).multiplyScalar((soil ? 3 : 2) * Math.sqrt(s)), r, Math.round(Math.min(14, 4 + 2 * s)), m.dustColor, 0.7 + 0.15 * s);
       }
+      // The ejecta cone is a ballistic signature of the hit itself: emitted even when the target
+      // raised its own (slow, billowing) dust. Soil throws a narrower, steeper plume.
+      {
+        const r = Math.min(1.2, Math.max(0.06, 0.12 * s));
+        this.emitDustJet(p, _d, soil ? 0.35 : 0.6, (soil ? 9 : 10) * Math.pow(s, 0.35), Math.round(Math.min(12, 5 + 2 * s)), r, m.dustColor);
+      }
       if (!(done & MARK_CHIPS)) {
         const count = Math.min(90, 6 + 10 * s * s);
         const size = Math.min(0.08, (soil ? 0.012 : 0.008) * Math.sqrt(s));
@@ -410,7 +471,11 @@ export class FxSystem implements System, FxApi {
         this.emitSparks(p, _u, count, jet ? 45 : 90, jet ? 2300 : 1900, jet ? 1.2 : 0.8, jet ? 0.0025 : 0.0008, 0, jet ? 1.4 : 0.6);
         if (e.outcome === 'perforate' && e.exitPoint) this.emitSparks(e.exitPoint, e.direction, count * 0.6, 120, 2000, 0.6, 0.001, 0, 0.5);
       }
-      this.lights.fire(this.now, p, jet ? 0xfff0d0 : 0xffa860, (jet ? 800 : 30) * Math.min(20, s), 3 + 2 * s, jet ? 0.08 : 0.025);
+      // Incandescent spray: ≈ 2 % of the impact energy (10 % for a jet) leaves as a visible flash
+      // (estimate). The light sits in the spray half a metre off the plate: a point source on the
+      // surface would paint a white disc (illuminance ∝ 1/d²).
+      _v.copy(p).addScaledVector(n, 0.5);
+      this.lights.fire(this.now, _v, jet ? 0xfff0d0 : 0xffa860, flashCandela((jet ? 0.1 : 0.02) * E), 3 + 2 * s, jet ? 0.08 : 0.025);
       if (jet || e.ammo.kind === 'apfsds') this.emitDust(p, _v.copy(n).multiplyScalar(4), 0.25 * s, 6, 0x6d6760, 1);
     } else if (cls === 'glass') {
       this.emitSparks(p, e.direction, Math.min(200, 25 * s), 6, 0, 1.3, 0.004, 1, 2.5);
@@ -426,7 +491,10 @@ export class FxSystem implements System, FxApi {
       // Incendiary (zirconium / misch-metal) flash on impact: a white burst and burning particles.
       this.emitFlame(p.x + n.x * 0.05, p.y + n.y * 0.05, p.z + n.z * 0.05, 0, 0, 0, 0.12 * s, 0.25 * s, 0.05, 2600, 12 + rng.int(0, 4), this.now, 10, 0);
       this.emitSparks(p, _d, 20 * s, 40, 2400, 1.1, 0.001, 0, 0.5);
-      this.lights.fire(this.now, p, 0xfff2d8, 60 * s, 6, 0.04);
+      // Incendiary filler ≈ 3 % of the projectile mass burning at ~10 MJ/kg (zirconium, misch metal),
+      // a flash of a few milliseconds.
+      _v.copy(p).addScaledVector(n, 0.5);
+      this.lights.fire(this.now, _v, 0xfff2d8, flashCandela(0.03 * e.mass * 1e7), 6, 0.015);
     }
   }
 
@@ -455,7 +523,7 @@ export class FxSystem implements System, FxApi {
 
     // Flash. Peak luminous intensity ≈ fireball radiance × projected area (a ~2300 K surface of
     // radius R_f ≈ 1.75 W^⅓), i.e. ≈ 300 W^⅔ render-candela; it decays with the fireball.
-    this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, 300 * Math.pow(W, 2 / 3) * (thermo ? 1.5 : 1), 25 * w3 + 8, tFire);
+    this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, FIREBALL_CD * Math.pow(W, 2 / 3) * (thermo ? 1.5 : 1), 25 * w3 + 8, tFire);
 
     // 1) Fireball body: incandescent turbulent puffs that expand fast, stall and cool into soot.
     const nFire = Math.round(Math.min(260, (36 + 55 * w3) * (thermo ? 1.5 : 1)));
@@ -472,7 +540,9 @@ export class FxSystem implements System, FxApi {
       P.drag = kFire; P.gravity = -0.02; P.floor = -1e4; P.tLand = -1;
       P.size0 = Rf * rng.range(0.15, 0.3); P.size1 = Rf * rng.range(0.45, 0.7); P.growth = tFire * 0.3;
       P.spin = rng.range(-1.5, 1.5);
-      const soot = thermo ? 0.06 : 0.04;
+      // Cooled detonation products: dark grey TNT smoke (soot mixed with fine dust), not carbon
+      // black — a thin puff of albedo 0.04 reads as a hole in the cloud.
+      const soot = thermo ? 0.1 : 0.075;
       P.r = soot; P.g = soot; P.b = soot * 1.04; P.opacity = 0.85;
       P.seed = rng.next();
       // Turbulent mixing: the fireball is a patchwork of hot and cooler pockets, with tongues of
@@ -696,7 +766,9 @@ export class FxSystem implements System, FxApi {
         const len = Math.min(speed * SHUTTER * scale, speed * Math.max(p.age, 0), 60);
         _d.copy(p.velocity).divideScalar(speed);
         const green = p.ammo.id === 'lps';
-        const I = 45;
+        // Burning Sr(NO₃)₂ / Mg composition: a few ×10 the sun-lit wall at the pellet, spread over a
+        // sub-pixel streak — bright enough to bloom a little, not a laser beam.
+        const I = 12;
         tr.add(p.position.x, p.position.y, p.position.z, p.position.x - _d.x * len, p.position.y - _d.y * len, p.position.z - _d.z * len,
           (green ? 0.25 : 1) * I, (green ? 1 : 0.22) * I, (green ? 0.3 : 0.06) * I, Math.max(0.02, p.ammo.diameter * 3));
       }
@@ -728,16 +800,19 @@ export class FxSystem implements System, FxApi {
         const x = pos.x - _d.x * off - vel.x * back, y = pos.y - _d.y * off - vel.y * back, z = pos.z - _d.z * off - vel.z * back;
         this.emitFlame(x, y, z, vel.x, vel.y, vel.z, 0.2 - i * 0.03, 0.26 - i * 0.03, 0.045, 2350 - i * 150, rng.int(0, 12), now - back, 0.01, 0);
       }
-      // Motor smoke: a continuous white line (overlapping puffs every ≥ 0.12 m, at most 24 per
-      // frame so a 3 s Javelin burn stays inside the smoke budget) that spreads into a wispy trail
-      // over several seconds and drifts with the wind.
-      const n = Math.min(24, Math.ceil(dist / 0.12));
+      // Motor smoke: a continuous white line that spreads into a wispy trail over several seconds
+      // and drifts with the wind. Soft (diffuse) puffs every ≤ 0.16 m — under half their width, or
+      // the line breaks up into a string of beads. That is ~1 300 puffs for an RPG-7's 200 m burn
+      // and ~3 500 for a Javelin; the per-frame cap only bounds a stalled frame.
+      const n = Math.min(96, Math.ceil(dist / 0.16));
       for (let i = 0; i < n; i++) {
         const u = (i + rng.next()) / n;
         this.puff(t.x + dx * u, t.y + dy * u, t.z + dz * u, rng.range(-0.3, 0.3), rng.range(-0.1, 0.3), rng.range(-0.3, 0.3),
-          Math.max(0.2, (0.6 * dist) / n), rng.range(0.55, 1.1), rng.range(6, 12), 0xeae7e1, 0.4, now - (1 - u) * (dist / Math.max(speed, 1)), 1.8, -0.006, 1, rng.chance(0.8));
+          0.2, rng.range(0.55, 1.1), rng.range(6, 12), 0xeae7e1, 0.45, now - (1 - u) * (dist / Math.max(speed, 1)), 1.8, -0.006, 1, true);
       }
-      if (rng.chance(0.3)) this.lights.fire(now, pos, 0xffc080, 60, 10, 0.05);
+      // Motor plume: ~1 MW of burning propellant, ≈ 1 % radiated in the visible → ≈ 10⁵ cd, a few
+      // render candela (estimate); enough to warm the ground under a low rocket, no more.
+      if (rng.chance(0.3)) this.lights.fire(now, pos, 0xffc080, 4, 10, 0.05);
     }
     t.x = pos.x; t.y = pos.y; t.z = pos.z;
   }

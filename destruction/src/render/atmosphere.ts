@@ -161,14 +161,21 @@ uniform mat4 uSunShadowMatrix[2];
 uniform float uSunShadowSplit;
 uniform float uHasSunShadow;
 
-/** Fraction of direct sun reaching a world point (4-tap PCF on the pipeline's cascade atlas). */
+/**
+ * Fraction of direct sun reaching a world point (4-tap PCF on the pipeline's cascade atlas).
+ * The depth bias is 2 cm in world units: the cascades span a few hundred metres of depth, so a
+ * fixed bias in [0, 1] depth would be decimetres — and three.js stores the occluder's *far* face
+ * (back faces go into the shadow map), so dust hugging a wall's shaded face would read as sun-lit.
+ */
 float sunVisibility(vec3 wp, float viewDepth) {
   if (uHasSunShadow < 0.5) return 1.0;
-  vec4 c = (viewDepth < uSunShadowSplit ? uSunShadowMatrix[0] : uSunShadowMatrix[1]) * vec4(wp, 1.0);
+  mat4 M = viewDepth < uSunShadowSplit ? uSunShadowMatrix[0] : uSunShadowMatrix[1];
+  vec4 c = M * vec4(wp, 1.0);
   c.xyz /= c.w;
   if (c.x <= 0.0 || c.y <= 0.0 || c.x >= 1.0 || c.y >= 1.0 || c.z >= 1.0) return 1.0;
   vec2 o = vec2(1.5) / vec2(textureSize(uSunShadow, 0));
-  float z = c.z - 0.0005;
+  float depthPerMetre = length(vec3(M[0][2], M[1][2], M[2][2]));
+  float z = c.z - 0.02 * depthPerMetre;
   return 0.25 * (texture(uSunShadow, vec3(c.xy + vec2(-o.x, -o.y), z)) + texture(uSunShadow, vec3(c.xy + vec2(o.x, -o.y), z))
     + texture(uSunShadow, vec3(c.xy + vec2(-o.x, o.y), z)) + texture(uSunShadow, vec3(c.xy + vec2(o.x, o.y), z)));
 }

@@ -35,6 +35,33 @@ test('particle layer: ring buffer, minimal upload ranges, rejects non-finite par
   layer.dispose();
 });
 
+test('particle layer: frames stepped without a draw keep their particles queued for upload', () => {
+  const layer = new ParticleLayer('t', 16, new THREE.ShaderMaterial());
+  const p = newRecord();
+  p.life = 2;
+  const a0 = layer.mesh.geometry.getAttribute('a0') as THREE.InstancedBufferAttribute;
+  const a5 = layer.mesh.geometry.getAttribute('a5') as THREE.InstancedBufferAttribute;
+  // Two frames, no render in between (Simulation.advance): both frames' slots must go up.
+  for (let i = 0; i < 3; i++) layer.emit(p);
+  layer.flush(0);
+  for (let i = 0; i < 2; i++) layer.emit(p);
+  layer.flush(0);
+  assert.deepEqual(a0.updateRanges, [{ start: 0, count: 20 }]);
+  assert.deepEqual(a5.updateRanges, [{ start: 0, count: 20 }]);
+  // The renderer uploads (three.js clears the ranges and reports it): the next frame starts afresh.
+  for (const a of [a0, a5]) a.clearUpdateRanges();
+  a0.onUploadCallback();
+  layer.emit(p);
+  layer.flush(0);
+  assert.deepEqual(a0.updateRanges, [{ start: 20, count: 4 }]);
+  // A scene reset queues the whole pool (every slot was killed).
+  layer.clear();
+  layer.emit(p);
+  layer.flush(0);
+  assert.deepEqual(a0.updateRanges, [{ start: 0, count: 64 }]);
+  layer.dispose();
+});
+
 function fakeSim(): { sim: Simulation; ctx: SimContext; active: Projectile[] } {
   const active: Projectile[] = [];
   const scene = new THREE.Scene();

@@ -113,6 +113,9 @@ export class SteelBeam implements Destructible, Structural {
   private frozenPose = new THREE.Matrix4();
   private awake = true;
   private still = 0;
+  /** Node positions the static colliders were built for, and the sim time since the last rebuild */
+  private colliderX: Float64Array | null = null;
+  private colliderClock = 0;
   private dirtyMesh = true;
   private failed = false;
   private imposed = 0;
@@ -318,6 +321,11 @@ export class SteelBeam implements Destructible, Structural {
       this.still += dt;
       if (this.still > 0.4) this.awake = false;
     } else this.still = 0;
+    // Debris must collide with the member where it is now, not where it stood: refresh the static
+    // colliders when it has moved by more than a few centimetres (at most every 0.25 s while
+    // moving, and once more when it comes to rest).
+    this.colliderClock += dt;
+    if ((this.colliderClock > 0.25 || !this.awake) && this.colliderStale(0.03)) this.buildStaticColliders();
     this.stats.lastStepMs = performance.now() - t0;
     this.stats.awake = this.awake;
   }
@@ -538,6 +546,13 @@ export class SteelBeam implements Destructible, Structural {
     if (!c) return { segments: [{ material: this.material, start: 0, end: Math.min(maxDepth, this.maxPlateT()), strength: 1 }], exits: true };
     const runs = this.runThrough(c, maxDepth);
     const node = this.nodeAt(c.s);
+    // Craters from earlier hits thin the struck plate under this one (see DetailMap.dimple).
+    if (runs.length) {
+      const dent = this.detail.dimpleAt(this.perimeterAt(c.y, c.z), c.s / this.detailLength()) * Math.max(0.005, this.maxPlateT());
+      const pl = this.section.plates[runs[0]!.plate]!;
+      const r0 = runs[0]!;
+      r0.t1 = r0.t0 + (r0.t1 - r0.t0) * Math.max(0.1, 1 - dent / Math.max(pl.t, 1e-4));
+    }
     const segments: ProbeSegment[] = runs.map((r) => ({
       material: this.material, start: r.t0, end: r.t1, strength: Math.max(0.3, this.sim.frac[node * this.section.plates.length + r.plate]!),
     }));
@@ -772,7 +787,7 @@ export class SteelBeam implements Destructible, Structural {
       Jsum += Jn;
     }
     // Never more momentum than the charge's products can deliver (maxBlastMomentum).
-    const Jscale = Math.min(1, maxBlastMomentum(load.tntKg) / Math.max(Jsum, 1e-9));
+    const Jscale = Math.min(1, maxBlastMomentum(load.tntKg, load.kind) / Math.max(Jsum, 1e-9));
     const standoff = Math.sqrt(nd) - Math.max(this.section.cy, this.section.cz);
     const contact = load.contactTargetId === this.id || ((load.kind === 'contact' || load.kind === 'hesh') && standoff < 0.35 * w3);
     // A distant blast that cannot move any node by more than a few cm/s, beyond the fireball's
@@ -817,7 +832,18 @@ export class SteelBeam implements Destructible, Structural {
           }
           this.ctx.fx.chips({ position: load.center, direction: toNode, spread: 0.7, speed: 150, count: 30, size: 0.02, color: 0x3a3d40, kind: 'metal' });
         }
-        if (cd.spallRadius > 0) this.detail.scar(pu, v, cd.spallRadius / per, cd.spallRadius / L, 0.8, seed + 1);
+        // The charge strips coating and scale under its footprint on the struck face.
+        this.detail.scar(pu, v, cd.craterRadius / per, cd.craterRadius / L, 0.8, seed + 2);
+        if (cd.spallRadius > 0) {
+          // Hopkinson scab off the far side of the struck plate (a flange's inner face), bounded by
+          // the charge footprint ≈ 0.1 W^⅓ as for plates (Held 1981, see SteelPlate.applyBlast); it
+          // takes its depth out of that plate's section.
+          const rs = Math.min(cd.spallRadius, 0.1 * w3);
+          const f = this.faceAt(c.y, c.z);
+          const pr = this.perimeterAt(c.y - f.ny * pl.t * 1.05, c.z - f.nz * pl.t * 1.05);
+          this.detail.scab(pr, v, rs / per, rs / L, Math.min(1, cd.spallDepth / Math.max(0.005, this.maxPlateT())), seed + 1);
+          if (!cd.breach) this.removeSection(this.nodeAt(c.s), c.plate, (2 * rs * Math.min(pl.t, cd.spallDepth)) / Math.max(pl.A, 1e-9), rs);
+        }
         this.detail.heatSpot(pu, v, (0.06 * w3) / per, (0.06 * w3) / L, 500, this.ctx.time.now, 0.004, diffusivity(this.params), false);
       }
     }
@@ -837,8 +863,29 @@ export class SteelBeam implements Destructible, Structural {
 
   /** Fixed cuboids along the member so debris collides with it. */
   private staticBody: RAPIER.RigidBody | null = null;
+
+  /** Has any node moved more than `tol` metres since the static colliders were built? */
+  private colliderStale(tol: number): boolean {
+    const x = this.sim.x, c = this.colliderX;
+    if (!c) return true;
+    for (let i = 0; i < x.length; i += 3) {
+      if ((x[i]! - c[i]!) ** 2 + (x[i + 1]! - c[i + 1]!) ** 2 + (x[i + 2]! - c[i + 2]!) ** 2 > tol * tol) return true;
+    }
+    return false;
+  }
+
   private buildStaticColliders(): void {
     const phys = this.ctx.physics;
+    if (this.staticBody) {
+      try {
+        phys.removeBody(this.staticBody);
+      } catch {
+        // World replaced on scene change.
+      }
+      this.staticBody = null;
+    }
+    this.colliderX = Float64Array.from(this.sim.x);
+    this.colliderClock = 0;
     try {
       this.staticBody = phys.createFixed(new THREE.Vector3(), undefined, this.segmentColliders(new THREE.Matrix4()), this.owner);
     } catch {

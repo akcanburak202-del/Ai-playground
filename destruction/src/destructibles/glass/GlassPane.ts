@@ -5,19 +5,19 @@ import { material as getMaterial, type MaterialProps } from '../../physics/mater
 import type { BlastLoad, ImpactEvent, ThicknessProbe } from '../../physics/ballistics/types.ts';
 import type { Rng } from '../../core/rng.ts';
 import { CrackGraph, SEG_ARC, SEG_BOUNDARY, SEG_BRANCH, SEG_HOLE, type Face } from './crackGraph.ts';
-import { CRACK_SPEED } from './model.ts';
 import { growStar, holeOutline } from './cracks.ts';
 import { CrackRaster } from './raster.ts';
 import { pointInPoly, polyArea, polyBounds, polyCentroid, type Poly } from './polygon.ts';
 import {
-  arealMass, blastFragmentSpeed, blastStar, DICE_AREA, diceEjectionSpeed, diceSize, GASKET_GRIP, GRAVITY, impactStar,
-  LAMINATED_PULLOUT, temperedFails, type GlassType,
+  arealMass, blastFragmentSpeed, blastStar, CRACK_SPEED, DICE_AREA, diceEjectionSpeed, diceSize, GASKET_GRIP, GRAVITY,
+  impactStar, LAMINATED_PULLOUT, temperedFails, type GlassType,
 } from './model.ts';
-import { diceDrag, diceRest, hash01, landingTime, NEVER, siteRelease, sitePosition, type BreakTiming, type DiceRest } from './dicing.ts';
+import { diceDrag, diceRest, dragA, hash01, landingTime, NEVER, siteRelease, sitePosition, type BreakTiming, type DiceRest } from './dicing.ts';
 import { createGlassUniforms, createReflectionMaterial, createTransmissionMaterial, createFittingMaterial, type GlassUniforms } from './look.ts';
 import { DiceSystem, type DieSpawn } from './DiceSystem.ts';
 import { HeapDecal } from './HeapDecal.ts';
 import { FloorProbe } from './floor.ts';
+import { admitBlast, allowance, spend } from './budget.ts';
 import { Membrane } from './membrane.ts';
 import { Shards } from './Shards.ts';
 import { ReflectionProbes } from './probes.ts';
@@ -122,6 +122,7 @@ export class GlassPane implements Destructible, Structural {
     heap: Float32Array; heapFloor: Float32Array; nh: number;
   } | null = null;
   private readonly launchScratch = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, c: 0, floor: 0 };
+  private readonly landScratch = { floor: 0, ground: 0, t1: 0 };
   private readonly spawnScratch: DieSpawn = {
     x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, release: 0, flight: 0, drag: 0, seed: 0, sx: 0, sy: 0, sz: 0, floor: 0,
     qx: 0, qy: 0, qz: 0, qw: 1, r: 0, g: 0, b: 0, fadeAt: 1e9, cell: 0.008,
@@ -149,6 +150,11 @@ export class GlassPane implements Destructible, Structural {
   private goneArea = 0;
   private facesDirty = false;
   private schedule = new Map<string, Scheduled>();
+  private releaseQueue: { face: Face; field: BlastField; rigid: boolean; t0: number }[] = [];
+  private pendingBlasts: BlastLoad[] = [];
+  /** Crack segments left to draw (blast stars are drawn over a few steps) */
+  private cracksPending = false;
+  private blastWaits = 0;
   private shards: Shards | null = null;
   private lastHit = { x: 0, y: 0, time: -1e9, p: new THREE.Vector3(), R: 0.05 };
   /** Releases are reported as few, aggregated 'shatter' events (sound and dust per burst, not per piece). */
@@ -211,7 +217,7 @@ export class GlassPane implements Destructible, Structural {
     if (spec.tint !== undefined) this.tint.setHex(spec.tint);
     else this.tint.setRGB(...(CLEAR_ABSORPTION.map((a) => Math.exp(-a * spec.thickness)) as [number, number, number]));
 
-    this.diceAlbedo = [this.tint.r, this.tint.g, this.tint.b].map((c) => 0.04 + 0.3 * Math.pow(c, 1.5));
+    this.diceAlbedo = [this.tint.r, this.tint.g, this.tint.b].map((c) => 0.03 + 0.2 * c * c);
     this.cleanTex = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
     this.cleanTex.needsUpdate = true;
     this.uniforms = createGlassUniforms(this.cleanTex, this.width, this.height, this.thickness, this.seed, this.tint);
@@ -435,12 +441,22 @@ export class GlassPane implements Destructible, Structural {
   }
 
   /** Draw the crack segments added since the last call into the damage texture. */
-  private paintCracks(): void {
+  /**
+   * Draw the crack segments not drawn yet into the raster. With a budget (blasts), what is left over
+   * is drawn by the next steps: the lines of a big star appear over a few steps.
+   */
+  private paintCracks(budgetMs = Infinity): void {
     const g = this.graph;
     const r = this.raster;
     if (!g || !r) return;
-    for (let s = 0; s < g.segmentCount; s++) {
+    const t0 = budgetMs < Infinity ? performance.now() : 0;
+    this.cracksPending = false;
+    for (let s = 0, n = 0; s < g.segmentCount; s++) {
       if (!g.live[s] || g.painted[s]) continue;
+      if ((++n & 15) === 0 && budgetMs < Infinity && performance.now() - t0 > budgetMs) {
+        this.cracksPending = true;
+        break;
+      }
       g.painted[s] = 1;
       const k = g.kind[s]!;
       if (k === SEG_BOUNDARY || k === SEG_HOLE) continue;
@@ -522,8 +538,13 @@ export class GlassPane implements Destructible, Structural {
       for (const f of faces) {
         if (!this.isGone(f.sample[0], f.sample[1]) && sampleField(field, field.D, f.sample[0], f.sample[1], this.width, this.height) >= 1) blasted.push(f);
       }
+      // Largest first: they become the rigid shards and are spawned in the first steps.
       blasted.sort((a, b) => b.area - a.area);
-      blasted.forEach((f, k) => this.releaseFace(f, field, false, k < BLAST_SHARDS));
+      blasted.forEach((f, k) => {
+        this.markGone(f.outer, f.holes, false);
+        this.releaseQueue.push({ face: f, field, rigid: k < BLAST_SHARDS, t0: this.ctx.time.now });
+      });
+      this.runReleaseQueue(4);
     }
     for (const f of faces) {
       if (this.isGone(f.sample[0], f.sample[1])) continue;
@@ -557,6 +578,27 @@ export class GlassPane implements Destructible, Structural {
   /** A piece leaves the frame: as a rigid shard, or as dice when it is tiny. */
   private releaseFace(f: Face, field: BlastField | null, paint = true, rigid = true): void {
     this.markGone(f.outer, f.holes, paint);
+    this.spawnPiece(f, field, rigid, 0);
+  }
+
+  /**
+   * Spawn blast-released pieces within `budgetMs` per step. Pieces already count as gone (the pane
+   * shows the hole at once); one spawned `age` s late starts where its free flight has taken it.
+   */
+  private runReleaseQueue(budgetMs: number): void {
+    const t0 = performance.now();
+    let k = 0;
+    const q = this.releaseQueue;
+    while (k < q.length) {
+      const r = q[k++]!;
+      this.spawnPiece(r.face, r.field, r.rigid, this.ctx.time.now - r.t0);
+      if (performance.now() - t0 > budgetMs) break;
+    }
+    q.splice(0, k);
+  }
+
+  /** The physical piece of a released face: a rigid shard, or dice when small. */
+  private spawnPiece(f: Face, field: BlastField | null, rigid: boolean, age: number): void {
     const c = polyCentroid(f.outer);
     const v = new THREE.Vector3();
     const w = new THREE.Vector3();
@@ -586,8 +628,8 @@ export class GlassPane implements Destructible, Structural {
       w.copy(_v).multiplyScalar((this.rnd() - 0.5) * 6);
     }
     const shards = f.area >= DICE_AREA && rigid ? this.ensureShards() : null;
-    if (!shards || !shards.add({ outer: f.outer, holes: f.holes, linvel: v, angvel: w }, this.matrix)) {
-      this.pieceDice(this.toWorld(c[0], c[1], 0, new THREE.Vector3()), f.area, v, 0.01);
+    if (!shards || !shards.add({ outer: f.outer, holes: f.holes, linvel: v, angvel: w, age }, this.matrix)) {
+      this.pieceDice(this.toWorld(c[0], c[1], 0, new THREE.Vector3()), f.area, v, 0.01, age);
     }
     this.stats.shards = this.shards?.count ?? 0;
     this.toWorld(c[0], c[1], 0, _v);
@@ -595,13 +637,33 @@ export class GlassPane implements Destructible, Structural {
     this.shatterArea += f.area;
   }
 
+  /**
+   * Floor height a die thrown from (x, y, z) with velocity v lands on, and its flight time: solve
+   * once against the floor under the release point, then again against the floor under the landing
+   * point (a die thrown off a podium lands on the ground below it, not in mid-air).
+   */
+  private landing(x: number, y: number, z: number, vx: number, vy: number, vz: number, c: number, half: number, out: { floor: number; ground: number; t1: number }): void {
+    const floor = this.ensureFloor();
+    let g = floor.heightAt(x, z, y);
+    let t1 = landingTime(y, vy, c, g + half);
+    const A = dragA(c, t1);
+    const g2 = floor.heightAt(x + vx * A, z + vz * A, y);
+    if (g2 !== g) {
+      g = g2;
+      t1 = landingTime(y, vy, c, g + half);
+    }
+    out.floor = g + half;
+    out.ground = g;
+    out.t1 = t1;
+  }
+
   /** Small bits of glass (crumbs of a shard, slivers of a pane) as dice. */
-  private pieceDice(p: THREE.Vector3, area: number, v: THREE.Vector3, size: number): void {
-    const n = Math.max(1, Math.min(80, Math.round(area / (size * size))));
+  private pieceDice(p: THREE.Vector3, area: number, v: THREE.Vector3, size: number, age = 0): void {
+    const n = Math.max(1, Math.min(24, Math.round(area / (size * size))));
     const s = Math.sqrt(area / n);
     const ds = this.ensureDice();
     const floor = this.ensureFloor();
-    const now = this.ctx.time.now;
+    const now = this.ctx.time.now - age;
     const sp = this.spawnScratch;
     const albedo = this.diceAlbedo;
     const spread = 0.35 + 0.15 * v.length();
@@ -609,13 +671,14 @@ export class GlassPane implements Destructible, Structural {
     for (let k = 0; k < n; k++) {
       const vx = v.x + (this.rnd() - 0.5) * spread, vy = v.y + (this.rnd() - 0.3) * spread, vz = v.z + (this.rnd() - 0.5) * spread;
       const x = p.x + (this.rnd() - 0.5) * L, y = p.y + (this.rnd() - 0.5) * 0.02, z = p.z + (this.rnd() - 0.5) * L;
-      const fl = floor.heightAt(x, z, y) + 0.45 * Math.min(s, this.thickness);
       const c = diceDrag(s, this.thickness, Math.hypot(vx, vy, vz));
+      this.landing(x, y, z, vx, vy, vz, c, 0.45 * Math.min(s, this.thickness), this.landScratch);
+      const fl = this.landScratch.floor;
       _q.setFromUnitVectors(_n.set(0, 0, 1), _w.set(this.rnd() - 0.5, this.rnd() - 0.5, this.rnd() - 0.5).normalize());
       sp.x = x; sp.y = y; sp.z = z;
       sp.vx = vx; sp.vy = vy; sp.vz = vz;
       sp.release = now;
-      sp.flight = landingTime(y, vy, c, fl);
+      sp.flight = this.landScratch.t1;
       sp.drag = c;
       sp.seed = this.rnd();
       sp.sx = s;
@@ -695,7 +758,7 @@ export class GlassPane implements Destructible, Structural {
 
   /**
    * Spawn the dice of a broken tempered pane, row by row, within `budgetMs` of wall-clock time per
-   * call (continued every frame until done).
+   * call (continued every fixed step until done).
    */
   private runDiceJob(budgetMs: number): void {
     const job = this.diceJob;
@@ -753,10 +816,11 @@ export class GlassPane implements Destructible, Structural {
           if (_d.dot(this.normalW) * blastDirSign < 0) _d.reflect(this.normalW);
           _w.addScaledVector(_d, v);
         }
-        const flo = floor.heightAt(_v.x, _v.z, _v.y);
-        const fl = flo + half;
         const c = diceDrag(s, T, _w.length());
-        const t1 = landingTime(_v.y, _w.y, c, fl);
+        this.landing(_v.x, _v.y, _v.z, _w.x, _w.y, _w.z, c, half, this.landScratch);
+        const flo = this.landScratch.ground;
+        const fl = this.landScratch.floor;
+        const t1 = this.landScratch.t1;
         launch.x = _v.x; launch.y = _v.y; launch.z = _v.z;
         launch.vx = _w.x; launch.vy = _w.y; launch.vz = _w.z;
         launch.c = c;
@@ -990,7 +1054,22 @@ export class GlassPane implements Destructible, Structural {
   }
 
   applyBlast(load: BlastLoad): void {
+    this.blastWithin(load, false);
+  }
+
+  /** Process a blast now if the scene's per-step budget allows (or `force`), else defer it a step. */
+  private blastWithin(load: BlastLoad, force: boolean): void {
     if (this.disposed || this.hasFailed()) return;
+    if (!admitBlast(this.ctx) && !force) {
+      this.pendingBlasts.push(load);
+      return;
+    }
+    const t0 = performance.now();
+    this.processBlast(load);
+    spend(this.ctx, performance.now() - t0);
+  }
+
+  private processBlast(load: BlastLoad): void {
     const t0 = performance.now();
     const field = this.blastField(load);
     if (field.max >= 1) {
@@ -1005,7 +1084,7 @@ export class GlassPane implements Destructible, Structural {
           this.evaluateFaces(field);
           this.facesDirty = false;
           // Only what is left in the frame needs its cracks drawn.
-          if (this.goneArea < 0.97 * this.width * this.height) this.paintCracks();
+          if (this.goneArea < 0.97 * this.width * this.height) this.paintCracks(3);
           else for (let s = 0; s < g.segmentCount; s++) g.painted[s] = 1;
           break;
         }
@@ -1020,11 +1099,12 @@ export class GlassPane implements Destructible, Structural {
   private laminatedBlast(field: BlastField): void {
     const g = this.ensureGraph();
     this.ensureRaster();
-    const spec = blastStar(Math.max(1, field.max * 1.5), this.width, this.height, this.rnd);
+    const spec = blastStar(Math.max(1, field.max), this.width, this.height, this.rnd);
     spec.ringProb = spec.ringProb.map(() => 0.8);
     growStar(g, field.ox, field.oy, 0, spec, this.rnd, (x, y) => this.isGone(x, y));
-    this.paintCracks();
-    this.ensureRaster().halo(field.ox, field.oy, 0.05, 0.6 * Math.min(this.width, this.height), 0.25, this.seed, 1, 0.6);
+    this.paintCracks(3);
+    // The interlayer delaminates across the loaded pane: a milky, blotchy veil.
+    this.uniforms.uHaze.value = Math.min(0.22, Math.max(this.uniforms.uHaze.value, 0.1 * field.max));
     const m = this.ensureMembrane();
     if (m.bulge === 0) m.bulge = Math.sign(_v.copy(this.bounds.getCenter(_o)).sub(field.center).dot(this.normalW)) || 1;
     for (let k = 0; k < m.n; k++) {
@@ -1050,6 +1130,29 @@ export class GlassPane implements Destructible, Structural {
 
   fixedUpdate(dt: number): void {
     if (this.disposed) return;
+    // Dice of a broken tempered pane still being spawned (a few ms per step, centre-out).
+    if (this.diceJob) {
+      const t = performance.now();
+      this.runDiceJob(allowance(this.ctx, this.diceJob.field ? 12 : 5, 2));
+      spend(this.ctx, performance.now() - t);
+    }
+    if (this.releaseQueue.length) {
+      const t = performance.now();
+      this.runReleaseQueue(allowance(this.ctx, 5, 1));
+      spend(this.ctx, performance.now() - t);
+    }
+    if (this.cracksPending) {
+      const t = performance.now();
+      this.paintCracks(allowance(this.ctx, 4, 1));
+      spend(this.ctx, performance.now() - t);
+    }
+    if (this.pendingBlasts.length) {
+      // Deferred by the shared budget; after a few steps it goes through regardless, so a stalled
+      // clock (or a scene of many panes) never starves one.
+      this.blastWaits++;
+      this.blastWithin(this.pendingBlasts.shift()!, this.blastWaits > 8);
+      if (!this.pendingBlasts.length) this.blastWaits = 0;
+    }
     const t0 = performance.now();
     const now = this.ctx.time.now;
     if (this.type === 'annealed') {
@@ -1117,7 +1220,6 @@ export class GlassPane implements Destructible, Structural {
     }
     this.probes?.update();
     this.uniforms.uTime.value = this.ctx.time.now;
-    if (this.diceJob) this.runDiceJob(6);
     if (this.dice) this.dice.update(this.ctx.time.now);
     this.uploadRaster();
     this.shards?.frameUpdate();
@@ -1247,6 +1349,7 @@ export class GlassPane implements Destructible, Structural {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.pendingBlasts.length = 0;
     this.root.removeFromParent();
     this.boxGeom.dispose();
     this.lam?.geom.dispose();

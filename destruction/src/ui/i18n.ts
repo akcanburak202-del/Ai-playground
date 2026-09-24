@@ -125,7 +125,7 @@ export const HELP_DESKTOP: { title: string; entries: HelpEntry[] }[] = [
     entries: [
       { keys: ['Fare'], label: 'Bakış (tıkla: fare kilidi)' },
       { keys: ['W', 'A', 'S', 'D'], label: 'Uçuş' },
-      { keys: ['Space', 'E'], label: 'Yüksel' },
+      { keys: ['Boşluk', 'E'], label: 'Yüksel' },
       { keys: ['Q', 'Ctrl'], label: 'Alçal' },
       { keys: ['Shift'], label: 'Hızlı (25 m/s)' },
     ],

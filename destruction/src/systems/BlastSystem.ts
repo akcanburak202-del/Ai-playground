@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { Simulation } from '../app/Simulation.ts';
-import type { BlastSystemApi, SimContext, System } from '../app/contracts.ts';
+import type { BlastSystemApi, SimContext, SpawnProjectileOptions, System } from '../app/contracts.ts';
 import type { Rng } from '../core/rng.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import { createBlastLoad, fireballRadius, hemisphericalCharge, rangeForOverpressure } from '../physics/ballistics/blast.ts';
@@ -11,6 +11,16 @@ import type { BlastLoad, BlastRequest } from '../physics/ballistics/types.ts';
 export interface ExtendedBlastRequest extends BlastRequest {
   /** Tamping factor for charges that detonated buried inside a target (≥ 1) */
   tamping?: number;
+  /**
+   * Simulation time of the detonation when it happened part-way through the current fixed step
+   * (a shell striking mid-step); default and upper bound: `ctx.time.now`.
+   */
+  time?: number;
+}
+
+/** Anything that can throw a round from a given moment (ProjectileSystem.spawnAt). */
+interface TimedSpawner {
+  spawnAt(o: SpawnProjectileOptions, start: number): unknown;
 }
 
 /** Radius of effect: where peak incident overpressure has fallen to 2 kPa (window-rattling), capped. */
@@ -52,8 +62,11 @@ export class BlastSystem implements System, BlastSystemApi {
 
   detonate(req: BlastRequest): void {
     const ctx = this.ctx;
-    const now = ctx.time.now;
     const ext = req as ExtendedBlastRequest;
+    // Detonation time: inside the step being simulated when the projectile system knows it, so the
+    // contact target is loaded in this same step and far targets exactly when the front arrives
+    // (loads are applied at the end of the step in which they arrive, never before).
+    const now = Math.min(ctx.time.now, Number.isFinite(ext.time) ? ext.time! : ctx.time.now);
     const load = createBlastLoad(req, now, { tamping: ext.tamping });
     const thermo = req.kind === 'thermobaric';
     this.count++;
@@ -105,9 +118,13 @@ export class BlastSystem implements System, BlastSystemApi {
     // Casing fragments fly as real projectiles.
     const casing = req.casingMass ?? 0;
     if (casing > 0) {
+      const timed = (ctx.projectiles as Partial<TimedSpawner>).spawnAt ? (ctx.projectiles as unknown as TimedSpawner) : null;
       for (const f of sampleFragments(req, fragmentBudget(casing), this.rng)) {
         const spec = fragmentAmmo(f.mass, f.speed, req.source);
-        ctx.projectiles.spawn({ ammo: spec, origin: center.clone().addScaledVector(f.direction, 0.02), velocity: f.direction.multiplyScalar(f.speed) });
+        const o = { ammo: spec, origin: center.clone().addScaledVector(f.direction, 0.02), velocity: f.direction.multiplyScalar(f.speed) };
+        // Thrown at the moment of detonation: they catch up with the clock on their first step.
+        if (timed) timed.spawnAt(o, now);
+        else ctx.projectiles.spawn(o);
       }
     }
   }

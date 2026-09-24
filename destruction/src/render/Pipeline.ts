@@ -171,8 +171,9 @@ export class Pipeline implements RenderPipelineApi {
     this.compositePass = new CompositePass(ctx.camera, this.frame, atmo);
     this.fxPass = new FxPass(ctx.camera, this.frame, atmo);
     // Threshold above any sun-lit diffuse surface (≈1.5): only fire, tracers, hot metal, flashes
-    // and the sun disc bloom.
-    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.22, 0.3, 7.0);
+    // and the sun disc bloom. Incandescent sources run at 10–100× the lit wall (see fx glow()), so
+    // the strength stays low: veiling glare of a real lens is a few per cent of the source.
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.1, 0.3, 7.0);
     this.outputPass = new OutputPass();
     this.smaaPass = new SMAAPass();
     this.fxaaPass = new FXAAPass();

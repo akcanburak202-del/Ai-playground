@@ -240,10 +240,11 @@ export const AMMO: Record<string, AmmoData> = {
     explosiveTNT: 2.8, casingMass: 1.5, gurney: 2800, tandem: true, precursorRHA: 0.12,
     heatPenetrationRHA: 0.78, heatConeDiameter: 0.12,
     rocket: { thrust: 720, burnTime: 3.2, ignitionDelay: 0.28, propellantMass: 1.25 },
-    guidance: { mode: 'topAttack', maxAccel: 200, loftHeight: 150 },
-    note: 'Fire-and-forget IR-guided missile: soft launch, flight motor lights clear of the gunner, climbs ~150 m and dives onto the top of the target',
+    // Only `mode` and `loftHeight` are read: the arc is a scripted cosmetic path (flight.ts LoftPath), no guidance law.
+    guidance: { mode: 'topAttack', maxAccel: 0, loftHeight: 150 },
+    note: 'Top-attack launcher: soft launch, the flight motor lights clear of the gunner, the missile arcs up and comes down onto the roof of the target (scripted arc in this game)',
     rated: '≈ 750–800 mm RHA (tandem, after ERA)',
-    source: 'Javelin JV fact sheets (Raytheon/Lockheed); open estimates of penetration',
+    source: 'Javelin JV public fact sheets (Raytheon/Lockheed Martin); open encyclopedic estimates of penetration',
   },
 
   // ─── 120 mm tank ammunition ─────────────────────────────────────────────────────────────────
@@ -301,8 +302,7 @@ export const AMMO: Record<string, AmmoData> = {
     coreDensity: 7850, noseFactor: 1.0, deformable: false, fuze: 'impact',
     explosiveTNT: 95, casingMass: 110, gurney: 2600,
     filler: { name: 'Tritonal (80/20 TNT/Al)', mass: 89, re: 1.07 },
-    guidance: { mode: 'direct', maxAccel: 30 },
-    note: 'GPS/INS guided Mk 82: 89 kg Tritonal (≈ 95 kg TNT-e), instantaneous fuze',
+    note: 'Mk 82 500 lb bomb body: 89 kg Tritonal (≈ 95 kg TNT-e), instantaneous fuze; arrives from the sky onto the marked point',
     source: 'USAF fact sheet (JDAM); Mk 82 data',
   },
   gbu31: {
@@ -311,7 +311,6 @@ export const AMMO: Record<string, AmmoData> = {
     coreDensity: 7850, noseFactor: 1.14, deformable: false, fuze: 'delay', fuzeDelay: 0.015,
     explosiveTNT: 260, casingMass: 550, gurney: 2600,
     filler: { name: 'Tritonal', mass: 243, re: 1.07 },
-    guidance: { mode: 'direct', maxAccel: 30 },
     note: 'Hardened 4340-steel penetrator: goes through ~1.8 m of reinforced concrete, then a delay fuze fires 243 kg Tritonal inside',
     rated: '1.8–2.4 m reinforced concrete',
     source: 'USAF fact sheet (BLU-109/B)',

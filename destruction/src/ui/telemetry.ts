@@ -11,6 +11,10 @@ import { KIND_TR, OUTCOME_TR, caliberTr } from './i18n.ts';
  */
 
 export interface ImpactRow {
+  /** Same round, same target, same material, same result: rows with one key are merged (×N) */
+  key: string;
+  /** How many impacts this row stands for */
+  count: number;
   ammo: string;
   material: string;
   outcome: ImpactEvent['outcome'];
@@ -28,6 +32,8 @@ export interface ImpactRow {
 
 export function impactRow(e: ImpactEvent): ImpactRow {
   return {
+    key: `${e.ammo.id}|${e.agent}|${e.targetKind}|${e.targetName ?? ''}|${e.material.id}|${e.outcome}`,
+    count: 1,
     ammo: e.agent === 'jet' ? `${e.ammo.name} · jet` : e.ammo.name,
     material: e.material.nameTr,
     outcome: e.outcome,
@@ -69,6 +75,245 @@ export function describeImpact(e: ImpactEvent): string {
       return `Krater Ø${d(e.craterRadius)} × ${fmtLength(e.craterDepth)} · nüfuz ${fmtLength(e.depth)} · mikro çatlak Ø${d(e.damageRadius)}${spall}`;
     }
   }
+}
+
+/** Points kept of a group's depth profile (older ones are merged pairwise as the burst goes on) */
+export const PROFILE_POINTS = 96;
+
+/**
+ * Consecutive hits on one spot of one target. The resolver measures each round's depth from the
+ * surface it met, and after the first rounds that surface is the floor of the crater the earlier
+ * rounds dug (and the damaged material around it resists less). Measured from the first hit's
+ * entry plane, the group's deepest reach is the depth of the cavity, so a burst on one spot reads
+ * as a number that keeps growing — the progressive damage the simulation is about, made visible.
+ */
+export class HitGroup {
+  count = 0;
+  /** Cavity depth (deepest reach so far) after each hit, m; ≤ PROFILE_POINTS entries, `stride` hits each */
+  readonly profile: number[] = [];
+  stride = 1;
+  /** Deepest reach so far, m */
+  deepest = 0;
+  /** Reach of the first hit, m */
+  first = 0;
+  /** Hit number (1-based) that first went through, 0 while none has */
+  perforatedAt = 0;
+  /** Member thickness along the normal, known once a hit went through, m */
+  thickness = NaN;
+  material = '';
+  /** Sim time of the latest hit, s */
+  lastTime = -Infinity;
+  /** Hits, decayed with a 0.5 s time constant: how hard this spot is being worked right now */
+  activity = 0;
+  private key = '';
+  /** First entry point: the depth reference plane passes through it */
+  private ox = 0;
+  private oy = 0;
+  private oz = 0;
+  /** Centre of the spot (mean of the hits, in that plane): a wide burst is judged from its middle */
+  private cx = 0;
+  private cy = 0;
+  private cz = 0;
+  private nx = 0;
+  private ny = 0;
+  private nz = 1;
+  private radius = 0;
+  /** The weapon's 95 % group radius at this range, m */
+  private spread = 0;
+
+  static keyOf(e: ImpactEvent): string {
+    return `${e.targetKind}|${e.targetName ?? ''}`;
+  }
+
+  /**
+   * Squared lateral distance of a hit from this spot, m², or Infinity unless it is on the same
+   * target, within a few crater radii of the first hit and not in front of its surface.
+   */
+  distance2(e: ImpactEvent): number {
+    if (this.count === 0 || HitGroup.keyOf(e) !== this.key) return Infinity;
+    const d = this.below(e.point);
+    if (!(d > -0.05 && d < 3)) return Infinity;
+    // Lateral offset from the spot's centre, in the first hit's entry plane.
+    const lx = e.point.x + d * this.nx - this.cx, ly = e.point.y + d * this.ny - this.cy, lz = e.point.z + d * this.nz - this.cz;
+    const r2 = lx * lx + ly * ly + lz * lz;
+    // Judged from a centre estimated from n hits, a round of the same group lies within the 95 %
+    // radius × √(1 + 1/n) (the centre's own scatter adds σ²/n).
+    const r = Math.max(this.radius, this.spread * Math.sqrt(1 + 1 / this.count));
+    return r2 <= r * r ? r2 : Infinity;
+  }
+
+  /** Start a group at this hit; `minRadius` widens the spot for a dispersed weapon (m). */
+  begin(e: ImpactEvent, minRadius = 0): void {
+    this.key = HitGroup.keyOf(e);
+    this.count = 0;
+    this.profile.length = 0;
+    this.stride = 1;
+    this.deepest = this.first = 0;
+    this.perforatedAt = 0;
+    this.thickness = NaN;
+    this.activity = 0;
+    this.lastTime = -Infinity;
+    this.material = e.material.nameTr;
+    this.ox = this.cx = e.point.x;
+    this.oy = this.cy = e.point.y;
+    this.oz = this.cz = e.point.z;
+    const n = e.normal;
+    const len = Math.hypot(n.x, n.y, n.z);
+    const s = len > 1e-6 ? 1 / len : 0;
+    this.nx = len > 1e-6 ? n.x * s : -e.direction.x;
+    this.ny = len > 1e-6 ? n.y * s : -e.direction.y;
+    this.nz = len > 1e-6 ? n.z * s : -e.direction.z;
+    // "One spot": a few crater radii, at least 10 cm (a rifle burst at 30 m groups within that),
+    // and the weapon's own 95 % group at this range when it is wider (a GAU-8 at 30 m: ≈ 0.2 m).
+    this.radius = Math.max(0.1, 3 * e.craterRadius, 1.5 * e.tunnelRadius);
+    this.spread = Number.isFinite(minRadius) ? Math.max(0, minRadius) : 0;
+  }
+
+  /** Record a hit that `accepts` (or `begin`) admitted. */
+  push(e: ImpactEvent): void {
+    // A tandem precursor and the main jet (or two jets of one round) arrive in the same step:
+    // one round, one hit.
+    const sameRound = this.count > 0 && Math.abs(e.time - this.lastTime) < 1e-4;
+    if (!sameRound) {
+      this.activity = this.activityAt(e.time) + 1;
+      this.count++;
+      const d = this.below(e.point);
+      if (Number.isFinite(d)) {
+        const k = 1 / Math.min(this.count, 32);
+        this.cx += (e.point.x + d * this.nx - this.cx) * k;
+        this.cy += (e.point.y + d * this.ny - this.cy) * k;
+        this.cz += (e.point.z + d * this.nz - this.cz) * k;
+      }
+    }
+    this.lastTime = e.time;
+    const cos = Math.max(0, -(e.direction.x * this.nx + e.direction.y * this.ny + e.direction.z * this.nz));
+    const reach = this.below(e.point) + (Number.isFinite(e.depth) ? e.depth : 0) * cos;
+    if (e.outcome === 'perforate') {
+      const t = e.exitPoint ? this.below(e.exitPoint) : reach;
+      if (Number.isFinite(t) && t > 0) this.thickness = Number.isFinite(this.thickness) ? Math.max(this.thickness, t) : t;
+      if (!this.perforatedAt) this.perforatedAt = this.count;
+    }
+    const r = Number.isFinite(reach) ? Math.max(0, reach) : 0;
+    if (this.count === 1 && !sameRound) this.first = r;
+    this.deepest = Math.max(this.deepest, r);
+    // Profile of the cavity: one point per `stride` hits; when full, merge pairs (it is monotone,
+    // so the later of each pair is the pair).
+    if (sameRound || (this.count - 1) % this.stride !== 0) {
+      if (this.profile.length) this.profile[this.profile.length - 1] = this.deepest;
+    } else {
+      this.profile.push(this.deepest);
+      if (this.profile.length > PROFILE_POINTS) {
+        const tail = this.profile[PROFILE_POINTS]!; // the entry this hit just opened
+        for (let i = 0; i < PROFILE_POINTS / 2; i++) this.profile[i] = this.profile[2 * i + 1]!;
+        this.profile.length = PROFILE_POINTS / 2;
+        this.profile.push(tail);
+        this.stride *= 2;
+      }
+    }
+  }
+
+  /** Decayed hit count at sim time t (τ = 0.5 s). */
+  activityAt(t: number): number {
+    const dt = t - this.lastTime;
+    return dt > 0 ? this.activity * Math.exp(-dt / 0.5) : this.activity;
+  }
+
+  /** Distance of p below the first entry plane, m (negative in front of it). */
+  private below(p: { x: number; y: number; z: number }): number {
+    return (this.ox - p.x) * this.nx + (this.oy - p.y) * this.ny + (this.oz - p.z) * this.nz;
+  }
+}
+
+/**
+ * The spots hit recently (a round that goes through a wall lands somewhere behind it, which is
+ * a spot of its own). The readout follows the spot being worked hardest right now — the most
+ * hits in the last half second or so — and only a spot hit at least twice can take it over, so
+ * stray rounds, ricochets and rounds flying on through a hole do not steal it.
+ */
+export class HitGroups {
+  readonly list: HitGroup[] = [];
+  current: HitGroup | null = null;
+  private readonly max: number;
+
+  constructor(max = 6) {
+    this.max = max;
+  }
+
+  /** Add an impact; `minRadius` is the weapon's 95 % group radius at the impact's range, m. */
+  add(e: ImpactEvent, minRadius = 0): HitGroup | null {
+    if (e.agent === 'fragment') return null;
+    // Of the spots that take it, the one being worked hardest (a burst's outliers do not pull
+    // its rounds away into side groups), then the nearest (neighbouring spots keep their own).
+    let g: HitGroup | null = null;
+    let takeD2 = Infinity;
+    let takeA = -1;
+    for (const x of this.list) {
+      const d2 = x.distance2(e);
+      if (d2 === Infinity) continue;
+      const a = x.activityAt(e.time);
+      if (a > takeA + 0.25 || (a > takeA - 0.25 && d2 < takeD2)) {
+        takeD2 = d2;
+        takeA = a;
+        g = x;
+      }
+    }
+    if (!g) {
+      if (this.list.length < this.max) this.list.push((g = new HitGroup()));
+      else {
+        // Recycle the idlest spot, never the one on display.
+        let idle = -1;
+        let low = Infinity;
+        this.list.forEach((x, i) => {
+          const a = x === this.current ? Infinity : x.activityAt(e.time);
+          if (a < low) {
+            low = a;
+            idle = i;
+          }
+        });
+        if (idle < 0) idle = 0;
+        g = new HitGroup();
+        this.list[idle] = g;
+      }
+      g.begin(e, minRadius);
+    }
+    g.push(e);
+    let best = this.current ?? g;
+    let bestA = this.current ? this.current.activityAt(e.time) : -1;
+    for (const x of this.list) {
+      const a = x.activityAt(e.time);
+      if (x !== best && x.count >= 2 && a > bestA + 1e-6) {
+        best = x;
+        bestA = a;
+      }
+    }
+    this.current = best;
+    return g;
+  }
+
+  reset(): void {
+    this.list.length = 0;
+    this.current = null;
+  }
+}
+
+export interface GroupLine {
+  /** e.g. "Aynı nokta · 14. isabet" */
+  head: string;
+  /** Cavity depth after the first round → now, e.g. "oyuk 21 → 118 mm" */
+  depth: string;
+  /** e.g. "11. isabette delindi · kesit 250 mm" ('' until something went through) */
+  note: string;
+}
+
+/** Turkish readout of a hit group (null until a second round lands on the spot). */
+export function groupLine(g: HitGroup | null): GroupLine | null {
+  if (!g || g.count < 2) return null;
+  const mm = g.deepest < 1;
+  const first = mm ? num(g.first * 1000, g.first < 0.01 ? 1 : 0) : fmtLength(g.first);
+  const notes: string[] = [];
+  if (g.perforatedAt) notes.push(`${g.perforatedAt}. isabette delindi`);
+  if (Number.isFinite(g.thickness)) notes.push(`kesit ${fmtLength(g.thickness)}`);
+  return { head: `Aynı nokta · ${g.count}. isabet`, depth: `oyuk ${first} → ${fmtLength(g.deepest)}`, note: notes.join(' · ') };
 }
 
 /**

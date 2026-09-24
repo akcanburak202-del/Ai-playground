@@ -1,12 +1,13 @@
 import * as THREE from 'three';
 import type { Simulation } from '../app/Simulation.ts';
-import type { ChargeEvent, SimContext, System, WeaponControllerApi, WeaponSpec } from '../app/contracts.ts';
+import type { ChargeEvent, SimContext, SpawnProjectileOptions, System, WeaponControllerApi, WeaponSpec } from '../app/contracts.ts';
 import type { Rng } from '../core/rng.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import type { AmmoData } from '../physics/ballistics/ammo.ts';
 import { planArrival } from '../physics/ballistics/flight.ts';
 import type { AmmoSpec } from '../physics/ballistics/types.ts';
 import { ProjectileSystem } from '../systems/ProjectileSystem.ts';
+import type { ExtendedBlastRequest } from '../systems/BlastSystem.ts';
 import { PLAY_RELOAD_SCALE, WEAPONS, getWeapon, type WeaponData } from './arsenal.ts';
 
 /** 1 MOA in radians */
@@ -61,6 +62,13 @@ export class WeaponController implements WeaponControllerApi, System {
   private fuses: { time: number; charge: PlacedCharge }[] = [];
   private nextChargeId = 1;
   private aim = new THREE.Vector3();
+  /** Length of the fixed step being simulated (rounds are timed inside it) */
+  private stepDt = 0;
+  /** Reused spawn options: the projectile system copies what it needs, so nothing is allocated per round */
+  private readonly spawnOpts: SpawnProjectileOptions & { origin: THREE.Vector3; velocity: THREE.Vector3; target?: THREE.Vector3 } = {
+    ammo: null as unknown as AmmoSpec, origin: new THREE.Vector3(), velocity: new THREE.Vector3(), tracer: false, target: undefined,
+  };
+  private readonly spawnTarget = new THREE.Vector3();
 
   constructor(sim: Simulation) {
     this.sim = sim;
@@ -119,6 +127,7 @@ export class WeaponController implements WeaponControllerApi, System {
   }
 
   fixedUpdate(dt: number): void {
+    this.stepDt = dt;
     const cam = this.ctx.camera;
     cam.updateMatrixWorld();
     cam.getWorldPosition(_pos);
@@ -208,7 +217,11 @@ export class WeaponController implements WeaponControllerApi, System {
     return p instanceof ProjectileSystem ? p : null;
   }
 
-  /** One direct-fire round, `delay` seconds into the current step. */
+  /**
+   * One direct-fire round, `delay` seconds into the current step. The step being simulated spans
+   * [now − dt, now], so the round leaves at now − dt + delay: the projectile system flies it from
+   * that moment whether it runs before or after this system.
+   */
   private fireRound(delay: number): void {
     const w = this.current;
     let ammo = this.currentAmmo as AmmoData;
@@ -217,16 +230,21 @@ export class WeaponController implements WeaponControllerApi, System {
     const sigma = w.dispersionMOA * MOA;
     _dir.copy(_fwd);
     if (sigma > 0) _dir.addScaledVector(_right, this.rng.gaussian(0, sigma)).addScaledVector(_up, this.rng.gaussian(0, sigma)).normalize();
-    // Top-attack missiles leave the tube pitched up a little; guidance does the rest.
-    if (ammo.guidance?.mode === 'topAttack') _dir.addScaledVector(_up, 0.18).normalize();
-    const origin = _pos.clone().addScaledVector(_dir, 0.05);
+    // The top-attack launcher needs an aim point: its arc is scripted from the muzzle to that point
+    // (ProjectileSystem → LoftPath); with nothing under the crosshair it flies straight.
     const tracer = !!ammo.tracer || (w.tracerEvery > 0 && ++this.tracerCount % w.tracerEvery === 0);
-    const opts = { ammo, origin, velocity: _dir.clone().multiplyScalar(ammo.muzzleVelocity), tracer, target: this.aimPoint?.clone() };
+    const opts = this.spawnOpts;
+    opts.ammo = ammo;
+    opts.origin.copy(_pos).addScaledVector(_dir, 0.05);
+    opts.velocity.copy(_dir).multiplyScalar(ammo.muzzleVelocity);
+    opts.tracer = tracer;
+    opts.target = this.aimPoint ? this.spawnTarget.copy(this.aimPoint) : undefined;
+    const t = this.ctx.time.now - this.stepDt + delay;
     const ps = this.projectileSystem();
-    if (ps) ps.spawnDelayed(opts, delay);
-    else this.ctx.projectiles.spawn(opts);
+    if (ps) ps.spawnAt(opts, t);
+    else this.ctx.projectiles.spawn({ ...opts, origin: opts.origin.clone(), velocity: opts.velocity.clone(), target: opts.target?.clone() });
     this.roundsFired++;
-    this.ctx.events.emit('shot', { time: this.ctx.time.now + delay, weapon: w as WeaponSpec, ammo, origin: this.muzzle(), direction: _dir.clone() });
+    this.ctx.events.emit('shot', { time: t, weapon: w as WeaponSpec, ammo, origin: this.muzzle(), direction: _dir.clone() });
   }
 
   private muzzle(): THREE.Vector3 {
@@ -280,13 +298,14 @@ export class WeaponController implements WeaponControllerApi, System {
     const now = this.ctx.time.now;
     const left: typeof this.fuses = [];
     for (const f of this.fuses) {
-      if (f.time <= now) this.fire(f.charge);
+      if (f.time <= now) this.fire(f.charge, Math.max(f.time, now - this.stepDt));
       else left.push(f);
     }
     this.fuses = left;
   }
 
-  private fire(c: PlacedCharge): void {
+  /** Fire one placed charge; `time` is when its detonator fired (inside the current step). */
+  private fire(c: PlacedCharge, time: number): void {
     const { event, ammo } = c;
     const ps = this.projectileSystem();
     if (ammo.linearCut && ps) {
@@ -298,14 +317,15 @@ export class WeaponController implements WeaponControllerApi, System {
       for (let i = 0; i < count; i++) {
         const s = (i / (count - 1) - 0.5) * L;
         const o = event.position.clone().addScaledVector(c.along, s).addScaledVector(n, 0.02);
-        ps.jet(ammo, ammo.linearCut.depthRHA, ammo.heatConeDiameter ?? 0.02, o, inward, 'cutting jet', 0.15);
+        ps.jet(ammo, ammo.linearCut.depthRHA, ammo.heatConeDiameter ?? 0.02, o, inward, 'cutting jet', 0.15, time);
       }
     }
     if ((ammo.explosiveTNT ?? 0) > 0) {
-      this.ctx.blasts.detonate({
+      const req: ExtendedBlastRequest = {
         center: event.position.clone(), tntKg: ammo.explosiveTNT!, kind: ammo.linearCut ? 'shaped' : 'contact', normal: event.normal.clone(),
-        contactTargetId: c.target?.id, source: ammo, label: ammo.name,
-      });
+        contactTargetId: c.target?.id, source: ammo, label: ammo.name, time,
+      };
+      this.ctx.blasts.detonate(req);
     }
     this.chargeEvents = this.chargeEvents.filter((e) => e.id !== event.id);
     this.ctx.events.emit('chargeRemoved', { id: event.id });

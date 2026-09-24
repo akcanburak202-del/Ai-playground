@@ -14,6 +14,7 @@ import { createBlastLoad } from '../src/physics/ballistics/blast.ts';
 import { MATERIALS } from '../src/physics/materials.ts';
 
 type Ctx = SimContext & { step(dt?: number): void; shatters: number; shatterArea: number };
+const _p = new THREE.Vector3();
 
 /** Headless context: real Rapier world with a ground slab (top at y = 0), no renderer. */
 async function makeCtx(): Promise<Ctx> {
@@ -89,7 +90,7 @@ test('tempered pane: one rifle round dices the whole pane, front first, then the
   assert.ok(shoot(ctx, p, 'm855', from, new THREE.Vector3(0.4, 1.8, 0)));
   assert.ok(p.hasFailed(), 'pane failed');
   assert.equal(ctx.shatters, 1);
-  // The dice are spawned over a few frames (≤ ~8 ms each).
+  // The dice are spawned over a few fixed steps (≤ ~5 ms each).
   for (let k = 0; k < 20; k++) ctx.step(1 / 240);
   assert.ok(Math.abs(ctx.shatterArea - 9) < 1e-9);
   // ~8 mm dice, capped to 20 000 clusters for a 9 m² pane.
@@ -161,9 +162,12 @@ test('laminated pane: holds together, sags with damage, tears out when heavily b
   // 10 kg at 1.2 m: beyond it — the sheet tears out of the frame.
   p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.2, 1.2), tntKg: 10, kind: 'he' }, ctx.time.now));
   assert.ok(p.hasFailed(), 'torn out of the frame');
+  // The torn-out sheet falls and comes to rest on the floor (y ≥ 0), in one piece.
   for (let k = 0; k < 180; k++) ctx.step(1 / 60);
-  const box = new THREE.Box3().setFromObject(p.root);
-  void box;
+  const m = (p as unknown as { membrane: { x: Float64Array; n: number } }).membrane;
+  let minY = Infinity;
+  for (let k = 0; k < m.n; k++) minY = Math.min(minY, _p.set(m.x[3 * k]!, m.x[3 * k + 1]!, m.x[3 * k + 2]!).applyMatrix4(p.root.matrixWorld).y);
+  assert.ok(minY > -0.02 && minY < 0.1, `sheet rests on the floor: lowest point ${minY.toFixed(3)} m`);
   p.dispose();
 });
 
@@ -192,9 +196,13 @@ test('P–I hookup: panes fail at the distance the pressure–impulse curve says
   const Rt = lo;
   assert.ok(Rt < Ra, `tempered fails closer (${Rt.toFixed(1)} m) than annealed (${Ra.toFixed(1)} m)`);
   for (const [type, R] of [['annealed', Ra], ['tempered', Rt]] as const) {
+    // Each blast in its own step: panes share a per-step budget for blast fracture work (blasts past
+    // it are deferred to the next steps), and these assertions are about the P–I hookup only.
+    ctx.time.now += 1 / 60;
     const near = pane(ctx, type, { position: [0, 10, 0] });
     near.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 10, 0.75 * R), tntKg: 1, kind: 'he' }, ctx.time.now));
     assert.ok(near.remaining() < 0.9, `${type} at 0.75 R_fail breaks (remaining ${near.remaining().toFixed(2)})`);
+    ctx.time.now += 1 / 60;
     const far = pane(ctx, type, { position: [0, 10, 0] });
     far.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 10, 1.5 * R), tntKg: 1, kind: 'he' }, ctx.time.now));
     assert.equal(far.remaining(), 1, `${type} at 1.5 R_fail survives`);
@@ -208,11 +216,11 @@ test('blast throws annealed shards away from the charge at the impulse–momentu
   const p = pane(ctx, 'annealed', { position: [0, 1.5, 0] });
   p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.5, 4), tntKg: 2, kind: 'he' }, 0));
   assert.ok(p.remaining() < 0.1, `remaining ${p.remaining()}`);
-  assert.ok(p.stats.shards > 10, `shards ${p.stats.shards}`);
-  // After 0.1 s the fragments have moved towards −z (away from the charge at z = +4).
+  // Pieces are spawned over the next steps (bounded cost per step); after 0.12 s they have moved
+  // towards −z, away from the charge at z = +4.
   let moved = 0;
-  ctx.step(1 / 60);
-  for (let k = 0; k < 6; k++) ctx.step(1 / 60);
+  for (let k = 0; k < 7; k++) ctx.step(1 / 60);
+  assert.ok(p.stats.shards > 10, `shards ${p.stats.shards}`);
   ctx.physics.world.forEachRigidBody((b) => {
     if (b.isDynamic() && b.translation().z < -0.3) moved++;
   });
@@ -226,10 +234,26 @@ test('blast throws annealed shards away from the charge at the impulse–momentu
   p.dispose();
 });
 
+test('a blast along a curtain wall: every pane it reaches breaks, the work spread over a few steps', async () => {
+  const ctx = await makeCtx();
+  const panes = [0, 1, 2, 3, 4, 5].map((k) =>
+    pane(ctx, k % 2 ? 'annealed' : 'laminated', { name: `bay ${k}`, position: [(k - 2.5) * 1.6, 1.5, 0] }),
+  );
+  const load = createBlastLoad({ center: new THREE.Vector3(0, 1.5, 2.5), tntKg: 8, kind: 'he' }, ctx.time.now);
+  for (const p of panes) p.applyBlast(load);
+  for (let k = 0; k < 6; k++) ctx.step(1 / 240);
+  for (const p of panes) {
+    if (p.type === 'annealed') assert.ok(p.remaining() < 0.5, `annealed ${p.name} broke: remaining ${p.remaining().toFixed(2)}`);
+    else assert.ok(p.laminatedDamage > 0.3, `laminated ${p.name} crazed: damage ${p.laminatedDamage.toFixed(2)}`);
+  }
+  for (const p of panes) p.dispose();
+});
+
 test('dispose frees bodies and leaves the registry clean', async () => {
   const ctx = await makeCtx();
   const p = pane(ctx, 'annealed');
   p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.5, 3), tntKg: 2, kind: 'he' }, 0));
+  for (let k = 0; k < 10; k++) ctx.step(1 / 60);
   const before = ctx.physics.dynamicCount;
   assert.ok(before > 0);
   p.dispose();

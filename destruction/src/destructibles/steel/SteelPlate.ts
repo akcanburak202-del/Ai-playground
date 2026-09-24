@@ -405,7 +405,8 @@ export class SteelPlate implements Destructible, Structural {
       const nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
       const th = s.tThick[t]! * this.thickness;
       const eq = s.eqStrain(t);
-      for (const i of [a, b, c]) {
+      for (let q = 0; q < 3; q++) {
+        const i = q === 0 ? a : q === 1 ? b : c;
         N[3 * i] = N[3 * i]! + nx;
         N[3 * i + 1] = N[3 * i + 1]! + ny;
         N[3 * i + 2] = N[3 * i + 2]! + nz;
@@ -469,11 +470,9 @@ export class SteelPlate implements Destructible, Structural {
       ry /= rl;
       rz /= rl;
       const base = this.rimBase + 4 * r;
-      const corners = [i, j, j, i];
-      const top = [true, true, false, false];
       for (let q = 0; q < 4; q++) {
-        const p = corners[q]!, vtx = base + q;
-        const src = top[q] ? p : o + p;
+        const p = q === 0 || q === 3 ? i : j, vtx = base + q;
+        const src = q < 2 ? p : o + p;
         pos[3 * vtx] = pos[3 * src]!;
         pos[3 * vtx + 1] = pos[3 * src + 1]!;
         pos[3 * vtx + 2] = pos[3 * src + 2]!;
@@ -553,7 +552,10 @@ export class SteelPlate implements Destructible, Structural {
       const a = 3 * s.tv[3 * t]!, b = 3 * s.tv[3 * t + 1]!, c = 3 * s.tv[3 * t + 2]!;
       const cx = (x[a]! + x[b]! + x[c]!) / 3, cy = (x[a + 1]! + x[b + 1]! + x[c + 1]!) / 3, cz = (x[a + 2]! + x[b + 2]! + x[c + 2]!) / 3;
       let r2 = 0;
-      for (const p of [a, b, c]) r2 = Math.max(r2, (x[p]! - cx) ** 2 + (x[p + 1]! - cy) ** 2 + (x[p + 2]! - cz) ** 2);
+      for (let q = 0; q < 3; q++) {
+        const p = q === 0 ? a : q === 1 ? b : c;
+        r2 = Math.max(r2, (x[p]! - cx) ** 2 + (x[p + 1]! - cy) ** 2 + (x[p + 2]! - cz) ** 2);
+      }
       sp[4 * t] = cx;
       sp[4 * t + 1] = cy;
       sp[4 * t + 2] = cz;
@@ -810,6 +812,22 @@ export class SteelPlate implements Destructible, Structural {
       }
     }
 
+    // Rear-face spall the resolver reported (a hard hit on a thick plate that did not go through, or
+    // a wide flake around an exit): a flat fracture scab, the material gone with it.
+    if (e.spallRadius > 0 && e.spallDepth > 0) {
+      const rs = e.spallRadius;
+      this.detail.scab(uExit, vv, ru(rs), rv(rs), Math.min(1, e.spallDepth / this.thickness), seed + 5);
+      if (e.outcome !== 'perforate' && rs > 0.5 * s.spacing) {
+        const frac = Math.min(0.6, e.spallDepth / Math.max(tEff, 1e-4));
+        for (let t = 0; t < s.nt; t++) {
+          if (!s.talive[t]) continue;
+          const [tu, tv] = s.centroidUV(t);
+          const q = ((tu - c.u) ** 2 + (tv - c.v) ** 2) / (rs * rs);
+          if (q < 1) s.removeMaterial(t, frac * (1 - 0.5 * q));
+        }
+      }
+    }
+
     // Structural response: the momentum (normal component) as a Gaussian load over ~2–3 calibres.
     const nL = c.normal;
     const pLocal = _v.copy(e.momentum).transformDirection(this.invPivot).multiplyScalar(Pmag);
@@ -964,7 +982,7 @@ export class SteelPlate implements Destructible, Structural {
       Jtot += Ji;
     }
     // Never more momentum than the charge's products can deliver (maxBlastMomentum).
-    const Jcap = maxBlastMomentum(load.tntKg);
+    const Jcap = maxBlastMomentum(load.tntKg, load.kind);
     if (Jtot > Jcap) {
       const k = Jcap / Jtot;
       for (let q = 0; q < J.length; q++) J[q] = J[q]! * k;

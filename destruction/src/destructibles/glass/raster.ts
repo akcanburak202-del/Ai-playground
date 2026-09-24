@@ -128,16 +128,35 @@ export class CrackRaster {
     if (ang >= Math.PI) ang -= Math.PI;
     const aByte = Math.min(255, Math.round((ang / Math.PI) * 255));
     const d = this.data;
-    this.capsule(x0, y0, x1, y1, hw + 0.5, (k, dist) => {
-      const cov = hw + 0.5 - dist;
-      if (cov <= 0) return;
-      const v = Math.round(255 * I * (cov > 1 ? 1 : cov));
-      const q = 4 * k;
-      if (v > d[q]!) {
-        d[q] = v > 255 ? 255 : v;
-        d[q + 3] = aByte;
+    // Same walk as capsule(), inlined: this is the hot path (thousands of crack segments per blast).
+    const r = hw + 0.5;
+    const dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;
+    const steep = Math.abs(dy) > Math.abs(dx);
+    const a0 = steep ? y0 : x0, a1 = steep ? y1 : x1, b0 = steep ? x0 : y0, b1 = steep ? x1 : y1;
+    const na = steep ? this.h : this.w, nb = steep ? this.w : this.h;
+    const lo = Math.max(0, Math.floor(Math.min(a0, a1) - r - 1)), hi = Math.min(na - 1, Math.ceil(Math.max(a0, a1) + r + 1));
+    const slope = a1 !== a0 ? (b1 - b0) / (a1 - a0) : 0;
+    const span = r * Math.sqrt(1 + slope * slope) + 1;
+    const W = this.w;
+    for (let A = lo; A <= hi; A++) {
+      const t0 = a1 !== a0 ? Math.min(1, Math.max(0, (A - a0) / (a1 - a0))) : 0;
+      const bc = b0 + t0 * (b1 - b0);
+      const blo = Math.max(0, Math.floor(bc - span - r)), bhi = Math.min(nb - 1, Math.ceil(bc + span + r));
+      for (let B = blo; B <= bhi; B++) {
+        const i = steep ? B : A, j = steep ? A : B;
+        let u = l2 > 0 ? ((i - x0) * dx + (j - y0) * dy) / l2 : 0;
+        u = u < 0 ? 0 : u > 1 ? 1 : u;
+        const ex = x0 + u * dx - i, ey = y0 + u * dy - j;
+        const cov = r - Math.sqrt(ex * ex + ey * ey);
+        if (cov <= 0) continue;
+        const v = (255 * I * (cov > 1 ? 1 : cov) + 0.5) | 0;
+        const q = 4 * (j * W + i);
+        if (v > d[q]!) {
+          d[q] = v > 255 ? 255 : v;
+          d[q + 3] = aByte;
+        }
       }
-    });
+    }
     this.touch(Math.max(0, Math.floor(Math.min(x0, x1) - hw - 1)), Math.max(0, Math.floor(Math.min(y0, y1) - hw - 1)), Math.min(this.w - 1, Math.ceil(Math.max(x0, x1) + hw + 1)), Math.min(this.h - 1, Math.ceil(Math.max(y0, y1) + hw + 1)));
   }
 
@@ -236,10 +255,11 @@ export class CrackRaster {
   /** Fill the whole pane channel (a pane that has gone completely). */
   fillAll(channel: 1 | 2, value = 255): void {
     // One 32-bit write per texel (little-endian: byte `channel` = bits 8·channel…).
-    const d32 = new Uint32Array(this.data.buffer, this.data.byteOffset, this.data.length >> 2);
+    // Int32 view and int32-only bit operations: no values ≥ 2³¹ that the engine would box.
+    const d32 = new Int32Array(this.data.buffer, this.data.byteOffset, this.data.length >> 2);
     const shift = 8 * channel;
-    const mask = ~(0xff << shift) >>> 0, bits = (value & 0xff) << shift;
-    for (let k = 0; k < d32.length; k++) d32[k] = ((d32[k]! & mask) | bits) >>> 0;
+    const mask = ~(0xff << shift), bits = (value & 0xff) << shift;
+    for (let k = 0; k < d32.length; k++) d32[k] = (d32[k]! & mask) | bits;
     this.touch(0, 0, this.w - 1, this.h - 1);
   }
 }

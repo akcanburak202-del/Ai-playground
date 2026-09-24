@@ -72,14 +72,25 @@ function evalFit(f: Fit, Z: number): number {
   return Math.exp(poly(last.c, Math.log(Z)));
 }
 
+/**
+ * Normal reflection of a weak shock in air (Rankine–Hugoniot, γ = 1.4):
+ * P_r = 2 P_s (7 P_0 + 4 P_s) / (7 P_0 + P_s). Tends to the acoustic 2 P_s.
+ */
+export function rankineHugoniotReflection(ps: number, p0 = 101_325): number {
+  return (2 * ps * (7 * p0 + 4 * ps)) / (7 * p0 + ps);
+}
+
+/** Largest Z covered by the reflected-pressure fit; beyond it P_r follows from P_s by Rankine–Hugoniot. */
+const PR_ZMAX = 40;
+
 /** Kingery–Bulmash hemispherical burst quantities at scaled distance Z (m/kg^⅓). SI output. */
 export const KB = {
   /** Peak incident overpressure, Pa */
   incidentPressure: (Z: number) => evalFit(PS, Z) * 1e3,
   /** Scaled incident impulse, Pa·s / kg^⅓ */
   incidentImpulse: (Z: number) => evalFit(IS, Z) * 1e3 * 1e-3,
-  /** Peak normally reflected overpressure, Pa */
-  reflectedPressure: (Z: number) => evalFit(PR, Z) * 1e3,
+  /** Peak normally reflected overpressure, Pa (past the fit's range: Rankine–Hugoniot on P_s) */
+  reflectedPressure: (Z: number) => (Z > PR_ZMAX ? rankineHugoniotReflection(evalFit(PS, Z) * 1e3) : evalFit(PR, Z) * 1e3),
   /** Scaled normally reflected impulse, Pa·s / kg^⅓ */
   reflectedImpulse: (Z: number) => evalFit(IR, Z) * 1e3 * 1e-3,
   /** Scaled arrival time, s / kg^⅓ */
@@ -150,9 +161,11 @@ export function obliqueReflection(incident: number, reflected: number, cosA: num
 
 /** Radius at which peak incident overpressure falls to `pa` Pascals, m (bisection on the fit). */
 export function rangeForOverpressure(W: number, pa: number): number {
+  // Bisection in scaled distance Z (m/kg^⅓) between 0.05 and 400, then R = Z W^⅓.
   let lo = 0.05, hi = 400;
   const w3 = Math.cbrt(Math.max(W, 1e-9));
-  if (KB.incidentPressure(hi / w3) > pa) return hi * w3;
+  if (KB.incidentPressure(hi) > pa) return hi * w3;
+  if (KB.incidentPressure(lo) <= pa) return lo * w3;
   for (let i = 0; i < 50; i++) {
     const mid = Math.sqrt(lo * hi);
     if (KB.incidentPressure(mid) > pa) lo = mid;
@@ -172,9 +185,18 @@ export function fireballRadius(tntKg: number, thermobaric: boolean): number {
 // ─── Contact charges ────────────────────────────────────────────────────────────────────────
 
 /**
+ * Fraction of a shaped-charge warhead's fill that loads the struck face like a contact charge.
+ * Estimate, not a published constant: the charge detonates at ≈1–3 cone diameters stand-off and a
+ * large share of its energy goes into the liner (jet + slug). Chosen so that an RPG-7 HEAT hit on
+ * a C40 wall leaves the ≈20–40 cm entry crater seen in open-source photographs rather than the
+ * ≈65 cm crater of a 1.2 kg TNT charge in contact.
+ */
+export const SHAPED_CONTACT_COUPLING = 0.25;
+
+/**
  * Damage directly under a contact / near-contact charge.
  *
- * Concrete & stone (McVay 1988, WES TR SL-88-1; UFC 3-340-02 §4-26 spall & breach thresholds;
+ * Concrete & stone (McVay 1988, "Spall damage of concrete structures", USAE WES TR SL-88-22; UFC 3-340-02 spall & breach thresholds;
  * Morishita et al. 2004 contact-detonation tests): with scaled thickness T* = T / W^⅓ (m/kg^⅓),
  * breach for T* < 0.18 and rear spall for T* < 0.33 (normal-strength concrete; thresholds scale
  * with (f_c/40 MPa)^−0.25 so weaker material fails at larger T*). Front crater radius ≈0.30 W^⅓,
@@ -182,12 +204,36 @@ export function fireballRadius(tntKg: number, thermobaric: boolean): number {
  *
  * Steel: a contact charge holes a plate thinner than ≈0.020 W^⅓ (mild steel; ∝ √(σ_u/510 MPa)) —
  * from the FM 5-250 steel-cutting rule P = 3/8 A applied to the charge perimeter; HESH / contact
- * scabbing of the rear face for t < 0.09 W^⅓ × √(σ_u/1100 MPa) (≈1.3 calibres for a 120 mm HESH).
+ * scabbing of the rear face for t < 0.09 W^⅓ × √(σ_u/1100 MPa) (≈1.3 calibres for a 120 mm HESH),
+ * scab ≈ the squashed-charge footprint (HESH ≈ 2–2.5 calibres across), none once the plate is holed.
  *
  * Soil: crater radius ≈0.4 W^⅓, depth ≈0.2 W^⅓ (Cooper, "Explosives Engineering", 1996, dry soil).
+ *
+ * Shaped-charge warheads ('shaped': HEAT rounds, linear cutters) sit at stand-off behind their
+ * liner and put most of their energy into the jet, so only `SHAPED_CONTACT_COUPLING` of the fill
+ * acts as a contact charge on the struck face (game-level estimate, see PHYSICS.md; the jet itself
+ * is resolved separately by the terminal-ballistics module).
  */
+/**
+ * Permanent dish of a steel plate under a contact charge, m. Nurick & Martin (1989, Int. J. Impact
+ * Eng. 8) for clamped circular plates under localised impulse: δ/t = 0.480 φ + 0.277 with
+ * φ = I (1 + ln(R/r0)) / (π R t² √(ρ σ_y)); below φ = 1 the plate barely yields, so δ/t falls
+ * linearly to 0. Impulse delivered I ≈ 1 000 N·s per kg TNT (half the momentum (8/27) W D of a slab
+ * charge detonating against a rigid wall, D = 6.9 km/s; the rest leaves sideways from a compact
+ * charge). Plate radius R = 1 m, charge radius r0 = 0.053 W^⅓ (a TNT sphere).
+ */
+export function contactDish(W: number, material: MaterialProps, thickness: number): number {
+  const t = Math.max(thickness, 1e-3);
+  const sy = material.yieldStrength ?? material.compressiveStrength;
+  const I = 1000 * W;
+  const R = 1, r0 = Math.min(0.5, 0.053 * Math.cbrt(Math.max(W, 1e-6)));
+  const phi = (I * (1 + Math.log(R / r0))) / (Math.PI * R * t * t * Math.sqrt(material.density * sy));
+  const dt = phi >= 1 ? 0.48 * phi + 0.277 : 0.757 * phi;
+  return Math.min(t * dt, 0.3);
+}
+
 export function contactDamage(tntKg: number, kind: BlastRequest['kind'], material: MaterialProps, thickness: number, tamping = 1): ContactDamage {
-  const W = Math.max(tntKg, 0) * tamping;
+  const W = Math.max(tntKg, 0) * tamping * (kind === 'shaped' ? SHAPED_CONTACT_COUPLING : 1);
   const w3 = Math.cbrt(W);
   const out: ContactDamage = { craterRadius: 0, craterDepth: 0, breach: false, breachRadius: 0, spallRadius: 0, spallDepth: 0, spallVelocity: 0 };
   if (W <= 0) return out;
@@ -217,14 +263,16 @@ export function contactDamage(tntKg: number, kind: BlastRequest['kind'], materia
       const tb = 0.020 * w3 * Math.sqrt(510e6 / su) * (hesh ? 0.5 : 1);
       const ts = 0.09 * w3 * Math.sqrt(1100e6 / su) * (hesh ? 1 : 0.6);
       out.craterRadius = 0.12 * w3; // dished zone under the charge
-      out.craterDepth = Math.min(0.5 * thickness + 0.02 * w3, 0.05 * w3 + thickness);
+      out.craterDepth = contactDish(W, material, thickness);
       if (thickness < tb) {
         out.breach = true;
         out.breachRadius = 0.08 * w3 * Math.sqrt(1 - thickness / tb) + 0.02 * w3;
       }
-      if (thickness < ts) {
+      if (thickness < ts && !out.breach) {
+        // Rear scab about the size of the squashed charge (HESH: ≈ 2–2.5 calibres, i.e. 0.13 W^⅓
+        // across for a 120 mm round), a quarter to a half of the plate thick.
         const f = 1 - thickness / ts;
-        out.spallRadius = (hesh ? 0.5 : 0.3) * w3 * (0.5 + 0.5 * f);
+        out.spallRadius = (hesh ? 0.065 : 0.05) * w3 * (1 + f);
         out.spallDepth = Math.min(thickness, thickness * (0.25 + 0.25 * f));
         out.spallVelocity = clamp((hesh ? 150 : 80) * (0.5 + f), 30, 250);
       }
@@ -264,14 +312,30 @@ export function piScale(P: number, I: number, P0: number, I0: number, psi = 0.3)
 
 interface PIParams { P0: number; I0: number; P0b: number; I0b: number }
 
+/** Span of the wall / slab strip assumed by the brittle-member P–I model, m (a storey-height panel). */
+export const PI_WALL_SPAN = 3;
+
 /**
  * P–I asymptotes for a member of `thickness` made of `material`: [onset of damage] and [severe /
- * breach]. Glass: ASTM E1300 load resistance of a 6 mm annealed 1.5 × 1 m pane ≈ 2.3 kPa (3-s) ≈
- * 4.5 kPa dynamic, ∝ t², ×4 tempered (glass-type factor), impulse asymptote I0 = 2 P0/ω with
- * ω = 2π·21 Hz. RC: cracking at M_cr = f_ct h²/6 over a ~3 m span (≈10 kPa for 0.2 m) and severe
- * damage ≈20× cracking pressure, I0b ≈ 4 kPa·s for 0.2 m (PDC-TR 06-08 response limits). Masonry
- * and stone use the same form scaled by tensile strength. Steel plates: yield-line capacity
- * 6 σ_y t² / a² (a ≈ 1 m) and the Nurick–Martin impulse φ = I R / (t² √(ρ σ_y)) ≈ 1.5 (onset) / 25 (tearing).
+ * breach].
+ *
+ * Glass: ASTM E1300 load resistance of a 6 mm annealed 1.5 × 1 m pane ≈ 2.3 kPa (3-s) ≈ 4.5 kPa
+ * dynamic, ∝ t², ×4 tempered (glass-type factor), impulse asymptote I0 = 2 P0/ω with ω = 2π·21 Hz
+ * (first mode of that simply supported pane).
+ *
+ * Brittle walls and slabs (concrete, stone, brick): a one-way strip of span L = 3 m as an elastic
+ * single-degree-of-freedom system (Biggs 1964, "Introduction to Structural Dynamics"; the SDOF
+ * basis of PDC-TR 06-08). Cracking resistance R_cr = 8 M_cr / L² with M_cr = f_t h²/6, stiffness
+ * k = 384 E I / (5 L⁴), I = h³/12, mass m = ρ h, load–mass factor K_LM = 0.78. Onset of cracking is
+ * the elastic response reaching R_cr: quasi-static asymptote P0 = R_cr / 2 (dynamic load factor
+ * 2), impulsive asymptote I0 = x_cr √(K_LM m k), x_cr = R_cr / k. (For a 0.25 m C40 wall:
+ * 16 kPa, 107 Pa·s.) Severe damage / local breach is placed at P0b = 20 P0, I0b = 48 I0 for
+ * reinforced concrete (≈ 320 kPa and ≈ 5 kPa·s for 0.25 m — heavier than the global-flexure
+ * "heavy damage" limit of PDC-TR 06-08 because the element realises it as a local breach) and at
+ * half those ratios for unreinforced masonry and stone, whose post-cracking capacity is small.
+ *
+ * Steel plates: yield-line capacity 6 σ_y t² / a² (a ≈ 1 m) and the Nurick–Martin damage number
+ * φ = I R / (t² √(ρ σ_y)) ≈ 1.5 (onset of permanent deflection) / 25 (tearing).
  */
 function piParams(m: MaterialProps, t: number): PIParams {
   const th = Math.max(t, 1e-3);
@@ -292,12 +356,16 @@ function piParams(m: MaterialProps, t: number): PIParams {
     case 'soil':
       return { P0: 2e6, I0: 5e3, P0b: 1e7, I0b: 5e4 };
     default: {
-      const ft = m.tensileStrength / 3.5e6;
-      const r = th / 0.2;
-      const P0 = 10e3 * ft * r * r;
-      const I0 = 83 * ft * r;
-      const brick = m.id === 'brick' ? 0.5 : 1;
-      return { P0, I0, P0b: 200e3 * ft * r * r * brick, I0b: 4000 * ft * r * brick };
+      const L = PI_WALL_SPAN;
+      const Rcr = (8 * (m.tensileStrength * th * th) / 6) / (L * L);
+      const k = (384 * m.youngModulus * (th * th * th) / 12) / (5 * L ** 4);
+      const mass = m.density * th;
+      const xcr = Rcr / k;
+      const P0 = Rcr / 2;
+      const I0 = xcr * Math.sqrt(0.78 * mass * k);
+      const reinforced = m.id === 'concrete' || m.id === 'concrete_hs';
+      const aP = reinforced ? 20 : 10, aI = reinforced ? 48 : 24;
+      return { P0, I0, P0b: P0 * aP, I0b: I0 * aI };
     }
   }
 }

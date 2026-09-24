@@ -24,13 +24,19 @@ export class Chips {
   private head = 0;
   private dirty0 = -1;
   private dirty1 = -1;
+  /** Slots written since the GPU last received them (see ParticleLayer.flush) */
+  private pend0 = -1;
+  private pend1 = -1;
   private lastDeath = -Infinity;
   emitted = 0;
 
   constructor(atmo: Atmosphere, capacity: number) {
     this.capacity = capacity;
     // An irregular faceted pebble (icosahedron with jittered vertices, flat shading).
-    const ico = new THREE.IcosahedronGeometry(0.5, 0).toNonIndexed();
+    const src = new THREE.IcosahedronGeometry(0.5, 0);
+    // Polyhedra are already non-indexed in current three.js (flat facets need split vertices).
+    const ico = src.index ? src.toNonIndexed() : src;
+    if (ico !== src) src.dispose();
     const p = ico.getAttribute('position') as THREE.BufferAttribute;
     const jitter = new Map<string, number>();
     for (let i = 0; i < p.count; i++) {
@@ -65,6 +71,9 @@ export class Chips {
     g.setAttribute('c3', this.c3);
     g.setAttribute('color', this.col);
     g.instanceCount = capacity;
+    this.c0.onUpload(() => {
+      this.pend0 = this.pend1 = -1;
+    });
     ico.dispose();
     this.geometry = g;
 
@@ -102,13 +111,21 @@ export class Chips {
           vec3 chipPos = motionBounce(c0.xyz, c1.xyz, c2.x, c2.y, uWind * 0.3, max(chipAge, 0.0), c2.z, c2.w, chipVel, chipRest);
           float chipFade = 1.0 - smoothstep(0.85, 1.0, chipAge / max(c1.w, 1e-3));
           vec3 transformed = chipAlive ? chipPos + chipR * (position * chipScale * chipFade) : vec3(0.0, -1e5, 0.0);
-          vChipKind = c3.w;`);
+          vChipKind = c3.w;`)
+        .replace('#include <shadowmap_vertex>', `#include <shadowmap_vertex>
+          #if defined( USE_SHADOWMAP ) && NUM_SUN_LIGHT_SHADOWS > 0
+            // A chip is far smaller than a shadow texel of the ground it rests on: shade it as a
+            // point a little above its centre, or the ground's own depth darkens its sun-facing
+            // facets (resting granite chips rendered as black pepper).
+            vSunShadowWorldPosition.xyz = chipPos + vec3(0.0, 0.12, 0.0);
+            vSunShadowWorldNormal = vec3(0.0);
+          #endif`);
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>', '#include <common>\nvarying float vChipKind;')
         .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = vChipKind < 0.5 ? 0.92 : (vChipKind < 1.5 ? 0.06 : 0.38);')
         .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = vChipKind > 1.5 ? 1.0 : 0.0;');
     };
-    m.customProgramCacheKey = () => 'fx-chips-v1';
+    m.customProgramCacheKey = () => 'fx-chips-v2';
     this.material = m;
     this.mesh = new THREE.Mesh(g, m);
     this.mesh.name = 'fx-chips';
@@ -144,27 +161,35 @@ export class Chips {
     this.mesh.visible = true;
   }
 
+  /** Queue new chips for the GPU: the union of everything written since the last upload. */
   flush(now: number): void {
     if (this.dirty0 >= 0) {
-      const n = this.dirty1 - this.dirty0 + 1;
-      for (const a of [this.c0, this.c1, this.c2, this.c3]) {
-        a.clearUpdateRanges();
-        a.addUpdateRange(this.dirty0 * 4, n * 4);
-        a.needsUpdate = true;
-      }
-      this.col.clearUpdateRanges();
-      this.col.addUpdateRange(this.dirty0 * 3, n * 3);
-      this.col.needsUpdate = true;
+      this.pend0 = this.pend0 < 0 ? this.dirty0 : Math.min(this.pend0, this.dirty0);
+      this.pend1 = Math.max(this.pend1, this.dirty1);
+      this.queue(this.pend0, this.pend1 - this.pend0 + 1);
       this.dirty0 = this.dirty1 = -1;
     }
     this.mesh.visible = now <= this.lastDeath;
   }
 
+  private queue(first: number, n: number): void {
+    for (const a of [this.c0, this.c1, this.c2, this.c3]) {
+      a.clearUpdateRanges();
+      a.addUpdateRange(first * 4, n * 4);
+      a.needsUpdate = true;
+    }
+    this.col.clearUpdateRanges();
+    this.col.addUpdateRange(first * 3, n * 3);
+    this.col.needsUpdate = true;
+  }
+
   clear(): void {
     const a0 = this.c0.array as Float32Array;
     for (let i = 0; i < this.capacity; i++) a0[i * 4 + 3] = 1e9;
-    this.c0.clearUpdateRanges();
-    this.c0.needsUpdate = true;
+    this.pend0 = 0;
+    this.pend1 = this.capacity - 1;
+    this.queue(0, this.capacity);
+    this.dirty0 = this.dirty1 = -1;
     this.lastDeath = -Infinity;
     this.mesh.visible = false;
   }

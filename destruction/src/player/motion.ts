@@ -50,6 +50,37 @@ export class RecoilSpring {
   }
 }
 
+/**
+ * A shooter holding an automatic weapon on target. Every round kicks the muzzle up; under a
+ * sustained burst the kicks add up to a steady climb (the mean of the recoil spring), which a
+ * trained shooter pulls back down within a few rounds while each round's jump stays. The hold
+ * tracks the spring's displacement with a time constant of ≈ 0.35 s while firing; when the burst
+ * ends it is handed to the spring (its rest point moves by the same amount), so the view neither
+ * jumps nor dips below the aim.
+ */
+export class AimHold {
+  offset = 0;
+  tau: number;
+
+  constructor(tau = 0.35) {
+    this.tau = tau;
+  }
+
+  /** Call after `spring.update(dt)`; returns the displacement the view shows (spring minus hold). */
+  update(spring: RecoilSpring, dt: number, firing: boolean): number {
+    if (firing) this.offset = approach(this.offset, spring.x, dt, this.tau);
+    else if (this.offset !== 0) {
+      spring.x -= this.offset;
+      this.offset = 0;
+    }
+    return spring.x - this.offset;
+  }
+
+  reset(): void {
+    this.offset = 0;
+  }
+}
+
 /** Vertical field of view (degrees) through a sight of magnification `zoom`: tan(φ/2) scales by 1/zoom. */
 export function fovForZoom(baseFovDeg: number, zoom: number): number {
   const z = Math.max(1, zoom);
@@ -70,11 +101,12 @@ export function rampTimeScale(current: number, target: number, realDt: number, t
 
 /**
  * Worth following with the bullet camera: rockets, missiles, grenades, tank rounds, shells and
- * bombs — heavy or slow enough for the eye; not bullets, not fragments.
+ * bombs — heavy or slow enough for the eye; not bullets (not even one slowed by a perforation
+ * or a ricochet), not fragments.
  */
 export function isFollowable(ammo: AmmoSpec, speed: number): boolean {
   if (ammo.kind === 'fragment') return false;
-  return ammo.mass >= 1 || !!ammo.rocket || !!ammo.guidance || speed < 400;
+  return ammo.mass >= 1 || !!ammo.rocket || !!ammo.guidance || (speed < 400 && ammo.mass >= 0.1);
 }
 
 /** Wrap an angle to (−π, π]. */

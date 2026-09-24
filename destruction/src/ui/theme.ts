@@ -131,12 +131,12 @@ const CSS = /* css */ `
 .dx-row::before { content: ''; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; background: var(--rule); }
 .dx-row.dx-new::before { background: var(--amber); }
 .dx-row.dx-new { color: var(--ink); }
-.dx-row.dx-flash { animation: dx-flash 0.45s ease-out; }
-@keyframes dx-flash { from { background: rgba(255, 181, 71, 0.2); } to { background: transparent; } }
 .dx-row.dx-new .dx-v { color: var(--amber); }
 .dx-row-1 { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .dx-row-1 .dx-ammo { font-family: var(--f-label); font-weight: 600; font-size: 12px; letter-spacing: 0.02em; white-space: nowrap; }
 .dx-row-1 .dx-mat { font-family: var(--f-text); font-size: 11.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.dx-row-1 .dx-cnt { font-size: 10px; color: var(--ink-3); }
+.dx-row.dx-new .dx-cnt { color: var(--amber); }
 .dx-cols, .dx-row-2 { display: grid; grid-template-columns: 1.1fr 0.55fr 0.95fr 0.95fr 0.95fr; gap: 4px; }
 .dx-cols { padding: 0 0 4px 12px; border-bottom: 1px solid var(--rule); }
 .dx-cols .dx-lbl { font-size: 8.5px; letter-spacing: 0.12em; overflow: hidden; text-overflow: ellipsis; }
@@ -151,6 +151,23 @@ const CSS = /* css */ `
 .dx-tag.dx-shatter { color: var(--ink); }
 .dx-summary { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--rule); }
 .dx-summary .dx-tr { font-size: 11.5px; color: var(--ink); }
+.dx-group { margin-top: 8px; }
+.dx-group-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.dx-group-head .dx-lbl { color: var(--ink-2); }
+.dx-group-head .dx-num { color: var(--amber); font-size: 11px; }
+.dx-section { position: relative; height: 28px; margin-top: 5px; }
+.dx-band {
+  position: absolute; left: 0; right: 0; top: 0;
+  background: repeating-linear-gradient(135deg, rgba(239, 233, 223, 0.28) 0 1px, transparent 1px 5px);
+  -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent);
+}
+.dx-band.dx-back { -webkit-mask-image: none; mask-image: none; border-bottom: 1px dashed var(--ink-2); }
+.dx-section svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.dx-section .c { fill: rgba(14, 12, 10, 0.9); }
+.dx-section .p { fill: none; stroke: var(--amber); stroke-width: 1.25; vector-effect: non-scaling-stroke; }
+.dx-section .s { stroke: var(--ink); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.dx-group-note { margin-top: 4px; font-family: var(--f-mono); font-stretch: 87.5%; font-size: 10px; color: var(--ink-2); }
+.dx-summary .dx-model { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .dx-summary .dx-model { font-family: var(--f-mono); font-stretch: 80%; font-size: 9.5px; color: var(--ink-3); margin-top: 3px; line-height: 1.4; overflow-wrap: anywhere; }
 .dx-empty { padding: 10px 0 4px; color: var(--ink-3); font-size: 11.5px; }
 .dx-blast { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--rule); transition: opacity 1.2s ease; }
@@ -234,7 +251,7 @@ const CSS = /* css */ `
 .dx-toast {
   position: absolute; left: 50%; top: 21%; transform: translate(-50%, 0); padding: 6px 14px;
   font-family: var(--f-label); font-weight: 500; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
-  opacity: 0; transition: opacity 0.35s ease, transform 0.35s ease; white-space: nowrap;
+  opacity: 0; transition: opacity 0.35s ease, transform 0.35s ease; white-space: nowrap; z-index: 4;
 }
 .dx-toast.dx-show { opacity: 1; transform: translate(-50%, -6px); transition: opacity 0.08s ease, transform 0.2s ease; }
 .dx-toast.dx-accent { color: var(--amber); border-color: var(--amber-2); }
@@ -359,6 +376,10 @@ const CSS = /* css */ `
 .dx-tbtn svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.5; }
 
 /* ── Responsive ────────────────────────────────────────────────────────── */
+/* Short screens with the weapon strip: the telemetry keeps its three newest rows so it stays clear of the strip. */
+@media (max-height: 800px) and (min-width: 1101px) {
+  .dx-rows .dx-row:nth-child(n+5) { display: none !important; }
+}
 @media (max-width: 1100px) {
   .dx-tele { width: 340px; }
   .dx-card { width: 340px; }
@@ -371,6 +392,13 @@ const CSS = /* css */ `
   .dx-ruler { top: 26px; }
   .dx-tele { left: var(--pad); right: var(--pad); width: auto; top: 170px; padding: 7px 10px 8px; }
   .dx-tele .dx-row:not(.dx-new), .dx-tele .dx-summary .dx-model, .dx-tele-head .dx-lbl { display: none; }
+  /* Numbers only: the panel must end above the reticle. */
+  .dx-tele .dx-summary .dx-tr, .dx-group-note, .dx-blast .dx-note { display: none !important; }
+  .dx-summary { margin-top: 4px; padding-top: 4px; }
+  .dx-group { margin-top: 0; }
+  .dx-section { height: 18px; margin-top: 3px; }
+  .dx-blast { margin-top: 5px; padding-top: 5px; }
+  .dx-blast .dx-tele-head { margin-bottom: 0; }
   .dx-tele-head { margin-bottom: 4px; }
   .dx-card { left: var(--pad); right: var(--pad); top: 34px; bottom: auto; width: auto; padding: 8px 10px 9px; }
   .dx-card > .dx-card-top, .dx-card .dx-dimline, .dx-card .dx-role, .dx-card .dx-ammo-line { display: none; }

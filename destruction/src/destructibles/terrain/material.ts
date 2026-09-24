@@ -250,6 +250,9 @@ GroundSample groundSample(vec2 p) {
     col = mix(col, dirt, cover);
     rough = mix(rough, 0.98, cover);
     h += 0.02 * cover * cl.b;
+    // Thrown soil buries the paving's joints and arrises too (relief and cavity, not just colour).
+    hMicro *= 1.0 - cover;
+    cavity = mix(cavity, 1.0, cover);
   }
   if (sp.r > 0.003) {
     // Soot deposit: near-black at the seat of the blast, brown-grey smudge further out, with

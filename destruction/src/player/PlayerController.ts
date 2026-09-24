@@ -4,7 +4,9 @@ import type { Projectile, ShotEvent, SimContext, System, WeaponControllerApi } f
 import type { AmmoSpec } from '../physics/ballistics/types.ts';
 import { groundOf } from '../fx/ground.ts';
 import { bridgeOf, type Bridge, type BulletCamView, type PlayerView } from '../ui/bridge.ts';
-import { fovForZoom, approach, isFollowable, rampTimeScale, RecoilSpring } from './motion.ts';
+import { scopeFor, scopeFov } from '../ui/crosshair.ts';
+import { AimHold, fovForZoom, approach, isFollowable, rampTimeScale, RecoilSpring } from './motion.ts';
+import { Rng } from '../core/rng.ts';
 import { buildSlots, stepWeapon, weaponForKey, type Slot } from './slots.ts';
 import { TouchControls } from './touch.ts';
 
@@ -92,8 +94,14 @@ export class PlayerController implements System, PlayerView {
   private adsToggle = false;
   private baseFov = 70;
   private lastFov = -1;
+  private fovWeapon = '';
   private readonly recoilPitch = new RecoilSpring(16, 0.75);
   private readonly recoilYaw = new RecoilSpring(18, 0.8);
+  private readonly aimHold = new AimHold(0.35);
+  /** Wall-clock ms of the last automatic-fire round (the hold works while a burst goes on) */
+  private lastAutoShot = -1e9;
+  /** Camera kick jitter: its own generator, so the viewer never shifts the simulation's random sequence */
+  private readonly kickRng = new Rng(0x7ec011);
   private readonly lastPos = new THREE.Vector3(NaN, NaN, NaN);
   private readonly lastQuat = new THREE.Quaternion(NaN, NaN, NaN, NaN);
   private triggerHeld = false;
@@ -140,6 +148,7 @@ export class PlayerController implements System, PlayerView {
   setAds(on: boolean, instant = false): void {
     this.adsToggle = on;
     if (instant) {
+      this.fovWeapon = this.weapons.current.id;
       this.ads = on ? 1 : 0;
       this.updateFov(0, this.ads);
     }
@@ -445,9 +454,15 @@ export class PlayerController implements System, PlayerView {
     if (this.cam || e.weapon.delivery !== 'direct') return;
     // Per-round kick; at very high rates the kicks blur into vibration, so scale by 600 / rpm.
     const rate = Math.min(1, 600 / Math.max(1, e.weapon.rpm));
-    const v = 2.4 * e.weapon.recoil * rate;
+    // The camera is the aim. For automatic fire the arsenal's dispersion already contains the
+    // scatter of a burst from its mount, bipod or shoulder, so the kick that moves the aim stays
+    // small (the effects' render-time shake carries each round's punch). Semi / single shots kick
+    // in full: the view has settled again before the next round.
+    const auto = e.weapon.fireMode === 'auto';
+    const v = 2.4 * e.weapon.recoil * rate * (auto ? 0.3 : 1);
     this.recoilPitch.kick(v);
-    this.recoilYaw.kick((this.ctx.rng.next() - 0.5) * 0.5 * v);
+    this.recoilYaw.kick((this.kickRng.next() - 0.5) * 0.5 * v);
+    if (e.weapon.fireMode === 'auto') this.lastAutoShot = performance.now();
   }
 
   // ─── Touch ─────────────────────────────────────────────────────────────────────────────────
@@ -484,6 +499,7 @@ export class PlayerController implements System, PlayerView {
     this.vel.set(0, 0, 0);
     this.recoilPitch.reset();
     this.recoilYaw.reset();
+    this.aimHold.reset();
     if (this.ads < 0.01) this.baseFov = cam.fov;
     this.lastFov = cam.fov;
   }
@@ -503,7 +519,13 @@ export class PlayerController implements System, PlayerView {
       this.triggerHeld = false;
       this.applyTrigger(false);
     }
-    if (this.menuOpen && this.triggerOut) this.applyTrigger(false);
+    if (this.menuOpen) {
+      if (this.triggerOut) this.applyTrigger(false);
+      // Behind the menu nothing steers the camera (a key held while it opened must not fly on).
+      this.keys.clear();
+      this.mouseDX = this.mouseDY = 0;
+      this.adsHeld = false;
+    }
 
     this.updateTimeScale(dt);
     if (this.touchUi && ((++this.frames & 7) === 0 || this.menuOpen !== this.touchWasHidden)) {
@@ -561,7 +583,8 @@ export class PlayerController implements System, PlayerView {
     }
 
     this.updateFov(dt, this.adsHeld || this.adsToggle ? 1 : 0);
-    const kp = this.recoilPitch.update(dt);
+    this.recoilPitch.update(dt);
+    const kp = this.aimHold.update(this.recoilPitch, dt, performance.now() - this.lastAutoShot < 200);
     const ky = this.recoilYaw.update(dt);
     cam.position.copy(this.pos);
     cam.rotation.set(THREE.MathUtils.clamp(this.pitch + kp, -PITCH_LIMIT, PITCH_LIMIT), this.yaw + ky, 0, 'YXZ');
@@ -580,7 +603,20 @@ export class PlayerController implements System, PlayerView {
     this.ads = approach(this.ads, adsTarget, dt, 0.06);
     if (this.ads < 1e-3) this.ads = 0;
     if (this.ads > 0.999) this.ads = 1;
-    const zoom = 1 + (Math.max(1, this.weapons.current.zoom) - 1) * this.ads;
+    const w = this.weapons.current;
+    // A new weapon brings up its own sight from scratch (no jump from one sight's zoom to another's).
+    if (w.id !== this.fovWeapon) {
+      this.fovWeapon = w.id;
+      this.ads = 0;
+    }
+    const sight = scopeFor(w);
+    // Scoped sights: the eyepiece spans the sight's real true field (see scopeFov); open sights
+    // and reflex/telescopic sights without an overlay: tan(φ/2) / zoom.
+    const full = sight
+      ? Math.max(1, Math.tan((this.baseFov * Math.PI) / 360) / Math.tan((scopeFov(sight, w.zoom, cam.aspect) * Math.PI) / 360))
+      : Math.max(1, w.zoom);
+    // Blend in log space so the zoom-in feels even from 1× to 30×.
+    const zoom = Math.pow(full, this.ads);
     const fov = fovForZoom(this.baseFov, zoom);
     if (Math.abs(fov - cam.fov) > 1e-4) {
       cam.fov = fov;

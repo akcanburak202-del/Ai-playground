@@ -1,13 +1,17 @@
 import * as THREE from 'three';
 import { createSandbox } from './sandboxKit.ts';
 import type { Simulation } from '../app/Simulation.ts';
-import type { ChargeEvent, SceneDef, SimContext, System, WeaponControllerApi, WeaponSpec } from '../app/contracts.ts';
+import type {
+  ChargeEvent, FxApi, GlassPaneSpec, RenderPipelineApi, SceneDef, SimContext, SteelBeamSpec, SteelPlateSpec, System, VoxelElementSpec,
+  WeaponControllerApi, WeaponSpec,
+} from '../app/contracts.ts';
 import { allocateDestructibleId, rayBoxEntry, type Destructible, type RayHit } from '../destructibles/Destructible.ts';
 import { MATERIALS, type MaterialId, type MaterialProps } from '../physics/materials.ts';
 import type { AmmoSpec, BlastKind, BlastLoad, ImpactEvent, ImpactOutcome, ThicknessProbe } from '../physics/ballistics/types.ts';
 import { installAudio, renderOfflineTest, type AudioSystem } from '../audio/index.ts';
 import { installPlayer, type PlayerController } from '../player/index.ts';
 import { installHud, ensureFonts, type Hud } from '../ui/index.ts';
+import type { HitGroups } from '../ui/telemetry.ts';
 
 /**
  * UI sandbox: BasicPipeline and a few blocks, the M6 stack (audio, player, HUD + menu) driven by
@@ -15,10 +19,47 @@ import { installHud, ensureFonts, type Hud } from '../ui/index.ts';
  * `?real`, the real ballistics and weapon controller. `window.__ui` scripts screenshots:
  * synthetic telemetry, menu / help / scope states, the offline audio render test and timing.
  *
- * URL: `?real` real weapons · `?touch` force touch controls · `?menu=0` start without the menu.
+ * `?full` is the integration check: M5's production pipeline, effects and terrain, the real
+ * ballistics and weapon controller, and real voxel / steel / glass elements on the range — the
+ * HUD over the real look, and the hit-group readout over real progressive damage.
+ *
+ * URL: `?real` real weapons · `?full` real everything · `?touch` force touch controls ·
+ * `?menu=0` start without the menu · `?q=0|1|2` pipeline quality (full).
  */
 
 const params = new URLSearchParams(location.search);
+const FULL = params.has('full');
+const REAL = FULL || params.has('real');
+
+// Optional modules for `?full`: each one missing degrades the range instead of breaking it.
+type Factory<S> = (ctx: SimContext, spec: S) => Destructible;
+const optional = async <T>(what: string, load: () => Promise<T>): Promise<T | null> => {
+  try {
+    return await load();
+  } catch (err) {
+    console.warn(`ui sandbox: ${what} unavailable`, err);
+    return null;
+  }
+};
+const mods = {
+  Pipeline: null as (new (o: { quality?: 0 | 1 | 2 }) => RenderPipelineApi) | null,
+  installFx: null as ((sim: Simulation) => FxApi) | null,
+  terrain: null as ((ctx: SimContext, opts?: { plaza?: { halfX: number; halfZ: number; finish: 'pavers' | 'travertine' | 'concrete' } }) => Destructible) | null,
+  voxel: null as Factory<VoxelElementSpec> | null,
+  plate: null as Factory<SteelPlateSpec> | null,
+  beam: null as Factory<SteelBeamSpec> | null,
+  glass: null as Factory<GlassPaneSpec> | null,
+};
+if (FULL) {
+  mods.Pipeline = await optional('pipeline', async () => (await import('../render/Pipeline.ts')).Pipeline as unknown as typeof mods.Pipeline);
+  mods.installFx = await optional('fx', async () => (await import('../fx/index.ts')).installFx);
+  mods.terrain = await optional('terrain', async () => (await import('../destructibles/terrain/index.ts')).createTerrain as unknown as typeof mods.terrain);
+  mods.voxel = await optional('voxel', async () => (await import('../destructibles/voxel/index.ts')).createVoxelElement);
+  const steel = await optional('steel', async () => await import('../destructibles/steel/index.ts'));
+  mods.plate = steel?.createSteelPlate ?? null;
+  mods.beam = steel?.createSteelBeam ?? null;
+  mods.glass = await optional('glass', async () => (await import('../destructibles/glass/index.ts')).createGlassPane);
+}
 
 /** Static box that projectiles and the aim ray can hit (it does not change shape). */
 class Block implements Destructible {
@@ -93,11 +134,36 @@ function buildBase(ctx: SimContext): void {
   addBlock(ctx, 'column', [0.5, 4, 0.5], [3.2, 2, 3], 'marble', looks.marble);
 }
 
+/**
+ * The integration range: a reinforced board-formed concrete wall (the burst target), a welded
+ * 12 mm S355 plate, a framed tempered pane and a loaded HEB 300 column, on a concrete plaza.
+ * Falls back to plain blocks for any element module that is missing.
+ */
+function buildFull(ctx: SimContext): void {
+  mods.terrain?.(ctx, { plaza: { halfX: 30, halfZ: 20, finish: 'concrete' } });
+  if (mods.voxel) {
+    const wall = mods.voxel(ctx, {
+      name: 'RC duvar', material: 'concrete', finish: 'board-formed-concrete', shape: { type: 'box', size: [5, 3, 0.25] }, position: [0, 1.5, 0],
+      rebar: { diameter: 0.012, spacing: 0.15, cover: 0.03, layout: 'two-faces' },
+    });
+    const b = wall.bounds;
+    ctx.structure.link('ground', wall, new THREE.Box3(new THREE.Vector3(b.min.x, -0.05, b.min.z), new THREE.Vector3(b.max.x, 0.06, b.max.z)));
+  } else addBlock(ctx, 'wall', [5, 3, 0.25], [0, 1.5, 0], 'concrete', looks.concrete);
+  if (mods.plate) mods.plate(ctx, { name: 'S355 levha 12 mm', material: 'steel_s355', width: 1.2, height: 1.2, thickness: 0.012, position: [-4.2, 1.3, 2], edges: { top: true, bottom: true, left: true, right: true }, finish: 'mill-scale' });
+  else addBlock(ctx, 'steel plate', [1.2, 1.2, 0.012], [-4.2, 1.3, 2], 'steel_s355', looks.steel);
+  if (mods.glass) mods.glass(ctx, { name: 'temperli cam', type: 'tempered', width: 1.6, height: 2.2, thickness: 0.012, position: [4.2, 1.2, 2], framed: true });
+  else addBlock(ctx, 'pane', [1.6, 2.2, 0.012], [4.2, 1.2, 2], 'glass_tempered', looks.glass);
+  if (mods.beam) {
+    const col = mods.beam(ctx, { name: 'HEB 300 kolon', material: 'steel_s355', profile: { type: 'I', h: 0.3, b: 0.3, tw: 0.011, tf: 0.019 }, start: [7, 0.02, -1.5], end: [7, 4, -1.5], up: [0, 0, 1], ends: { start: 'fixed', end: 'pinned' }, finish: 'painted', paintColor: 0x8a2a1c });
+    col.structural?.setImposedLoad(1.2e6);
+  }
+}
+
 const MOCK_SCENES: SceneDef[] = [
   {
     id: 'proving-ground', name: 'Proving ground', nameTr: 'Atış poligonu',
     blurb: 'Calibration targets', blurbTr: 'Kalibrasyon hedefleri: C40 beton blok, S355 ve RHA levhalar, temperli cam. Modelleri tek tek sına.',
-    spawn: { position: [0, 1.7, 14], lookAt: [0, 1.6, 0] }, build: buildBase,
+    spawn: { position: [0, 1.7, 14], lookAt: [0, 1.6, 0] }, build: FULL ? buildFull : buildBase,
   },
   {
     id: 'chapel', name: 'Chapel of Light', nameTr: 'Işık Şapeli',
@@ -284,6 +350,7 @@ let audio: AudioSystem | null = null;
 const kit = await createSandbox({
   title: 'ui sandbox',
   camera: { position: [0, 1.7, 14], lookAt: [0, 1.6, 0] },
+  pipeline: mods.Pipeline ? new mods.Pipeline({ quality: Number(params.get('q') ?? 1) as 0 | 1 | 2 }) : undefined,
   async install(sim: Simulation) {
     let arsenal: readonly WeaponSpec[] = [];
     try {
@@ -291,11 +358,12 @@ const kit = await createSandbox({
     } catch (err) {
       console.warn('ui sandbox: arsenal unavailable', err);
     }
-    if (params.has('real')) {
+    if (REAL) {
       const { installBallistics } = await import('../systems/index.ts');
       const { createWeaponController } = await import('../weapons/index.ts');
       installBallistics(sim);
       weapons = createWeaponController(sim);
+      if (mods.installFx) mods.installFx(sim);
     } else {
       const mock = new MockWeapons(sim.ctx, arsenal);
       sim.addSystem(mock);
@@ -303,7 +371,7 @@ const kit = await createSandbox({
     }
     audio = installAudio(sim) as AudioSystem;
   },
-  build: buildBase,
+  build: FULL ? buildFull : buildBase,
 });
 
 const sim = kit.sim;
@@ -368,6 +436,26 @@ const api = {
       ctx.events.emit('impact', syntheticImpact(ctx, ctx.ammo(ammo), MATERIALS[mat], point, new THREE.Vector3(0, 0, 1), dir, target, outcome));
     }
   },
+  /**
+   * Mock burst on one spot (no resolver): each round meets the floor the earlier ones dug, a few
+   * millimetres deeper, the way a real burst deepens a crater; the last one goes through.
+   */
+  burstDemo(n = 40, ammo = 'm855', at: number[] = [0.3, 1.7, 0.2]) {
+    const cam = ctx.camera.position;
+    const target = ctx.registry.all()[0]!;
+    let floor = 0;
+    for (let i = 0; i < n; i++) {
+      const point = v3(at).add(new THREE.Vector3(0.012 * Math.sin(i * 2.1), 0.012 * Math.cos(i * 1.7), -floor));
+      const dir = point.clone().sub(cam).normalize();
+      const last = i === n - 1;
+      const e = syntheticImpact(ctx, ctx.ammo(ammo), MATERIALS.concrete, point, new THREE.Vector3(0, 0, 1), dir, target, last ? 'perforate' : 'embed');
+      e.time = ctx.time.now + i * 0.075;
+      e.depth = last ? Math.max(0.02, 0.25 - floor) : 0.035 + 0.0008 * i;
+      if (last) e.exitPoint = v3(at).add(new THREE.Vector3(0, 0, -0.25));
+      ctx.events.emit('impact', e);
+      floor += 0.0035 + 0.00008 * i;
+    }
+  },
   blast(at: number[], tntKg: number, kind: BlastKind = 'he', ammo = 'pg7vl') {
     emitBlast(ctx, v3(at), tntKg, kind, ctx.ammo(ammo));
   },
@@ -411,6 +499,66 @@ const api = {
     return document.fonts.ready.then(() => [...document.fonts].filter((f) => f.status === 'loaded').map((f) => f.family));
   },
   audioTest: () => renderOfflineTest(),
+  /** The HUD's hit group (progressive damage on one spot) */
+  groupState() {
+    const gs = (hud as unknown as { groups: HitGroups }).groups;
+    const g = gs.current;
+    const mm = (x: number) => Math.round(x * 1000);
+    if (!g) return null;
+    return {
+      count: g.count, firstMm: mm(g.first), deepestMm: mm(g.deepest), perforatedAt: g.perforatedAt, thicknessMm: mm(g.thickness),
+      profileMm: g.profile.map(mm), stride: g.stride, material: g.material, groups: gs.list.map((x) => x.count),
+    };
+  },
+  /**
+   * Slow motion at a tiny fixed step: `seconds` of sim time in steps of `dt`, a rendered-frame
+   * update every `frameDt` of real time at the current time scale. Reports anything non-finite.
+   */
+  slowRun(seconds: number, dt = 0.001, frameDt = 1 / 60) {
+    let t = 0, sinceFrame = 0, frames = 0;
+    const bad: string[] = [];
+    while (t < seconds - 1e-9) {
+      const h = Math.min(dt, seconds - t);
+      sim.fixedStep(h);
+      t += h;
+      sinceFrame += h;
+      const simFrame = frameDt * ctx.time.scale;
+      if (sinceFrame >= simFrame) {
+        sim.frameStep(sinceFrame, frameDt);
+        sinceFrame = 0;
+        frames++;
+        const c = ctx.camera;
+        if (![c.position.x, c.position.y, c.position.z, c.quaternion.x, c.quaternion.w, c.fov, ctx.time.scale].every(Number.isFinite)) bad.push(`camera at t=${t}`);
+      }
+    }
+    const txt = hud.root.textContent ?? '';
+    if (/NaN|Infinity|undefined/.test(txt)) bad.push('HUD text');
+    return { frames, scale: ctx.time.scale, bad, simTime: ctx.time.now };
+  },
+  /**
+   * Whole frames through the pipeline (GPU finished by a 1-px read-back) and the M6 share of the
+   * CPU: player + audio (systems) and HUD (frame listener) as timed inside the frame.
+   */
+  framePerf(frames = 20) {
+    const gl = ctx.renderer.getContext();
+    const px = new Uint8Array(4);
+    let total = 0, m6 = 0;
+    for (let i = 0; i < frames; i++) {
+      const t0 = performance.now();
+      const p0 = performance.now();
+      player.frameUpdate(0, 1 / 60);
+      const p1 = performance.now();
+      (hud as unknown as { frame(dt: number): void }).frame(1 / 60);
+      const p2 = performance.now();
+      audio!.frameUpdate(0, 1 / 60);
+      m6 += performance.now() - p2 + (p2 - p1) + (p1 - p0);
+      sim.render(1 / 60);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      total += performance.now() - t0;
+    }
+    const info = ctx.renderer.info.render;
+    return { frameMs: total / frames, m6Ms: m6 / frames, drawCalls: info.calls, triangles: info.triangles };
+  },
   /** Per-frame CPU cost of the M6 systems, ms (HUD DOM work, audio scheduling, player). */
   perf(frames = 120) {
     const t: number[] = [];

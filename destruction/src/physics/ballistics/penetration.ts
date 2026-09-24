@@ -238,8 +238,9 @@ export function tateTargetResistance(m: MaterialProps, strength = 1): number {
 // ─── Soil: Young's penetration equation ─────────────────────────────────────────────────────
 
 /**
- * Young (1997, SAND97-2426) earth penetration, SI: for V ≥ 61 m/s
- * D = 0.000018 S N K (m/A)^0.7 (V − 30.5); below, D = 0.0008 S N K (m/A)^0.7 ln(1 + 2·10⁻⁵ V²).
+ * Young (1997, SAND97-2426) earth penetration, SI (m, kg, m², m/s): for V ≥ 61 m/s
+ * D = 0.000018 S N K (m/A)^0.7 (V − 30.5); below, D = 0.0008 S N K (m/A)^0.7 ln(1 + 2.15·10⁻⁴ V²)
+ * (the English-unit form has 2·10⁻⁵ with V in ft/s; 2·10⁻⁵ / 0.3048² = 2.15·10⁻⁴).
  * K = 0.46 m^0.15 for m < 182 kg (small-penetrator correction). S = 5: compacted fill.
  */
 export function youngDepth(v: number, mass: number, d: number, nose: number, S = 5): number {
@@ -248,7 +249,7 @@ export function youngDepth(v: number, mass: number, d: number, nose: number, S =
   const K = mass < 182 ? 0.46 * Math.pow(mass, 0.15) : 1;
   const N = 0.56 + 0.8 * (nose - 0.72); // Young's nose coefficient: flat 0.56, ogive ≈ 0.9
   const base = S * N * K * Math.pow(mass / A, 0.7);
-  return v >= 61 ? 0.000018 * base * (v - 30.5) : 0.0008 * base * Math.log(1 + 2e-5 * v * v);
+  return v >= 61 ? 0.000018 * base * (v - 30.5) : 0.0008 * base * Math.log(1 + 2.15e-4 * v * v);
 }
 
 function youngVelocity(D: number, mass: number, d: number, nose: number): number {
@@ -305,11 +306,16 @@ export function criticalGrazingAngle(ammo: AmmoSpec, m: MaterialProps, v: number
     case 'ap': b0 = 20; vref = 850; rho = 7850; break;
     case 'ball': b0 = 30; vref = 850; rho = 11340; break;
     case 'fragment': b0 = 25; vref = 1000; rho = 7850; break;
-    default: return 0;
+    default:
+      // Delay-fuzed or unfuzed steel-bodied shells (M908, BLU-109) skip off like AP; impact fuzes
+      // and shaped charges function on the graze instead.
+      if (ammo.fuze === 'impact' || ammo.kind === 'heat') return 0;
+      b0 = 20; vref = 850; rho = 7850;
+      break;
   }
   const Y = flowStress(m, strength);
   if (Y <= 0) return THREE.MathUtils.degToRad(2);
-  const rhoP = ammo.kind === 'ball' ? 11340 : ammo.coreDensity;
+  const rhoP = ammo.kind === 'ball' ? 11340 : ammo.kind === 'ap' || ammo.kind === 'apfsds' || ammo.kind === 'fragment' ? ammo.coreDensity : 7850;
   const t0 = Math.tan(THREE.MathUtils.degToRad(b0));
   const t3 = t0 * t0 * t0 * (Y / RHA.tensileStrength) * ((rho * vref * vref) / (rhoP * Math.max(v, 30) ** 2));
   return Math.atan(Math.cbrt(t3));
@@ -395,7 +401,7 @@ function marchKinetic(a: AmmoData, st: MarchState, probe: ThicknessProbe, obliq:
     if (isRod(a) && onSteel) {
       // Lanz–Odermatt limit; the rod erodes in proportion to the thickness defeated.
       const lim = lanzOdermatt(v, st.length, pen.d, a.coreDensity, m.density, loTargetStrength(m, s), obliq);
-      if (!st.note) st.note = `Lanz–Odermatt limit ${fmtLength(lim)}`;
+      if (!st.note) st.note = `Lanz–Odermatt sınır ${fmtLength(lim)}`;
       if (len < lim) {
         const lr = st.length * (1 - len / lim);
         // Tate tail deceleration: Δv = Y_p / (ρp (v−u)) · ln(L/L_r), v−u ≈ v / (1 + √(ρt/ρp))
@@ -436,7 +442,7 @@ function marchKinetic(a: AmmoData, st: MarchState, probe: ThicknessProbe, obliq:
       const fc = m.compressiveStrength * s;
       const phi = deformConcrete(pen, a);
       const x = phi * ndrcDepth(v, pen.mass, pen.d, pen.nose, fc);
-      if (!st.note) st.note = `NDRC x=${fmtLength(x)}`;
+      if (!st.note) st.note = backFree ? `NDRC x=${fmtLength(x)}, Kennedy e=${fmtLength(kennedyPerforation(x, pen.d))}` : `NDRC x=${fmtLength(x)}`;
       if (backFree) {
         const e = kennedyPerforation(x, pen.d);
         if (len < e) {
@@ -474,7 +480,8 @@ function marchKinetic(a: AmmoData, st: MarchState, probe: ThicknessProbe, obliq:
         const plug = blunt ? (m.density * Math.PI * pen.d * pen.d * 0.25 * len * Math.cos(obliq)) : 0;
         st.v = rechtIpson(v, vbl, pen.mass / (pen.mass + plug));
         if (!stripped && (a.kind === 'ap' || a.kind === 'ball')) {
-          st.mass = a.kind === 'ap' ? Math.max(a.coreMass ?? st.mass * 0.8, st.mass * 0.5) : st.mass * 0.75;
+          // The jacket strips off in the first plate: AP carries on as its core, lead ball loses ~¼.
+          st.mass = Math.min(st.mass, a.kind === 'ap' ? Math.max(a.coreMass ?? st.mass * 0.8, st.mass * 0.5) : st.mass * 0.75);
           stripped = true;
         }
         st.depth += len;
@@ -495,7 +502,7 @@ function marchKinetic(a: AmmoData, st: MarchState, probe: ThicknessProbe, obliq:
         const plug = m.density * Math.PI * pen.d * pen.d * 0.25 * len;
         st.v = rechtIpson(v, vbl, pen.mass / (pen.mass + plug));
         st.depth += len;
-        if (!st.note) st.note = `glass V_bl ${vbl.toFixed(0)} m/s`;
+        if (!st.note) st.note = `cam V_bl ${vbl.toFixed(0)} m/s`;
         continue;
       }
       st.depth += Math.min(len, 0.5 * pen.d);
@@ -554,7 +561,7 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   const seg0 = probe.segments[0];
   const mat = seg0?.material ?? hit.material;
   const ev = baseEvent(p, hit, dir, speed, obliq, mat);
-  const name = `${a.name} @ ${speed.toFixed(0)} m/s, ${deg(obliq)} → ${mat.name}`;
+  const name = `${a.name} ${speed.toFixed(0)} m/s, ${deg(obliq)} → ${mat.nameTr}`;
 
   // Ricochet: grazing angle below the critical angle (smoothed ±15 % so the edge is stochastic).
   const graze = Math.PI / 2 - obliq;
@@ -597,7 +604,7 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   if (outcome === 'shatter') ev.energyAbsorbed *= 0.4; // most of the energy leaves in the radial splash
 
   sizeCrater(ev, a, pen, mat, probe, st, speed, obliq);
-  ev.summary = summaryFor(ev, name, st, runLen);
+  ev.summary = summaryFor(ev, name, st, runLen, probe);
   return ev;
 }
 
@@ -606,26 +613,31 @@ function sizeCrater(ev: ResolvedImpact, a: AmmoData, pen: Penetrator, mat: Mater
   const s0 = probe.segments[0]?.strength ?? 1;
   const runLen = probe.segments.length ? probe.segments[probe.segments.length - 1]!.end : 0;
   if (mat.class === 'brittle' || mat.class === 'soil') {
-    // Crater cone volume from the energy spent near the face: V = E·w / (η σ), η ≈ 4 (brittle
-    // fragmentation energy density ≈ 4 f_c; checks against 5.56/7.62/.50 crater data), w = 1 for
-    // short penetrations, √(6d/x) for deep tunnels where the energy goes down the tunnel.
+    // Crater cone volume from the energy deposited near the face: V = E_abs·w / (η σ), η ≈ 4
+    // (brittle fragmentation energy density ≈ 4 f_c; checks against 5.56/7.62/.50 crater data),
+    // w = 1 for short penetrations, √(6d/x) for deep tunnels where the energy goes down the tunnel.
+    // E_abs is what the target absorbed: a round that perforates keeps the rest.
     const sigma = mat.class === 'soil' ? 5e6 : mat.compressiveStrength * s0;
     const x = Math.max(ev.depth, 1e-4);
     const w = x <= 6 * d ? 1 : Math.sqrt((6 * d) / x);
-    const V = (ev.kineticEnergy * w) / (4 * sigma);
+    const V = (ev.energyAbsorbed * w) / (4 * sigma);
     const h = Math.min(x, (a.deformable ? 3 : 2.5) * d);
     let r = Math.sqrt((3 * V) / (Math.PI * Math.max(h, 1e-4)));
     r = clamp(r, 1.0 * d, (mat.class === 'soil' ? 6 : 12) * d);
     ev.craterRadius = r;
     ev.craterDepth = h;
-    ev.tunnelRadius = (a.deformable ? 0.6 : 0.55) * d;
+    // Tunnel: ≈1.1–1.2 d for bullets; an eroding long rod opens a cavity ≈3 d across in concrete
+    // (cavity expansion around the mushroomed rod head, Tate 1967; game-level estimate, see PHYSICS.md).
+    ev.tunnelRadius = (a.kind === 'apfsds' ? 1.5 : a.deformable ? 0.6 : 0.55) * d;
     ev.damageRadius = Math.max(4 * r, 3 * d);
     if (mat.class === 'brittle' && probe.exits) {
       const xr = Math.max(st.depth, 1e-4);
       const hs = kennedyScabbing(xr, d);
       if (ev.outcome === 'perforate') {
+        // Exit scab: a punching-shear cone whose flanks leave the rear face at ≈30° (half-angle
+        // ≈60° about the shot line, as in concrete perforation tests and the EC2 punching cone).
         ev.spallDepth = Math.min(0.45 * runLen, 3 * d);
-        ev.spallRadius = 1.3 * r;
+        ev.spallRadius = Math.max(1.3 * r, Math.tan(Math.PI / 3) * ev.spallDepth);
       } else if (runLen < hs) {
         const e = kennedyPerforation(xr, d);
         const lig = Math.max(0, runLen - ev.depth);
@@ -668,19 +680,34 @@ function sizeCrater(ev: ResolvedImpact, a: AmmoData, pen: Penetrator, mat: Mater
   ev.damageRadius = Math.max(2.5 * d, Math.sqrt(ev.energyAbsorbed / (Math.PI * sy * tz * 0.05)));
 }
 
-function summaryFor(ev: ResolvedImpact, name: string, st: MarchState, runLen: number): string {
+/** "Beton 40 mm + İnşaat demiri 12 mm + …" for multi-material runs (empty for a single material). */
+function layers(probe: ThicknessProbe): string {
+  const segs = probe.segments;
+  if (segs.length < 2) return '';
+  const parts: string[] = [];
+  for (let i = 0; i < segs.length && parts.length < 4; i++) parts.push(`${segs[i]!.material.nameTr} ${fmtLength(segs[i]!.end - segs[i]!.start)}`);
+  if (segs.length > 4) parts.push('…');
+  return ` [${parts.join(' + ')}]`;
+}
+
+/**
+ * One-line, Turkish model summary for the telemetry panel: round, speed, obliquity, material, what
+ * happened (upper-case verb), the key sizes, and the model that decided it.
+ */
+function summaryFor(ev: ResolvedImpact, name: string, st: MarchState, runLen: number, probe: ThicknessProbe): string {
   const note = st.note ? ` (${st.note})` : '';
   const mm = (m: number) => fmtLength(m);
+  const lay = layers(probe);
   switch (ev.outcome) {
     case 'perforate':
-      return `${name} ${mm(runLen)}: perforated, ${ev.residualSpeed.toFixed(0)} m/s out${ev.ammo.kind === 'apfsds' ? `, rod ${mm(ev.residualLength)} left` : ''}${note}`;
+      return `${name} ${mm(runLen)}${lay}: DELDİ, çıkış ${ev.residualSpeed.toFixed(0)} m/s${ev.ammo.kind === 'apfsds' ? `, kalan çubuk ${mm(ev.residualLength)}` : ''}${ev.spallRadius > 0 && ev.material.class === 'brittle' ? `, arka kavlama Ø${mm(2 * ev.spallRadius)}` : ''}${note}`;
     case 'shatter':
-      return `${name}: bullet splashed, dent ${mm(ev.craterDepth)}${note}`;
+      return `${name}: mermi yüzeyde PARÇALANDI, göçük ${mm(ev.craterDepth)}${note}`;
     default:
-      if (ev.material.class === 'brittle') {
-        return `${name}: crater Ø${mm(2 * ev.craterRadius)} × ${mm(ev.craterDepth)}, stopped at ${mm(ev.depth)}${ev.spallRadius > 0 ? `, rear scab Ø${mm(2 * ev.spallRadius)}` : ''}${note}`;
+      if (ev.material.class === 'brittle' || ev.material.class === 'soil') {
+        return `${name}${lay}: SAPLANDI ${mm(ev.depth)}, krater Ø${mm(2 * ev.craterRadius)} × ${mm(ev.craterDepth)}${ev.spallRadius > 0 ? `, arka kavlama Ø${mm(2 * ev.spallRadius)}` : ''}${note}`;
       }
-      return `${name}: stopped at ${mm(ev.depth)} of ${mm(runLen)}${note}`;
+      return `${name}${lay}: DURDU ${mm(ev.depth)} / ${mm(runLen)}${note}`;
   }
 }
 
@@ -711,11 +738,13 @@ function ricochet(ev: ResolvedImpact, a: AmmoData, dir: THREE.Vector3, n: THREE.
   ev.damageRadius = 3 * d;
   ev.energyAbsorbed = Math.max(0, ev.kineticEnergy - 0.5 * mr * vr * vr);
   ev.momentum.copy(dir).multiplyScalar(ev.mass * ev.speed).addScaledVector(out, -mr * vr);
-  ev.summary = `${name}: ricochet (grazing ${deg(graze)} < β_c ${deg(bc)}), ${vr.toFixed(0)} m/s out`;
+  ev.summary = `${name}: SEKTİ (sıyırma açısı ${deg(graze)} < kritik ${deg(bc)}), çıkış ${vr.toFixed(0)} m/s`;
   return ev;
 }
 
 // ─── HEAT jet ───────────────────────────────────────────────────────────────────────────────
+
+const JET_LABEL_TR: Record<string, string> = { jet: 'oyuk dolgu jeti', 'precursor jet': 'öncü jet', 'cutting jet': 'kesici jet' };
 
 /** Jet tip speed of a copper shaped-charge jet, m/s (Walters & Zukas, "Fundamentals of Shaped Charges"). */
 export const JET_TIP_SPEED = 7500;
@@ -795,7 +824,9 @@ export function resolveJet(a: AmmoSpec, capacity: number, cone: number, hit: Ray
     ev.craterDepth = Math.min(ev.depth, 0.1 * cone);
     ev.damageRadius = 0.6 * cone;
   }
-  const eq = runLen * jetResistance(mat, seg0?.strength ?? 1);
-  ev.summary = `${a.name} ${label} (${fmtLength(capacity)} RHA) → ${mat.name}: ${perforated ? `perforated ${fmtLength(runLen)} (≈${fmtLength(eq)} RHA-e), ${fmtLength(c)} RHA left` : `penetrated ${fmtLength(ev.depth)}`}`;
+  let eq = 0;
+  for (const seg of probe.segments) eq += Math.max(0, seg.end - seg.start) * jetResistance(seg.material, clamp(seg.strength, 0.05, 1));
+  const what = JET_LABEL_TR[label] ?? label;
+  ev.summary = `${a.name} ${what} (${fmtLength(capacity)} RHA) → ${mat.nameTr}${layers(probe)}: ${perforated ? `DELDİ ${fmtLength(runLen)} (≈${fmtLength(eq)} RHA-eşd.), kalan ${fmtLength(c)} RHA` : `nüfuz ${fmtLength(ev.depth)}, jet tükendi`}`;
   return ev;
 }

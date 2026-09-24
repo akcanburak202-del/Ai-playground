@@ -5,6 +5,8 @@ const _spin = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
 const _p = new THREE.Vector3();
 const _s = new THREE.Vector3();
+const _n: number[] = [0, 1, 0];
+const _nv = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 
 /**
@@ -20,9 +22,12 @@ export class PockDecals {
   private capacity: number;
   private material: THREE.MeshStandardMaterial;
   private geometry: THREE.BufferGeometry;
+  /** Per mark: x, z, radius (0 = removed), spin — so later craters can move or remove it */
+  private marks: Float32Array;
 
   constructor(atlas: THREE.Texture, capacity: number) {
     this.capacity = capacity;
+    this.marks = new Float32Array(capacity * 4);
     this.geometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
     this.variant = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 2), 2);
     this.variant.setUsage(THREE.DynamicDrawUsage);
@@ -64,18 +69,47 @@ export class PockDecals {
   add(p: THREE.Vector3, n: THREE.Vector3, r: number, kind: 0 | 1, rand: number): void {
     const i = this.next;
     this.next = (this.next + 1) % this.capacity;
-    _q.setFromUnitVectors(UP, n);
-    _spin.setFromAxisAngle(UP, rand * Math.PI * 2);
-    _q.multiply(_spin);
-    const d = 2 * r;
-    _m.compose(_p.copy(p).addScaledVector(n, 0.002), _q, _s.set(d, 1, d));
-    this.mesh.setMatrixAt(i, _m);
-    this.mesh.instanceMatrix.addUpdateRange(i * 16, 16);
-    this.mesh.instanceMatrix.needsUpdate = true;
+    this.place(i, p, n, r, rand);
     this.variant.setXY(i, Math.floor(rand * 97) % 4, kind);
     this.variant.addUpdateRange(i * 2, 2);
     this.variant.needsUpdate = true;
     this.mesh.count = Math.min(this.capacity, Math.max(this.mesh.count, i + 1));
+  }
+
+  private place(i: number, p: THREE.Vector3, n: THREE.Vector3, r: number, rand: number): void {
+    _q.setFromUnitVectors(UP, n);
+    _spin.setFromAxisAngle(UP, rand * Math.PI * 2);
+    _q.multiply(_spin);
+    const d = 2 * r;
+    _m.compose(_p.copy(p).addScaledVector(n, 0.002), _q, r > 0 ? _s.set(d, 1, d) : _s.set(0, 0, 0));
+    this.mesh.setMatrixAt(i, _m);
+    this.mesh.instanceMatrix.addUpdateRange(i * 16, 16);
+    this.mesh.instanceMatrix.needsUpdate = true;
+    const k = i * 4;
+    this.marks[k] = p.x;
+    this.marks[k + 1] = p.z;
+    this.marks[k + 2] = r;
+    this.marks[k + 3] = rand;
+  }
+
+  /**
+   * The ground under (cx, cz) was re-shaped out to `reach`: marks inside `removeRadius` were blown
+   * away with the surface they sat on; the rest are re-seated on the new surface.
+   */
+  conform(cx: number, cz: number, reach: number, removeRadius: number, heightAt: (x: number, z: number) => number, normalAt: (x: number, z: number, out: number[]) => number[]): void {
+    const m = this.marks;
+    for (let i = 0; i < this.mesh.count; i++) {
+      const k = i * 4;
+      const r = m[k + 2]!;
+      if (!(r > 0)) continue;
+      const x = m[k]!, z = m[k + 1]!;
+      const d = Math.hypot(x - cx, z - cz);
+      if (d > reach + r) continue;
+      normalAt(x, z, _n);
+      _nv.set(_n[0]!, _n[1]!, _n[2]!);
+      _p.set(x, heightAt(x, z), z);
+      this.place(i, _p, _nv, d < removeRadius ? 0 : r, m[k + 3]!);
+    }
   }
 
   dispose(): void {

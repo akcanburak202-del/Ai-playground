@@ -30,12 +30,13 @@ vec3 blackbody(float T) {
   return pow(vec3(r, g, b), vec3(2.2));
 }
 /**
- * Visible radiance of an incandescent source relative to a sun-lit white wall: Planck's law in
- * the visible band rises roughly as T^6–T^8 between 1000 and 2500 K (Wien regime), so a 2600 K
- * flame core is ~10× the wall (blooms, burns to white), a 2200 K fireball body is orange-yellow at
- * ~3× and 1300 K embers only glow dull red.
+ * Visible radiance of an incandescent source in render units (a sun-lit white wall ≈ 1.5): Planck's
+ * law at 555 nm in the Wien regime, L ∝ 1 / (exp(c₂ / λT) − 1) with c₂/λ = 25 924 K, normalised to
+ * 40 at 2200 K. A true black body at 2200 K is ≈ 100× the wall; 40 keeps fireball cores, flashes
+ * and fresh sparks clipping to yellow-white with bloom while 1600–1800 K gas stays orange, 1300 K
+ * embers barely show in daylight — the gradient seen in daylight photographs of detonations.
  */
-float glow(float T) { return T < 700.0 ? 0.0 : 6.0 * pow(T / 2400.0, 7.0); }
+float glow(float T) { return T < 700.0 ? 0.0 : 40.0 * 131090.0 / (exp(25924.0 / T) - 1.0); }
 `;
 
 const PARTICLE_VERTEX_HEAD = /* glsl */ `
@@ -95,8 +96,9 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         gl_Position = projectionMatrix * mv;
         vUv = atlasUv(c, a5.y);
         vRot = vec2(cr, sr);
-        // Fade in over a few frames, out over the last 45 %; a puff thins as it spreads.
-        float fadeIn = smoothstep(0.0, clamp(0.05 * life, 0.015, 0.06), age);
+        // Fade in within a frame or two (an impact's ejecta appear at once), out over the last
+        // 45 %; a puff thins as it spreads.
+        float fadeIn = smoothstep(0.0, clamp(0.012 * life, 0.004, 0.04), age);
         float fadeOut = 1.0 - smoothstep(0.55, 1.0, x);
         float spread = clamp((size - a3.x) / max(a3.y - a3.x, 1e-4), 0.0, 1.0);
         vColor = vec4(a4.rgb * mix(a5.w, 1.0, smoothstep(0.0, 0.75, x)), a4.a * fadeIn * fadeOut * mix(1.0, 0.4, spread));
@@ -109,7 +111,11 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         vUp = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
         vBack = vec3(viewMatrix[0][2], viewMatrix[1][2], viewMatrix[2][2]);
         vWorld = wp;
-        vSunVis = sunVisibility(wp, -mv.z);
+        // Shade the puff where the camera sees it — its front half — not at its centre: dust born
+        // on a wall's shaded face starts partly inside the wall, within the shadow-map bias of
+        // the occluder, and would leak sunlight.
+        vec3 front = wp + normalize(cameraPosition - wp) * min(size * 0.5, 0.5);
+        vSunVis = sunVisibility(front, -mv.z);
         hazeAt(wp);
       }`,
     fragmentShader: /* glsl */ `
@@ -149,9 +155,10 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         float edge = 1.0 - dens;
         float selfShadow = 1.0 - 0.5 * tx.b * dens;
         vec3 sun = uSunColor * vSunVis * (wrap * selfShadow + hg * 3.5 * (0.3 + 0.7 * edge));
-        // Sky fill from above, sun-lit ground from below, plus multiply-scattered light inside the
-        // cloud (it sees the whole sunlit surroundings): a neutral share of the sun term.
-        vec3 amb = uSkyAmbient * (0.7 + 0.3 * N.y) + uGroundAmbient * (0.5 - 0.3 * N.y) + uSunColor * 0.035;
+        // Sky fill from above, sun-lit ground from below, plus multiply-scattered sunlight inside the
+        // cloud — which needs sun-lit parts of the cloud: a puff wholly in a building's shadow keeps
+        // only the bounce from the sun-lit surroundings (so it matches the blue-grey shade around it).
+        vec3 amb = uSkyAmbient * (0.7 + 0.3 * N.y) + uGroundAmbient * (0.5 - 0.3 * N.y) + uSunColor * 0.035 * (0.25 + 0.75 * vSunVis);
         // Multiple scattering inside an optically thick cloud mixes all incoming colours: neutralise.
         amb = mix(amb, vec3(dot(amb, vec3(0.2126, 0.7152, 0.0722))), 0.45 * dens);
         vec3 lit = vColor.rgb * (sun + amb);

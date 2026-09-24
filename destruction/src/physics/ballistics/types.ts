@@ -30,8 +30,8 @@ export interface RocketMotor {
 export interface Guidance {
   /** 'direct': steer towards the aim point; 'topAttack': climb then dive onto the target (Javelin) */
   mode: 'direct' | 'topAttack';
-  /** Max lateral acceleration, m/s² */
-  maxAccel: number;
+  /** Unused by the scripted loft; kept for data completeness */
+  maxAccel?: number;
   /** Cruise altitude above launch for top-attack, m */
   loftHeight?: number;
 }
@@ -196,6 +196,8 @@ export interface BlastRequest {
   travelSpeed?: number;
   source?: AmmoSpec;
   label?: string;
+  /** Detonation moment when it falls part-way through the current fixed step (default: ctx.time.now) */
+  time?: number;
 }
 
 /**

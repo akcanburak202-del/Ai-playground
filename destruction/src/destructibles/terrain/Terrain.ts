@@ -58,6 +58,7 @@ interface PaintJob {
 }
 
 const _v = new THREE.Vector3();
+const _nv = new THREE.Vector3();
 const _n: number[] = [0, 1, 0];
 
 interface Tile {
@@ -75,6 +76,21 @@ interface Tile {
 /** Render LOD steps (cells per quad) and the camera distance up to which each is used, m. */
 const LOD_STEPS = [1, 2, 4, 8];
 const LOD_RANGE = [28, 55, 110, Infinity];
+/**
+ * Vertical skirt hung below every tile edge, m (plus half the tile's relief). Neighbouring tiles at
+ * different LODs meet in T-junctions, which leave pixel cracks (sky specks at grazing angles) even
+ * where the heights agree; the skirt fills them from below.
+ */
+const SKIRT = 0.3;
+/** Vertices of one tile: the (TILE+1)² grid, then one row of skirt vertices per edge. */
+const GRID_VERTS = (TILE + 1) * (TILE + 1);
+const TILE_VERTS = GRID_VERTS + 4 * (TILE + 1);
+
+/** Grid index of the k-th vertex along tile edge e (0: j = 0, 1: j = TILE, 2: i = 0, 3: i = TILE). */
+function edgeVertex(e: number, k: number): number {
+  const s = TILE + 1;
+  return e === 0 ? k : e === 1 ? TILE * s + k : e === 2 ? k * s : k * s + TILE;
+}
 
 /**
  * The ground: a large field (default 600 m) whose central part (default 160 × 160 m) is a
@@ -137,8 +153,8 @@ export class Terrain implements Destructible {
       return n * inner * edge;
     });
     // Tiles share their index buffers (identical topology). Coarser levels skip vertices; the
-    // vertex normals still come from the full-resolution grid, and the gentle swales deviate
-    // < 1 mm between levels, so LOD seams are invisible (the far ring sits under them anyway).
+    // vertex normals still come from the full-resolution grid, the gentle swales deviate < 1 mm
+    // between levels, and edge skirts close the T-junction cracks where levels meet.
     this.tilesPerSide = Math.ceil(this.field.n / TILE);
     const s = TILE + 1;
     for (const step of LOD_STEPS) {
@@ -148,6 +164,14 @@ export class Terrain implements Destructible {
           const a = j * s + i, b = a + step, c = a + step * s, d = c + step;
           // Same diagonal as Heightfield / Rapier: (i,j)–(i+1,j+1). Counter-clockwise seen from +Y.
           idx.push(a, d, b, a, c, d);
+        }
+      }
+      // Skirts, both windings (a crack can be seen from either side of the edge).
+      for (let e = 0; e < 4; e++) {
+        for (let k = 0; k < TILE; k += step) {
+          const a = edgeVertex(e, k), b = edgeVertex(e, k + step);
+          const sa = GRID_VERTS + e * s + k, sb = sa + step;
+          idx.push(a, b, sb, a, sb, sa, a, sb, b, a, sa, sb);
         }
       }
       this.indices.push(new THREE.BufferAttribute(new Uint16Array(idx), 1));
@@ -212,6 +236,9 @@ export class Terrain implements Destructible {
   heightAt(x: number, z: number): number {
     return this.field.contains(x, z) ? this.field.heightAt(x, z) : 0;
   }
+
+  private heightFn = (x: number, z: number): number => this.heightAt(x, z);
+  private normalFn = (x: number, z: number, out: number[]): number[] => this.field.normalAt(x, z, out);
 
   private onPlaza(x: number, z: number): boolean {
     const p = this.plaza;
@@ -285,13 +312,20 @@ export class Terrain implements Destructible {
     }
     const soilHit = e.material.class === 'soil';
     const r = Math.max(e.craterRadius, e.ammo.diameter * 1.2, 0.01);
-    this.pocks.add(e.point, e.normal, r * (soilHit ? 1.6 : 1.25), soilHit ? 1 : 0, this.ctx.rng.next());
-    // Cannon and heavier: the pock is big enough for the height field (≥ 0.6 cell).
-    if (r >= 0.6 * this.field.cell && this.field.contains(e.point.x, e.point.z)) {
+    const p = e.point;
+    // Cannon and heavier: the pock is big enough for the height field (≥ 0.6 cell). Dig first so
+    // the mark lands on the new surface (the floor of the pock) rather than hovering over it.
+    if (r >= 0.6 * this.field.cell && this.field.contains(p.x, p.z)) {
       const depth = Math.min(Math.max(e.craterDepth, 0.4 * r), 1.2 * r);
       const c: CraterShape = { radius: r, depth, lipHeight: 0.15 * depth, ejectaRadius: 2.2 * r, pavingRadius: soilHit ? 0 : 1.3 * r };
-      this.dig(e.point.x, e.point.z, c, 0.15);
+      this.dig(p.x, p.z, c, 0.15);
+      this.field.normalAt(p.x, p.z, _n);
+      _v.set(p.x, this.field.heightAt(p.x, p.z), p.z);
+      _nv.set(_n[0]!, _n[1]!, _n[2]!);
+      this.pocks.add(_v, _nv, r * (soilHit ? 1.6 : 1.25), soilHit ? 1 : 0, this.ctx.rng.next());
+      return;
     }
+    this.pocks.add(p, e.normal, r * (soilHit ? 1.6 : 1.25), soilHit ? 1 : 0, this.ctx.rng.next());
   }
 
   applyBlast(load: BlastLoad): void {
@@ -328,9 +362,14 @@ export class Terrain implements Destructible {
     const ref = this.field.heightAt(cx, cz);
     const reach = Math.max(c.ejectaRadius, c.radius * 1.6);
     const rim = rimWobbleTable(seed);
-    const range = this.field.stamp(cx, cz, reach, (r, a) => craterProfile(c, r, wobbleAt(rim, a)), ref);
+    // The mesh gets the lip widened to at least ~1.3 cells (same cross-section): a ridge narrower
+    // than the grid aliases into isolated spikes. The splat relief keeps the true profile.
+    const minLip = 1.3 * this.field.cell;
+    const range = this.field.stamp(cx, cz, reach, (r, a) => craterProfile(c, r, wobbleAt(rim, a), minLip), ref);
     if (range) this.markDirty(range.i0, range.i1, range.j0, range.j1);
     this.paintRelief(cx, cz, reach, c, rim);
+    // Marks inside the crater went with the ground; the rest now sit on the lip and ejecta.
+    this.pocks.conform(cx, cz, reach, Math.max(c.radius * 1.05, c.pavingRadius * 0.8), this.heightFn, this.normalFn);
     // Splat: soil cover inside the ejecta blanket, shattered paving, soot at the seat.
     this.paintDisc(cx, cz, c.ejectaRadius, SPLAT_SOIL, (r) => (r < c.radius * 1.05 ? 1 : Math.pow(Math.max(0, 1 - (r - c.radius) / (c.ejectaRadius - c.radius + 1e-6)), 1.6) * 0.9), seed);
     if (this.plaza && c.pavingRadius > 0) {
@@ -453,7 +492,8 @@ export class Terrain implements Destructible {
       const d = Math.hypot(dx, dz, cam.y);
       let lod = 0;
       while (lod < LOD_RANGE.length - 1 && d > LOD_RANGE[lod]!) lod++;
-      if (t.scarred) lod = Math.min(lod, 1);
+      // Cratered tiles keep their full detail wherever the crater can still be resolved.
+      if (t.scarred) lod = d > LOD_RANGE[2]! ? Math.min(lod, 1) : 0;
       if (lod !== t.lod) {
         t.lod = lod;
         t.mesh.geometry.setIndex(this.indices[lod]!);
@@ -513,9 +553,8 @@ export class Terrain implements Destructible {
 
   private buildTileGeometry(i0: number, j0: number): THREE.BufferGeometry {
     const g = new THREE.BufferGeometry();
-    const n = (TILE + 1) * (TILE + 1);
-    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TILE_VERTS * 3), 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(TILE_VERTS * 3), 3));
     g.setIndex(this.indices[0]!);
     this.writeTileAttributes(g, i0, j0);
     return g;
@@ -551,10 +590,26 @@ export class Terrain implements Destructible {
         k += 3;
       }
     }
+    // Skirt: a copy of each edge vertex lowered by the skirt depth, with the edge's normal so its
+    // (rarely visible) sliver shades like the surface above it. Deeper where the tile has relief
+    // (a crater crossing the edge can differ more between LOD levels).
+    const drop = SKIRT + 0.5 * (hi - lo);
+    for (let e = 0; e < 4; e++) {
+      for (let q = 0; q <= TILE; q++) {
+        const src = edgeVertex(e, q) * 3;
+        const dst = (GRID_VERTS + e * (TILE + 1) + q) * 3;
+        P[dst] = P[src]!;
+        P[dst + 1] = P[src + 1]! - drop;
+        P[dst + 2] = P[src + 2]!;
+        N[dst] = N[src]!;
+        N[dst + 1] = N[src + 1]!;
+        N[dst + 2] = N[src + 2]!;
+      }
+    }
     pos.needsUpdate = true;
     nor.needsUpdate = true;
     const x0 = f.x0 + i0 * c, z0 = f.z0 + j0 * c;
-    g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, lo, z0), new THREE.Vector3(x0 + TILE * c, hi, z0 + TILE * c));
+    g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, lo - drop, z0), new THREE.Vector3(x0 + TILE * c, hi, z0 + TILE * c));
     g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
   }
 

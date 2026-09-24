@@ -57,16 +57,18 @@ export function blastCrater(contactRadius: number, contactDepth: number, hob: nu
 /**
  * Radial surface profile of a crater: `cut` is the bowl relative to the reference surface (the
  * surface is lowered to at most ref + cut), `add` is the lip and ejecta added on top.
- * `wobble` in [−1, 1] perturbs the rim radius (irregular craters, ±12 %).
+ * `wobble` in [−1, 1] perturbs the rim radius (irregular craters, ±12 %). `minLipWidth` (m) widens
+ * the lip ridge for a coarse sampling grid, lowering it so its cross-section (volume) is unchanged.
  */
-export function craterProfile(c: CraterShape, r: number, wobble: number): { cut: number; add: number } {
+export function craterProfile(c: CraterShape, r: number, wobble: number, minLipWidth = 0): { cut: number; add: number } {
   const R = c.radius * (1 + 0.12 * wobble);
   if (R <= 1e-4) return { cut: Infinity, add: 0 };
   const x = r / R;
   // Paraboloid bowl, flattened slightly at the floor.
   const cut = x < 1 ? -c.depth * Math.pow(1 - x * x, 0.85) : Infinity;
   // Lip: a Gaussian ridge centred on the rim; ejecta: exponential blanket beyond it.
-  const lip = c.lipHeight * Math.exp(-(((r - R) / (0.32 * R)) ** 2));
+  const w = Math.max(0.32 * R, minLipWidth);
+  const lip = c.lipHeight * ((0.32 * R) / w) * Math.exp(-(((r - R) / w) ** 2));
   const ejecta = r > R ? 0.12 * c.lipHeight * Math.exp(-(r - R) / (0.6 * R)) : 0;
   return { cut, add: lip + ejecta };
 }

@@ -184,13 +184,17 @@ float stEps = vStrain;
 vec3 stAlbedo;
 float stRough, stMetal, stHeight = 0.0;
 bool stInside = !gl_FrontFacing || vRim > 0.5;
+// Millimetre grain (rolling texture, pits), faded out before it would alias.
+float stFine = clamp(1.5 - 600.0 * length(fwidth(stM)), 0.0, 1.0);
+float stGrain = stFine * (stNoise(stP * 700.0) - 0.5);
 // Fresh bright steel (fracture / gouge / exposed metal).
 vec3 stBare = vec3(0.4, 0.4, 0.395) * (0.8 + 0.4 * stN2);
 #if defined(FINISH_MILL)
   // Hot-rolled mill scale: blue-grey magnetite, mottled, with sparse rust blooms; the brittle scale
   // cracks and spalls where the steel has yielded (Lüders bands / scale flaking).
   stAlbedo = mix(vec3(0.050, 0.056, 0.064), vec3(0.085, 0.088, 0.092), stN1);
-  stAlbedo *= 0.85 + 0.3 * stN2;
+  stAlbedo *= (0.85 + 0.3 * stN2) * (1.0 + 0.25 * stGrain);
+  stHeight += 0.00003 * stGrain;
   float stRust = smoothstep(0.62, 0.8, stFbm(stP * 1.3 + 3.0)) * 0.6;
   stAlbedo = mix(stAlbedo, vec3(0.16, 0.07, 0.03), stRust);
   stRough = 0.5 + 0.25 * stN2 + 0.2 * stRust;
@@ -254,12 +258,13 @@ vec3 stBare = vec3(0.4, 0.4, 0.395) * (0.8 + 0.4 * stN2);
   stMetal = 0.0;
   stHeight += 0.0004 * stCast;
 #else
-  // Sprayed fireproofing (cementitious SFRM): light grey, very rough, lumpy.
-  float stLump = stFbm(stP * 35.0);
+  // Sprayed fireproofing (cementitious SFRM): light grey, very rough, lumpy. Noise in object space:
+  // the coat is much thicker than the steel faces its texture coordinates come from.
+  float stLump = stFbm(vObj * 35.0 + uSeed);
   stAlbedo = vec3(0.42, 0.41, 0.39) * (0.8 + 0.35 * stLump);
   stRough = 0.97;
   stMetal = 0.0;
-  stHeight += 0.003 * stLump + 0.0008 * stNoise(stP * 250.0);
+  stHeight += 0.003 * stLump + 0.0008 * stNoise(vObj * 250.0);
 #endif
 // Chips / scars: paint → primer → bare metal; mill scale → bright steel; patina → fresh steel.
 float stScar = stDet.g;
@@ -290,6 +295,14 @@ if (stInside) {
   stRough = 0.78;
   stMetal = 0.85;
   stHeight += 0.0003 * stNoise(stP * 300.0);
+  // The inner side of a face, seen only through a hole: the far wall of a narrow bore that the
+  // shadow map cannot resolve (the thickness is below its normal bias). Treat it as the occluded
+  // cavity it is.
+  if (vRim < 0.5) {
+    stAlbedo *= 0.3;
+    stMetal = 0.5;
+    stRough = 0.9;
+  }
 #endif
 }
 stAlbedo = mix(stAlbedo, vec3(0.25, 0.24, 0.23), stLip * 0.6);

@@ -29,6 +29,40 @@ export function scopeFor(w: WeaponSpec): ScopeKind {
   return null;
 }
 
+/**
+ * The sights' published true fields (vertical) at a reference magnification. An eyepiece shows a
+ * fixed apparent field, so at magnification Z: tan(true/2) = tan(apparent/2) / Z with
+ * tan(apparent/2) = Z_ref · tan(true_ref/2). Riflescope: a 4.5–14× tactical scope at 10× sees
+ * 10.4 ft at 100 yd = 2.17° (Leupold Mark 4 LR/T data). Javelin CLU day sight: 4× with a
+ * 6.40° × 4.80° field (FM 3-22.37, Javelin Medium Antiarmor Weapon System).
+ */
+export const SIGHT_TRUE_FIELD: Record<Exclude<ScopeKind, null>, { deg: number; zoom: number }> = {
+  rifle: { deg: 2.17, zoom: 10 },
+  clu: { deg: 4.8, zoom: 4 },
+};
+
+/**
+ * Fraction of the viewport height the sight's aperture covers: the round eyepiece is 0.92 of the
+ * shorter side; the CLU display is 0.74 of the height, or 0.62 of the width on narrow screens.
+ * ScopeOverlay draws exactly these apertures.
+ */
+export function scopeAperture(kind: Exclude<ScopeKind, null>, aspect: number): number {
+  const a = Number.isFinite(aspect) && aspect > 0 ? aspect : 16 / 9;
+  return kind === 'rifle' ? 0.92 * Math.min(1, a) : Math.min(0.74, 0.62 * a);
+}
+
+/**
+ * Vertical camera field of view (degrees) at which the sight's aperture spans its real true
+ * field. With the aperture filling a fraction k of the screen height, tan(φ/2) = tan(true/2) / k,
+ * so the scene and the reticle stay in real proportion (1 mil on the reticle = 1 mrad).
+ */
+export function scopeFov(kind: Exclude<ScopeKind, null>, zoom: number, aspect: number): number {
+  const ref = SIGHT_TRUE_FIELD[kind];
+  const tanApparent = ref.zoom * Math.tan((ref.deg * Math.PI) / 360);
+  const t = tanApparent / Math.max(1, zoom) / scopeAperture(kind, aspect);
+  return (Math.atan(t) * 360) / Math.PI;
+}
+
 const NS = 'http://www.w3.org/2000/svg';
 
 function svgEl<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number>, parent?: Element): SVGElementTagNameMap[K] {
@@ -213,7 +247,7 @@ export class ScopeOverlay {
     const pxPerMil = (0.001 / Math.tan((fovDeg * Math.PI) / 360)) * (h / 2);
     const ink = 'rgba(8,8,8,0.92)';
     if (kind === 'rifle') {
-      const R = Math.min(w, h) * 0.46;
+      const R = (scopeAperture('rifle', w / h) * h) / 2;
       svgEl('path', { d: `M0 0H${w}V${h}H0Z M${cx - R} ${cy}a${R} ${R} 0 1 0 ${2 * R} 0a${R} ${R} 0 1 0 ${-2 * R} 0Z`, fill: 'rgb(6,6,5)', 'fill-rule': 'evenodd' }, s);
       const defs = svgEl('defs', {}, s);
       const grad = svgEl('radialGradient', { id: 'dx-vig', cx: '50%', cy: '50%', r: '50%' }, defs);
@@ -231,10 +265,11 @@ export class ScopeOverlay {
         svgEl('circle', { cx, cy: cy + i * pxPerMil, r: dot, fill: ink }, s);
       }
       svgEl('circle', { cx, cy, r: 1.6, fill: '#ffb547' }, s);
-      this.label = svgEl('text', { x: cx + R * 0.5, y: cy + R * 0.62, fill: '#ffb547', 'font-family': 'Martian Mono, monospace', 'font-size': 11, 'font-stretch': '87.5%' }, s);
+      // Range and magnification, lower left inside the eyepiece (clear of the touch buttons on the right).
+      this.label = svgEl('text', { x: cx - R * 0.62, y: cy + R * 0.62, fill: '#ffb547', 'font-family': 'Martian Mono, monospace', 'font-size': 11, 'font-stretch': '87.5%' }, s);
     } else {
-      // Javelin CLU day sight: 4:3 field, black surround, track gate brackets.
-      const fh = Math.min(h * 0.74, w * 0.62), fw = fh * 1.3;
+      // Javelin CLU day sight: 6.4° × 4.8° field (4:3), black surround, track gate brackets.
+      const fh = scopeAperture('clu', w / h) * h, fw = fh * (4 / 3);
       const x0 = cx - fw / 2, y0 = cy - fh / 2;
       svgEl('path', { d: `M0 0H${w}V${h}H0Z M${x0} ${y0}h${fw}v${fh}h${-fw}Z`, fill: 'rgb(8,9,8)', 'fill-rule': 'evenodd' }, s);
       svgEl('rect', { x: x0, y: y0, width: fw, height: fh, fill: 'rgba(120,150,110,0.06)', stroke: 'rgba(239,233,223,0.3)' }, s);
@@ -247,7 +282,7 @@ export class ScopeOverlay {
         e.textContent = t;
         return e;
       };
-      txt(x0 + 14, y0 + 22, 'GÜNDÜZ · DAR GÖRÜŞ');
+      txt(x0 + 14, y0 + 22, 'GÜNDÜZ NİŞANGAHI · 6,4° × 4,8°');
       txt(x0 + fw - 14, y0 + 22, 'TEPEDEN VURUŞ', 'end');
       this.label = txt(x0 + fw - 14, y0 + fh - 14, '', 'end');
       this.label.setAttribute('fill', amber);

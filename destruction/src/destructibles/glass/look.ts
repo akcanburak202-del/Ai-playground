@@ -30,6 +30,8 @@ export interface GlassUniforms {
   uCollapse: THREE.IUniform<THREE.Vector4>;
   /** (cluster cell s, visual die size d) */
   uDice: THREE.IUniform<THREE.Vector2>;
+  /** Pane-wide milkiness 0..1 (PVB delamination of blast-loaded laminated glass) */
+  uHaze: THREE.IUniform<number>;
 }
 
 export function createGlassUniforms(crack: THREE.Texture, w: number, h: number, t: number, seed: number, tint: THREE.Color): GlassUniforms {
@@ -41,6 +43,7 @@ export function createGlassUniforms(crack: THREE.Texture, w: number, h: number, 
     uBreak: { value: new THREE.Vector4(0, 0, 0, 0) },
     uCollapse: { value: new THREE.Vector4(0.05, 10, 0, 0) },
     uDice: { value: new THREE.Vector2(0.008, 0.008) },
+    uHaze: { value: 0 },
   };
 }
 
@@ -53,6 +56,7 @@ uniform float uTime;
 uniform vec4 uBreak;
 uniform vec4 uCollapse;
 uniform vec2 uDice;
+uniform float uHaze;
 
 uint gHash(uint x) {
   x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u;
@@ -104,6 +108,16 @@ GlassState glassState(vec2 uv, float shard) {
   g.crazed = 0.0;
   g.lod = 0.0;
   g.glint = 0.0;
+  if (uHaze > 0.0) {
+    // Blotchy whitening (value noise on a ~4 cm lattice).
+    vec2 q = uv * uPane.xy / 0.04;
+    vec2 i0 = floor(q), f = fract(q);
+    f = f * f * (3.0 - 2.0 * f);
+    uint hs = uint(uPane.w) + 31u;
+    float n = mix(mix(gHash01(int(i0.x), int(i0.y), hs), gHash01(int(i0.x) + 1, int(i0.y), hs), f.x),
+                  mix(gHash01(int(i0.x), int(i0.y) + 1, hs), gHash01(int(i0.x) + 1, int(i0.y) + 1, hs), f.x), f.y);
+    g.frost = max(g.frost, uHaze * (0.35 + 0.65 * n));
+  }
   if (uBreak.w > 0.5) {
     vec2 p = uv * uPane.xy;
     vec2 rel = p - uBreak.xy;

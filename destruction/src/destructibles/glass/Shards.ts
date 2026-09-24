@@ -6,6 +6,7 @@ import type { MaterialProps } from '../../physics/materials.ts';
 import { clipHalfPlane, convexHull, pointInPoly, polyArea, polyBounds, polyCentroid, type Poly } from './polygon.ts';
 import { createReflectionMaterial, createTransmissionMaterial, type GlassUniforms } from './look.ts';
 import { shardPieces, DICE_AREA } from './model.ts';
+import { exhausted, spend } from './budget.ts';
 
 /** Most rigid shards one pane keeps (rows of the transform texture). */
 export const MAX_SHARDS = 160;
@@ -16,6 +17,8 @@ export interface ShardInit {
   holes: Poly[];
   linvel: THREE.Vector3;
   angvel: THREE.Vector3;
+  /** Seconds the piece has already been flying (spawned late): start from its ballistic position */
+  age?: number;
 }
 
 interface Shard {
@@ -196,6 +199,13 @@ export class Shards {
     const mass = this.material.density * this.t * area;
     const pos = new THREE.Vector3(c[0], c[1], 0).applyMatrix4(paneMatrix);
     const quat = new THREE.Quaternion().setFromRotationMatrix(_m.extractRotation(paneMatrix));
+    const age = init.age ?? 0;
+    if (age > 0) {
+      // Drag-free flight over the delay (a few steps at most): x += v t + ½ g t², v += g t.
+      pos.addScaledVector(init.linvel, age);
+      pos.y -= 0.5 * 9.80665 * age * age;
+      init.linvel.y -= 9.80665 * age;
+    }
     const shard: Shard = {
       index, body: null, outer, ox, oy, area, size, mass, alive: true, v: init.linvel.clone(), sleepFor: 0,
       pos, quat, generation,
@@ -330,15 +340,22 @@ export class Shards {
   /** After the physics step: resolve pending breaks, record velocities, retire sleeping bodies. */
   fixedUpdate(dt: number): void {
     if (this.pending.length) {
+      // Within the scene's glass budget (at least two per step); the rest break a step later.
       const list = this.pending;
       this.pending = [];
       const done = new Set<Shard>();
-      for (const p of list) {
+      let k = 0;
+      for (; k < list.length; k++) {
+        const p = list[k]!;
         if (done.has(p.shard) || !p.shard.alive) continue;
+        if (done.size >= 2 && exhausted(this.ctx)) break;
         done.add(p.shard);
+        const t0 = performance.now();
         if (p.vn > 0.8) this.events.contact(p.point ?? p.shard.pos, p.impulse, p.shard.size);
         this.tryBreak(p);
+        spend(this.ctx, performance.now() - t0);
       }
+      for (; k < list.length; k++) this.pending.push(list[k]!);
     }
     const phys = this.ctx.physics;
     for (const s of this.shards) {

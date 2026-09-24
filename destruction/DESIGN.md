@@ -132,7 +132,7 @@ modules only realise the numbers.
 
 **Exterior ballistics.** Point-mass trajectory, gravity + quadratic drag
 `F = ½ ρ Cd A v²` (Cd from the ammo table, Mach-dependent G7-like curve optional), rocket
-thrust during burn, top-attack guidance for Javelin. Tracers visible; slow projectiles
+thrust during burn, and a scripted (cosmetic) top-attack loft arc for Javelin. Tracers visible; slow projectiles
 (RPG ≈ 115→295 m/s) visibly fly.
 
 **Terminal ballistics — brittle targets (concrete/stone/brick).** Modified NDRC (Kennedy 1976)
@@ -189,7 +189,7 @@ riddle glass). Pressure–impulse damage numbers for panes, walls and slabs.
 | 120 mm M829A3/A4 APFSDS vs RHA @ 2 km | ≈ 650–800 mm | ±15 % |
 | PG-7VL HEAT vs RHA | ≈ 500 mm; vs concrete ≈ 1.2–1.8 m | ±15 % |
 | Javelin vs RHA | ≈ 750–800 mm | ±15 % |
-| 1 kg TNT, R = 5 m: incident overpressure | ≈ 70 kPa (Kingery–Bulmash) | ±20 % |
+| 1 kg TNT, R = 5 m: normally reflected overpressure (incident ≈ 30 kPa) | ≈ 70 kPa (Kingery–Bulmash) | ±20 % |
 | 1 kg TNT, R = 5 m: arrival time | ≈ 8–9 ms | ±20 % |
 | Annealed 6 mm window 1.5 × 1 m fails at | ≈ 3–7 kPa reflected | range |
 
