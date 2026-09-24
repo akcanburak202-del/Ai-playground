@@ -81,6 +81,7 @@ async function start(): Promise<void> {
       applyLookBeforeLoad(pipeline, SCENE_LOOKS[def.id]);
       await sim.loadScene(def);
       applyLookAfterLoad(sim.ctx, SCENE_LOOKS[def.id]);
+      fractureQueueFor(sim.ctx).maxMs = 0;
       // Keep the address pointing at the scene; sandboxed frames may refuse history changes.
       try {
         if (location.hash.slice(1) !== def.id) history.replaceState(null, '', `#${def.id}`);

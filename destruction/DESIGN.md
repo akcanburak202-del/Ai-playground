@@ -265,6 +265,8 @@ cracks, stays in the frame, sags with damage, tears out when heavily hit. Blast 
 
 ### M5 — rendering, environment, FX, terrain
 
+- The Pipeline publishes its quality level as `scene.userData.renderQuality` (`renderQualityOf()` in
+  `src/render/Pipeline.ts`) so scene-build code can size decoration and terrain to the device.
 - Golden-hour physical sky (three `Sky` addon) + PMREM environment, sun shadows (cascaded or
   fitted to the camera), ACES/AgX tone mapping, GTAO ambient occlusion, bloom for fire/hot
   metal/tracers, SMAA/FXAA, subtle fog/aerial perspective. Quality levels 0/1/2.
