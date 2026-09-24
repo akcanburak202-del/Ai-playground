@@ -565,15 +565,43 @@ export class SteelPlate implements Destructible, Structural {
     this.triSphereVersion = this.geomVersion;
   }
 
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
+  /**
+   * Ray test in world space. `radius` is the round's: a hole narrower than it is solid (it strikes
+   * the rim) — texture holes by the disc test, mesh holes by rays offset by the radius on four sides.
+   */
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, radius = 0): RayHit | null {
     if (this.disposed) return null;
     this.ensureTriSpheres();
     const inv = this.invPivot;
     _o.copy(origin).applyMatrix4(inv);
     _d.copy(dir).transformDirection(inv);
+    // Radius in plate-local units (the pivot carries no scale).
+    let found = this.scanTris(_o.x, _o.y, _o.z, maxDist, radius);
+    if (!found && radius >= 0.005) {
+      // The centre went through a gap in the sheet: a round wider than the gap strikes its rim.
+      const e1 = _w.set(Math.abs(_d.x) < 0.9 ? 1 : 0, Math.abs(_d.x) < 0.9 ? 0 : 1, 0).cross(_d).normalize().clone();
+      const e2 = new THREE.Vector3().crossVectors(_d, e1);
+      const o0 = _o.clone();
+      for (const [a, b] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+        const ox = o0.x + radius * (a * e1.x + b * e2.x), oy = o0.y + radius * (a * e1.y + b * e2.y), oz = o0.z + radius * (a * e1.z + b * e2.z);
+        found = this.scanTris(ox, oy, oz, maxDist, radius);
+        if (found) {
+          _o.set(ox, oy, oz);
+          break;
+        }
+      }
+    }
+    if (!found) return null;
+    const s = this.sim, x = s.x;
+    const { best, bestT, bu, bv } = found;
+    return this.finishHit(origin, s, x, best, bestT, bu, bv);
+  }
+
+  /** Nearest live, solid triangle along the (local) ray from (ox, oy, oz) along _d. */
+  private scanTris(ox: number, oy: number, oz: number, maxDist: number, radius: number): { best: number; bestT: number; bu: number; bv: number } | null {
     const s = this.sim, x = s.x, sp = this.triSphere;
-    const ox = _o.x, oy = _o.y, oz = _o.z, dx = _d.x, dy = _d.y, dz = _d.z;
-    let best = maxDist, bestT = -1, bu = 0, bv = 0, bw = 0;
+    const dx = _d.x, dy = _d.y, dz = _d.z;
+    let best = maxDist, bestT = -1, bu = 0, bv = 0;
     for (let t = 0; t < s.nt; t++) {
       const r = sp[4 * t + 3]!;
       if (r < 0) continue;
@@ -604,14 +632,17 @@ export class SteelPlate implements Destructible, Structural {
       const ia = s.tv[3 * t]!, ib = s.tv[3 * t + 1]!, ic = s.tv[3 * t + 2]!;
       const ru = w * s.uv[2 * ia]! + u * s.uv[2 * ib]! + v * s.uv[2 * ic]!;
       const rv = w * s.uv[2 * ia + 1]! + u * s.uv[2 * ib + 1]! + v * s.uv[2 * ic + 1]!;
-      if (!this.detail.solid(0.5 * (ru / this.spec.width + 0.5), rv / this.spec.height + 0.5)) continue;
+      const hu = 0.5 * (ru / this.spec.width + 0.5), hv = rv / this.spec.height + 0.5;
+      if (!(radius > 0 ? this.detail.solidDisc(hu, hv, (0.5 * radius) / this.spec.width, radius / this.spec.height) : this.detail.solid(hu, hv))) continue;
       best = tt;
       bestT = t;
       bu = ru;
       bv = rv;
-      bw = w;
     }
-    if (bestT < 0) return null;
+    return bestT < 0 ? null : { best, bestT, bu, bv };
+  }
+
+  private finishHit(origin: THREE.Vector3, s: PlateSim, x: Float64Array, best: number, bestT: number, bu: number, bv: number): RayHit {
     // Normal of the struck triangle facing the ray; entry is on the face, t/2 before the mid-surface.
     const t = bestT;
     const a = 3 * s.tv[3 * t]!, b = 3 * s.tv[3 * t + 1]!, c = 3 * s.tv[3 * t + 2]!;
@@ -631,7 +662,6 @@ export class SteelPlate implements Destructible, Structural {
     const normal = _n.clone().transformDirection(this.pivot.matrixWorld);
     const dist = point.distanceTo(origin);
     const hit: RayHit = { target: this, point, normal, distance: dist, material: this.material, part: t };
-    void bw;
     this.hitCache = { hit, tri: t, u: bu, v: bv, local: mid, normal: _n.clone() };
     return hit;
   }

@@ -30,20 +30,27 @@ export interface ImpactRow {
   model: string;
   /** The round had already gone through something (it hit what lies behind a holed target) */
   secondary: boolean;
-  /** '' for a primary hit, else e.g. "2. hedef" (the round's second target) */
+  /** '' for a primary hit, else e.g. "2. hedef" (the round's second target) or "İkincil şarj" */
   follow: string;
+  /** Target struck (`HitGroup.keyOf`): the spot readout under this row must be on the same one */
+  spot: string;
 }
 
 /**
- * Did this impact come from a round that had already perforated something? Uses the resolver's
- * `priorPerforations` when it reports one; `undefined` when it does not (the caller may guess).
+ * Did this impact come from a round (or jet) that had already perforated something before it?
+ * The resolver reports `priorPerforations` on every impact; casing and behind-armour fragments are
+ * never follow-through hits of the viewer's round.
  */
-export function followThrough(e: ImpactEvent): boolean | undefined {
-  if (e.agent !== 'projectile') return e.agent === 'fragment' ? false : undefined;
-  return e.priorPerforations === undefined ? undefined : e.priorPerforations > 0;
+export function followThrough(e: ImpactEvent): boolean {
+  return e.agent !== 'fragment' && (e.priorPerforations ?? 0) > 0;
 }
 
-export function impactRow(e: ImpactEvent, secondary = followThrough(e) ?? false): ImpactRow {
+/**
+ * One telemetry row. `secondary` marks a hit that is not the viewer's primary result: a round or
+ * jet that came through something (`priorPerforations` > 0), or a charge the round carried in behind
+ * its jet (the HUD decides; defaults to the follow-through test).
+ */
+export function impactRow(e: ImpactEvent, secondary = followThrough(e)): ImpactRow {
   const n = e.priorPerforations ?? 0;
   return {
     key: `${e.ammo.id}|${e.agent}|${e.targetKind}|${e.targetName ?? ''}|${e.material.id}|${e.outcome}|${secondary ? 'b' : 'a'}`,
@@ -60,7 +67,8 @@ export function impactRow(e: ImpactEvent, secondary = followThrough(e) ?? false)
     description: describeImpact(e),
     model: e.summary,
     secondary,
-    follow: secondary ? (n > 0 ? `${n + 1}. hedef` : 'Arkadaki hedef') : '',
+    follow: secondary ? (n > 0 ? `${n + 1}. hedef` : 'İkincil şarj') : '',
+    spot: HitGroup.keyOf(e),
   };
 }
 
@@ -121,7 +129,8 @@ export class HitGroup {
   lastTime = -Infinity;
   /** Hits, decayed with a 0.5 s time constant: how hard this spot is being worked right now */
   activity = 0;
-  private key = '';
+  /** Target this spot is on (`HitGroup.keyOf`); read-only outside */
+  spot = '';
   /** First entry point: the depth reference plane passes through it */
   private ox = 0;
   private oy = 0;
@@ -146,7 +155,7 @@ export class HitGroup {
    * same target, within the spot's radius and not in front of the first hit's surface.
    */
   distance2(e: ImpactEvent): number {
-    if (this.count === 0 || HitGroup.keyOf(e) !== this.key) return Infinity;
+    if (this.count === 0 || HitGroup.keyOf(e) !== this.spot) return Infinity;
     const d = this.below(e.point);
     if (!(d > -0.05 && d < 3)) return Infinity;
     // Lateral offset from the spot's centre, in the first hit's entry plane.
@@ -160,7 +169,7 @@ export class HitGroup {
 
   /** Start a group at this hit; `minRadius` widens the spot for a dispersed weapon (m). */
   begin(e: ImpactEvent, minRadius = 0): void {
-    this.key = HitGroup.keyOf(e);
+    this.spot = HitGroup.keyOf(e);
     this.count = 0;
     this.profile.length = 0;
     this.stride = 1;
@@ -359,19 +368,30 @@ export const WINDOWS_SHATTER_PA = 6_900;
 export interface BlastRow {
   tnt: string;
   distance: string;
-  overpressure: string;
+  /** Peak incident (side-on) overpressure at the viewer: 'gelen basınç' */
+  incident: string;
+  /** Peak normally reflected overpressure at the viewer's range (a wall facing the charge there): 'yansıyan basınç' */
+  reflected: string;
   arrival: string;
   spl: string;
+  /** Quasi-static gas pressure of a confined detonation ('' in the open) */
+  gas: string;
   note: string;
   warn: boolean;
   label: string;
   /** Raw values for tests */
   ps: number;
+  pr: number;
   ta: number;
 }
 
-/** Blast as experienced at the viewer (Kingery–Bulmash incident values via the ballistics module). */
-export function blastRow(e: { center: { x: number; y: number; z: number; distanceTo(p: { x: number; y: number; z: number }): number }; tntKg: number; kind: BlastKind; normal?: unknown; label?: string }, viewer: { x: number; y: number; z: number }): BlastRow {
+/**
+ * Blast as experienced at the viewer: Kingery–Bulmash incident and normally reflected peak
+ * overpressure and arrival time (via the ballistics module, UFC 3-340-02 fig. 2-7/2-15), the sound
+ * level of the incident peak, and the quasi-static gas pressure the blast system reports for a
+ * confined detonation (UFC 3-340-02 §2-14, fig. 2-152).
+ */
+export function blastRow(e: { center: { x: number; y: number; z: number; distanceTo(p: { x: number; y: number; z: number }): number }; tntKg: number; kind: BlastKind; normal?: unknown; label?: string; gasPressure?: number }, viewer: { x: number; y: number; z: number }): BlastRow {
   const onSurface = !!e.normal || e.kind === 'contact' || e.kind === 'hesh';
   const W = hemisphericalCharge(e.tntKg, e.center.y, onSurface);
   const r = Math.max(0.3, e.center.distanceTo(viewer));
@@ -384,16 +404,22 @@ export function blastRow(e: { center: { x: number; y: number; z: number; distanc
     warn = true;
   } else if (ps >= WINDOWS_SHATTER_PA) note = `Pencereler kırılır (≥ ${fmtPressure(WINDOWS_SHATTER_PA)})`;
   else if (ps >= WINDOW_BREAK_PA) note = `Cam kırılma başlangıcı (≈ ${fmtPressure(WINDOW_BREAK_PA)})`;
+  const gasPa = e.gasPressure ?? 0;
+  const gas = gasPa > 0 ? fmtPressure(gasPa) : '';
+  if (gas) note = `Kapalı hacim: gaz basıncı uzun süre etkir · ${note}`;
   return {
     tnt: fmtMass(e.tntKg),
     distance: fmtDistance(r),
-    overpressure: fmtPressure(ps),
+    incident: fmtPressure(ps),
+    reflected: fmtPressure(bp.pr),
     arrival: fmtTime(bp.ta),
     spl: fmtDb(splFromPressure(ps)),
+    gas,
     note,
     warn,
     label: e.label ?? '',
     ps,
+    pr: bp.pr,
     ta: bp.ta,
   };
 }

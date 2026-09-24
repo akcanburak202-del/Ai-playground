@@ -6,7 +6,7 @@ import { material as getMaterial, type MaterialProps } from '../../physics/mater
 import type { BlastLoad, ImpactEvent, ProbeSegment, ThicknessProbe } from '../../physics/ballistics/types.ts';
 import type { PhysicsOwner } from '../../physics/PhysicsWorld.ts';
 import { BeamSim } from './beamSim.ts';
-import { sectionProps, type SectionPlate, type SectionProps } from './section.ts';
+import { contactCut, fm5250CutArea, sectionProps, type SectionPlate, type SectionProps } from './section.ts';
 import {
   accumulateDish, contactImpulse, diffusivity, dishStrain, fractureStrain, maxBlastMomentum, panelDish, sheetHeatLoss, steelParams, plugShearHeat,
   TAYLOR_QUINNEY, AMBIENT_C, type SteelParams,
@@ -105,6 +105,8 @@ interface BeamInit {
   detail: DetailMap;
   dents: Dent[];
   patches: DishPatch[];
+  /** Bearing pins of the piece (node index in the piece → bearing region) */
+  pins?: Map<number, THREE.Box3>;
 }
 
 /**
@@ -191,11 +193,15 @@ export class SteelBeam implements Destructible, Structural {
   private failed = false;
   private imposed = 0;
   private anchors = new Map<string, number[]>();
+  /** Nodes held by a bearing underneath (a pin that carries gravity only) → the bearing's region */
+  private pins = new Map<number, THREE.Box3>();
   private segs: SegFrame[] = [];
   private segVersion = -1;
   private version = 0;
   private hitCache: BeamHit | null = null;
   private hot = false;
+  /** Node positions the member was built with (lean of a free-headed column, see checkFailure) */
+  private restX: Float64Array | null = null;
   /** The last close-in / contact load as realised (diagnostics and the sandbox readout) */
   lastContact: { tntKg: number; kind: string; t: number; dish: number; dishR: number; breach: boolean; breachR: number; scab: number; impulse?: number; r0?: number } | null = null;
   /** Sim time since the member's temperatures were last integrated (coarse steps when not visible) */
@@ -255,6 +261,11 @@ export class SteelBeam implements Destructible, Structural {
     this.owner = { kind: 'beam', material: this.material, destructible: this };
     this.updateMesh();
     this.buildStaticColliders();
+    this.restX = Float64Array.from(this.sim.x);
+    if (init) {
+      if (init.pins) for (const [i, b] of init.pins) this.pins.set(i, b);
+      this.checkBalance();
+    }
   }
 
   /** Length of the original member (texture v spans it, so pieces keep their marks). */
@@ -288,6 +299,7 @@ export class SteelBeam implements Destructible, Structural {
   private buildCoat(): void {
     const out = offsetOutline(this.outline, 0.025);
     const swept = new SweptMesh(out, this.length, this.s0, Math.min(0.05, this.sim.ds / 3));
+    swept.dentShift = 0.025;
     const look = createSteelMaterial({
       finish: 'fireproofed', detail: this.detail.tex, heat: this.detail.heatTex, size: [out.perimeter, this.detailLength()],
       split: false, dimpleScale: 0.02, diffusivity: diffusivity(this.params), seed: (this.id * 17) % 89, coat: true,
@@ -311,24 +323,114 @@ export class SteelBeam implements Destructible, Structural {
 
   addAnchor(anchorId: string, regionWorld: THREE.Box3): void {
     if (this.mode === 'rigid' || this.anchors.has(anchorId)) return;
-    const box = regionWorld.clone().expandByScalar(Math.max(this.section.cy, this.section.cz));
     const nodes: number[] = [];
-    for (let i = 0; i < this.sim.n; i++) {
-      _v.set(this.sim.x[3 * i]!, this.sim.x[3 * i + 1]!, this.sim.x[3 * i + 2]!);
-      if (box.containsPoint(_v) && !this.sim.locked[i]) {
-        this.sim.anchorNode(i);
-        nodes.push(i);
+    const s = this.sim;
+    if (this.isBearing(regionWorld)) {
+      // A member lying on a bearing (a beam on a pier or a wall) is held there by gravity and
+      // friction, not gripped: a pin at the node nearest the bearing centre, free to rotate — a
+      // simply supported span. Clamping every node over the bearing would make it a built-in end.
+      const c = regionWorld.getCenter(_w);
+      let best = -1, bd = Infinity;
+      for (let i = 0; i < s.n; i++) {
+        const d = (s.x[3 * i]! - c.x) ** 2 + (s.x[3 * i + 2]! - c.z) ** 2;
+        if (d < bd && !s.locked[i]) {
+          bd = d;
+          best = i;
+        }
+      }
+      if (best >= 0) {
+        s.anchorNode(best);
+        nodes.push(best);
+        this.pins.set(best, regionWorld.clone());
+      }
+    } else {
+      // Column bases, splices and frame joints grip the section: every node inside is held (clamped).
+      const box = regionWorld.clone().expandByScalar(Math.max(this.section.cy, this.section.cz));
+      for (let i = 0; i < s.n; i++) {
+        _v.set(s.x[3 * i]!, s.x[3 * i + 1]!, s.x[3 * i + 2]!);
+        if (box.containsPoint(_v) && !s.locked[i]) {
+          s.anchorNode(i);
+          nodes.push(i);
+        }
       }
     }
     this.anchors.set(anchorId, nodes);
     this.wake();
   }
 
+  /**
+   * Is a support region a bearing underneath the member (it rests on it) rather than a joint that
+   * grips it? A roughly horizontal member whose support lies below its axis by more than half its
+   * half-depth — a column head or a frame joint encloses the section instead.
+   */
+  private isBearing(region: THREE.Box3): boolean {
+    const s = this.sim, n = s.n;
+    const ax = s.x[3 * (n - 1)]! - s.x[0]!, ay = s.x[3 * (n - 1) + 1]! - s.x[1]!, az = s.x[3 * (n - 1) + 2]! - s.x[2]!;
+    const al = Math.hypot(ax, ay, az) || 1;
+    if (Math.abs(ay / al) > 0.5) return false;
+    const c = region.getCenter(_w);
+    let k = 0, bd = Infinity;
+    for (let i = 0; i < n; i++) {
+      const d = (s.x[3 * i]! - c.x) ** 2 + (s.x[3 * i + 2]! - c.z) ** 2;
+      if (d < bd) {
+        bd = d;
+        k = i;
+      }
+    }
+    // Vertical half-extent of the section at that node (u = profile up, v = sideways).
+    const tx = s.t[3 * k]!, tz = s.t[3 * k + 2]!;
+    const ux = s.u[3 * k]!, uy = s.u[3 * k + 1]!, uz = s.u[3 * k + 2]!;
+    const vy = tz * ux - tx * uz; // (t × u)_y
+    const halfY = this.section.cy * Math.abs(uy) + this.section.cz * Math.abs(vy);
+    return region.max.y <= s.x[3 * k + 1]! - 0.5 * halfY;
+  }
+
   releaseAnchor(anchorId: string): void {
     const nodes = this.anchors.get(anchorId);
     if (!nodes) return;
     this.anchors.delete(anchorId);
-    for (const i of nodes) this.sim.releaseNode(i);
+    for (const i of nodes) {
+      this.sim.releaseNode(i);
+      this.pins.delete(i);
+    }
+    // A column whose base went cannot hold its floor: the floor and the column come down together.
+    if (this.sim.autoRoller && !this.sim.baseHeld()) this.dropHead();
+    this.wake();
+    this.checkBalance();
+  }
+
+  /**
+   * A member left resting on a single bearing (the other one gone, or a piece of a severed span)
+   * stays only while its centre of mass is over that bearing; otherwise it tips off: the pin lets
+   * go and the member falls as a rigid body, pivoting on the bearing's edge through its collider.
+   */
+  private checkBalance(): void {
+    const s = this.sim;
+    if (this.mode !== 'fixed' || this.disposed || s.roller >= 0 || s.ghostOn[0] || s.ghostOn[1]) return;
+    let bearing: THREE.Box3 | null = null;
+    const held: number[] = [];
+    for (let i = 0; i < s.n; i++) {
+      if (!s.locked[i]) continue;
+      const b = this.pins.get(i);
+      if (!b) return; // gripped somewhere: it stands (or cantilevers) on that
+      if (bearing && b !== bearing && !b.equals(bearing)) return; // two bearings: a simple span
+      bearing = b;
+      held.push(i);
+    }
+    if (!bearing || !held.length) return;
+    let m = 0, cx = 0, cz = 0;
+    for (let i = 0; i < s.n; i++) {
+      m += s.mass[i]!;
+      cx += s.mass[i]! * s.x[3 * i]!;
+      cz += s.mass[i]! * s.x[3 * i + 2]!;
+    }
+    cx /= Math.max(m, 1e-9);
+    cz /= Math.max(m, 1e-9);
+    if (cx >= bearing.min.x && cx <= bearing.max.x && cz >= bearing.min.z && cz <= bearing.max.z) return;
+    for (const i of held) {
+      s.releaseNode(i);
+      this.pins.delete(i);
+    }
     this.wake();
   }
 
@@ -348,8 +450,23 @@ export class SteelBeam implements Destructible, Structural {
   setImposedLoad(newtons: number): void {
     if (Math.abs(newtons - this.imposed) < 1) return;
     this.imposed = newtons;
-    if (!this.failed) this.sim.imposed = newtons;
+    if (!this.failed) {
+      this.sim.imposed = newtons;
+      // An upper-storey column: its floor bears on its head and holds it sideways (BeamSim.holdHead);
+      // with nothing left to carry, nothing holds the head either.
+      if (newtons > 0 && this.mode === 'fixed') this.sim.holdHead();
+      else if (newtons <= 0) this.dropHead();
+    }
     this.wake();
+  }
+
+  /** Let go of a head roller that was only there because of the carried floor. */
+  private dropHead(): void {
+    const s = this.sim;
+    if (!s.autoRoller || s.roller < 0) return;
+    s.imposed = 0;
+    s.releaseRoller();
+    s.autoRoller = false;
   }
 
   hasFailed(): boolean {
@@ -439,8 +556,20 @@ export class SteelBeam implements Destructible, Structural {
   private checkFailure(): void {
     if (this.failed) return;
     const s = this.sim;
-    if (s.roller < 0 || this.imposed <= 0) return;
-    const i = s.roller, j = i === 0 ? s.n - 1 : 0;
+    if (this.imposed <= 0) return;
+    // Loaded end i against the held end j: the roller of a ground-storey column, or the top of an
+    // upright member standing on what holds its base (an upper-storey column on its splice).
+    let i: number, j: number;
+    if (s.roller >= 0) {
+      i = s.roller;
+      j = i === 0 ? s.n - 1 : 0;
+    } else {
+      const lo = s.x[1]! <= s.x[3 * (s.n - 1) + 1]! ? 0 : s.n - 1;
+      const L0 = s.s0[s.n - 1]! - s.s0[0]!;
+      if (!s.locked[lo] || Math.abs(s.x[3 * (s.n - 1) + 1]! - s.x[1]!) < 0.7 * L0) return;
+      j = lo;
+      i = lo === 0 ? s.n - 1 : 0;
+    }
     const drop = s.s0[s.n - 1]! - s.s0[0]! - Math.hypot(s.x[3 * i]! - s.x[3 * j]!, s.x[3 * i + 1]! - s.x[3 * j + 1]!, s.x[3 * i + 2]! - s.x[3 * j + 2]!);
     let bow = 0;
     for (let k = 1; k < s.n - 1; k++) {
@@ -450,11 +579,11 @@ export class SteelBeam implements Destructible, Structural {
       bow = Math.max(bow, Math.hypot(s.x[3 * k]! - px, s.x[3 * k + 2]! - pz));
     }
     const L = this.length;
-    if (drop > 0.02 * L || bow > L / 25) {
-      let minA = 1;
-      for (let k = 0; k < s.n; k++) minA = Math.min(minA, s.areaFraction(k));
-      this.fail(drop > 0.02 * L && bow < L / 50 ? 'crushing' : 'buckling');
-    }
+    // A free-headed column can also lean over on a hinge at its base (bow and chord unchanged):
+    // once its head has drifted L/25 sideways it no longer carries the floor.
+    let drift = 0;
+    if (s.roller < 0 && this.restX) drift = Math.hypot(s.x[3 * i]! - this.restX[3 * i]!, s.x[3 * i + 2]! - this.restX[3 * i + 2]!);
+    if (drop > 0.02 * L || bow > L / 25 || drift > L / 25) this.fail(drop > 0.02 * L && bow < L / 50 && drift < L / 50 ? 'crushing' : 'buckling');
   }
 
   /** A node that has lost > 85 % of its section is cut through: the member splits there. */
@@ -476,8 +605,13 @@ export class SteelBeam implements Destructible, Structural {
     for (const [i0, i1] of parts) {
       const sub = s.slice(i0, i1);
       sub.imposed = 0;
+      // A column piece cut free below its head hangs from nothing that could carry it (the head
+      // connection only holds it sideways): it drops with the structure it held up.
+      if (sub.roller >= 0 && !sub.locked.some((l) => l === 1)) sub.releaseRoller();
+      const pins = new Map<number, THREE.Box3>();
+      for (const [i, b] of this.pins) if (i >= i0 && i <= i1) pins.set(i - i0, b);
       const beam = new SteelBeam(this.ctx, { ...this.spec, name: `${this.name}-${i0 === 0 ? 'a' : 'b'}` }, {
-        sim: sub, s0: s.s0[i0]!, length: sub.ds * (sub.n - 1), detail: this.detail, dents: this.dents, patches: this.patches,
+        sim: sub, s0: s.s0[i0]!, length: sub.ds * (sub.n - 1), detail: this.detail, dents: this.dents, patches: this.patches, pins,
       });
       beam.failed = true;
       this.ctx.addDestructible(beam);
@@ -628,16 +762,17 @@ export class SteelBeam implements Destructible, Structural {
     }
   }
 
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
-    return this.rayTest(origin, dir, maxDist, false);
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, radius = 0): RayHit | null {
+    return this.rayTest(origin, dir, maxDist, false, radius);
   }
 
   /**
-   * Ray test against the profile plates. `throughHoles: false` skips surface points where a hole
-   * has been cut (projectiles pass through them); a blast front loads the whole plate facing it,
-   * holes or not, so blasts look for the struck face with `true`.
+   * Ray test against the profile plates. `solidPlates: false` skips surface points where a hole
+   * has been cut (projectiles pass through them) — unless the hole is narrower than the round's
+   * `radius`, which strikes its rim; a blast front loads the whole plate facing it, holes or not,
+   * so blasts look for the struck face with `true`.
    */
-  private rayTest(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, solidPlates: boolean): RayHit | null {
+  private rayTest(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, solidPlates: boolean, radius = 0): RayHit | null {
     if (this.disposed) return null;
     this.ensureSegs();
     this.rayToSim(origin, dir);
@@ -667,7 +802,7 @@ export class SteelBeam implements Destructible, Structural {
         const sArc = g.s + hs;
         // Through an existing hole?
         const pu = this.perimeterAt(hy, hz);
-        if (!solidPlates && !this.detail.solid(pu, sArc / L)) continue;
+        if (!solidPlates && !(radius > 0 ? this.detail.solidDisc(pu, sArc / L, radius / this.outline.perimeter, radius / L) : this.detail.solid(pu, sArc / L))) continue;
         best = hit.t;
         bestSeg = k;
         bestPlate = p;
@@ -946,7 +1081,9 @@ export class SteelBeam implements Destructible, Structural {
     const before = patch ? patch.dish : 0;
     if (!patch) {
       const f = this.faceAt(c.y, c.z);
-      const dent: Dent = { s: c.s, y: c.y, z: c.z, dy: -f.ny, dz: -f.nz, R, depth: 0 };
+      const type = this.section.profile.type;
+      const freeEdges = (type === 'I' && pl.name.endsWith('flange')) || type === 'cruciform';
+      const dent: Dent = { s: c.s, y: c.y, z: c.z, dy: -f.ny, dz: -f.nz, R, depth: 0, t: pl.t, freeEdges };
       patch = { plate: c.plate, s: c.s, y: c.y, z: c.z, R, dish: 0, strain: 0, tLoss: 0, hits: 0, torn: false, dent };
       this.dents.push(dent);
       this.patches.push(patch);
@@ -987,6 +1124,44 @@ export class SteelBeam implements Destructible, Structural {
     this.paintHoleAlong(c, rb, 0.5, seed + 7, pl.t * 1.5 + 0.002);
     this.removeSection(this.nodeAt(c.s), c.plate, holeArea(pl, pl.t, rb, c.dy, c.dz) / Math.max(pl.A, 1e-9), rb);
     this.ctx.fx.sparks({ position: c.hit.point.clone(), direction: c.hit.normal.clone(), count: 30, speed: 14, hot: 0.8 });
+  }
+
+  /**
+   * A placed demolition charge that has breached the plate it sits on cuts the section around it:
+   * every plate within a radius R of the charge loses its steel inside R, R set by the charge's
+   * FM 5-250 cut area (section.ts contactCut / fm5250CutArea: 2.1 kg TNT cuts an HEB 200) and
+   * bounded by 4 r_b, the reach of the products that shear through behind the breach. The struck
+   * plate loses at least the breach itself. The kerf along the member is the breach width.
+   */
+  private cutSection(node: number, c: BeamHit, load: BlastLoad, rb: number, seed: number): void {
+    const g = this.segs[c.seg]!;
+    const sec = this.section, P = sec.plates.length;
+    _v.copy(load.center).sub(g.c);
+    // The charge in section coordinates, pulled onto the struck face if it sits off it.
+    let y0 = _v.dot(g.u), z0 = _v.dot(g.v);
+    const off = Math.hypot(y0 - c.y, z0 - c.z);
+    if (off > rb) {
+      y0 = c.y + ((y0 - c.y) * rb) / off;
+      z0 = c.z + ((z0 - c.z) * rb) / off;
+    }
+    const pl = sec.plates[c.plate]!;
+    const budget = fm5250CutArea(load.tntKg, this.material.tensileStrength);
+    const { lost, R } = contactCut(sec, y0, z0, budget, Math.max(4 * rb, pl.t + rb), this.sim.frac, node * P);
+    lost[c.plate] = Math.max(lost[c.plate]!, holeArea(pl, pl.t, rb, c.dy, c.dz) * this.sim.frac[node * P + c.plate]!);
+    for (let p = 0; p < P; p++) if (lost[p]! > 0) this.removeSection(node, p, lost[p]! / Math.max(sec.plates[p]!.A, 1e-9), rb);
+    // Draw the cut: a hole on every face of the outline within R of the charge, as long across the
+    // face as the disc's chord there and as wide along the member as the breach.
+    const L = this.detailLength(), per = this.outline.perimeter, v = c.s / L;
+    const Rd = Math.max(R, rb);
+    for (const f of this.faces) {
+      const ey = f.yb - f.ya, ez = f.zb - f.za;
+      const l2 = ey * ey + ez * ez || 1e-12;
+      const t = Math.max(0, Math.min(1, ((y0 - f.ya) * ey + (z0 - f.za) * ez) / l2));
+      const d = Math.hypot(f.ya + t * ey - y0, f.za + t * ez - z0);
+      if (d >= Rd) continue;
+      const half = Math.sqrt(Rd * Rd - d * d);
+      this.detail.hole(f.pa + t * (f.pb - f.pa), v, half / per, (1.1 * rb) / L, 0.45, seed + d * 100);
+    }
   }
 
   /** Keep at most MAX_DENTS dents: the shallowest go first (never a live dish patch). */
@@ -1097,9 +1272,10 @@ export class SteelBeam implements Destructible, Structural {
       if (Jb[3 * i] === 0 && Jb[3 * i + 1] === 0 && Jb[3 * i + 2] === 0) continue;
       s.addImpulse(s.s0[i]! - this.s0, Jb[3 * i]! * Jscale, Jb[3 * i + 1]! * Jscale, Jb[3 * i + 2]! * Jscale);
     }
-    // Face towards the charge at the nearest node: where soot, dishes and breaches go.
+    // Face towards the charge at the foot of the charge on the member axis (not the nearest node,
+    // which would bias every mark to the node grid): where soot, dishes and breaches go.
     const probeFrom = load.center.clone();
-    const toNode = new THREE.Vector3(s.x[3 * nearest]!, s.x[3 * nearest + 1]!, s.x[3 * nearest + 2]!).sub(probeFrom).normalize();
+    const toNode = this.axisFoot(load.center, nearest, new THREE.Vector3()).sub(probeFrom).normalize();
     const hit = this.rayTest(probeFrom, toNode, Math.sqrt(nd) + 1, true);
     const c = hit ? this.hitCache : null;
     const seed = this.ctx.rng.next() * 100;
@@ -1159,24 +1335,37 @@ export class SteelBeam implements Destructible, Structural {
         dishAdd = panelDish(this.params, I, Rp, Math.max(r0, 0.053 * w3), tLoc);
         this.lastContact = { tntKg: load.tntKg, kind: load.kind, t: tLoc, dish: dishAdd, dishR: Rp, breach: false, breachR: 0, scab: 0, impulse: I, r0 };
       }
+      // A breach the ballistics module did not call but the accumulated strain did is a tear of the
+      // struck plate only (the web and the far flange behind it are untouched by a dish).
+      let torn = false;
       if (dishAdd > 5e-4 || breach || scabD > 0) {
         const patch = this.dish(c, dishR, dishAdd, scabD);
         if (!breach && patch.torn) {
-          breach = true;
+          breach = torn = true;
           rb = Math.max(rb, 0.4 * patch.R);
         }
         if (breach) patch.torn = patch.tornDrawn = true;
       }
       if (breach) {
-        this.paintHoleAlong(c, rb, 0.45, seed, pl.t * 3 + 0.002);
         const node = this.nodeAt(c.s);
-        // The breach takes the struck plate over 2·r_b, and the plates behind it if it is wider
-        // than the struck plate is thick (the jet of detonation products shears through).
-        const run = this.runThrough(c, contact ? 4 * rb : pl.t * 1.5);
-        for (const seg of run) {
-          const p = this.section.plates[seg.plate]!;
-          const chord = (seg.t1 - seg.t0) * Math.hypot(c.dy, c.dz);
-          this.removeSection(node, seg.plate, holeArea(p, Math.max(p.t, 0.5 * chord), rb, c.dy, c.dz) / Math.max(p.A, 1e-9), rb);
+        if (torn) {
+          this.paintHoleAlong(c, rb, 0.5, seed, pl.t * 1.5 + 0.002);
+          this.removeSection(node, c.plate, holeArea(pl, pl.t, rb, c.dy, c.dz) / Math.max(pl.A, 1e-9), rb);
+        } else if (contact && load.kind === 'contact' && this.mode === 'fixed') {
+          // A placed demolition charge: cuts the section around it (FM 5-250, see cutSection).
+          this.cutSection(node, c, load, rb, seed);
+        } else {
+          // A shell's charge (HE, HESH, the blast of a shaped charge) holes the struck plate over
+          // 2·r_b; its products come through the hole and shear what stands right behind it within
+          // ½ r_b (a web root behind a flange), no further — the section behind is not cut.
+          const behind = pl.t + 0.5 * rb;
+          this.paintHoleAlong(c, rb, 0.45, seed, behind + 0.002);
+          const run = this.runThrough(c, behind);
+          for (const seg of run) {
+            const p = this.section.plates[seg.plate]!;
+            const chord = (seg.t1 - seg.t0) * Math.hypot(c.dy, c.dz);
+            this.removeSection(node, seg.plate, holeArea(p, seg.plate === c.plate ? p.t : chord, rb, c.dy, c.dz) / Math.max(p.A, 1e-9), rb);
+          }
         }
         this.ctx.fx.chips({ position: hit.point.clone(), direction: toNode, spread: 0.7, speed: 150, count: 30, size: 0.02, color: 0x3a3d40, kind: 'metal' });
       }
@@ -1201,6 +1390,25 @@ export class SteelBeam implements Destructible, Structural {
     if (!this.disposed) this.noteDemand();
     this.checkSever();
     this.stats.lastBlastMs = performance.now() - t0;
+  }
+
+  /** Point of the node polyline nearest to p, searched on the two segments around node `near`. */
+  private axisFoot(p: THREE.Vector3, near: number, out: THREE.Vector3): THREE.Vector3 {
+    const s = this.sim;
+    let bd = Infinity;
+    out.set(s.x[3 * near]!, s.x[3 * near + 1]!, s.x[3 * near + 2]!);
+    for (let i = Math.max(0, near - 1); i < Math.min(s.n - 1, near + 1); i++) {
+      const ax = s.x[3 * i]!, ay = s.x[3 * i + 1]!, az = s.x[3 * i + 2]!;
+      const ex = s.x[3 * i + 3]! - ax, ey = s.x[3 * i + 4]! - ay, ez = s.x[3 * i + 5]! - az;
+      const t = Math.max(0, Math.min(1, ((p.x - ax) * ex + (p.y - ay) * ey + (p.z - az) * ez) / (ex * ex + ey * ey + ez * ez || 1e-12)));
+      const qx = ax + t * ex, qy = ay + t * ey, qz = az + t * ez;
+      const d = (qx - p.x) ** 2 + (qy - p.y) ** 2 + (qz - p.z) ** 2;
+      if (d < bd) {
+        bd = d;
+        out.set(qx, qy, qz);
+      }
+    }
+    return out;
   }
 
   /** Heat was added: check the temperatures on the next frame. */
@@ -1280,11 +1488,29 @@ export class SteelBeam implements Destructible, Structural {
     com.divideScalar(Math.max(m, 1e-9));
     const vel = new THREE.Vector3();
     for (let i = 0; i < s.n; i++) vel.addScaledVector(new THREE.Vector3(s.v[3 * i]!, s.v[3 * i + 1]!, s.v[3 * i + 2]!), s.mass[i]! / m);
+    // Keep the spin too: ω = I⁻¹ L about the centre of mass (point masses on the nodes, plus the
+    // section's own radius of gyration so the inertia about the member axis is not zero). A piece
+    // kicked at one end tumbles instead of flying off upright.
+    const Lm = new THREE.Vector3(), r = new THREE.Vector3(), vi = new THREE.Vector3();
+    const k2 = (this.section.cy ** 2 + this.section.cz ** 2) / 4;
+    const I = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (let i = 0; i < s.n; i++) {
+      const mi = s.mass[i]!;
+      r.set(s.x[3 * i]! - com.x, s.x[3 * i + 1]! - com.y, s.x[3 * i + 2]! - com.z);
+      vi.set(s.v[3 * i]!, s.v[3 * i + 1]!, s.v[3 * i + 2]!);
+      Lm.add(r.clone().cross(vi).multiplyScalar(mi));
+      const rr = r.lengthSq() + k2;
+      const c = [r.x, r.y, r.z];
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) I[3 * a + b] = I[3 * a + b]! + mi * ((a === b ? rr : 0) - c[a]! * c[b]!);
+    }
+    const Iinv = new THREE.Matrix3().set(I[0]!, I[1]!, I[2]!, I[3]!, I[4]!, I[5]!, I[6]!, I[7]!, I[8]!);
+    const angvel = Iinv.determinant() > 1e-12 ? Lm.applyMatrix3(Iinv.invert()) : new THREE.Vector3();
+    if (angvel.length() > 30) angvel.setLength(30);
     this.frozenPose.makeTranslation(com.x, com.y, com.z);
     this.frozenInv.copy(this.frozenPose).invert();
     this.mode = 'rigid';
     this.updateMesh();
-    this.body = phys.createDynamic({ position: com, colliders: this.segmentColliders(this.frozenInv), owner: this.owner, linvel: vel, contactForceThreshold: 5e4 });
+    this.body = phys.createDynamic({ position: com, colliders: this.segmentColliders(this.frozenInv), owner: this.owner, linvel: vel, angvel, contactForceThreshold: 5e4 });
     this.root.position.copy(com);
     this.root.quaternion.identity();
     this.root.updateMatrixWorld(true);

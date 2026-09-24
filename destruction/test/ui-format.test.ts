@@ -92,6 +92,14 @@ test('blast readout uses Kingery–Bulmash at the viewer', () => {
   const far = blastRow({ center: new THREE.Vector3(0, 0, 0), tntKg: 1, kind: 'he', normal: new THREE.Vector3(0, 1, 0) }, new THREE.Vector3(200, 0, 0));
   assert.ok(!far.warn && far.ps < 1000);
   assert.equal(row.tnt, '1,00 kg');
+  // Normally reflected peak: 1 kg at 5 m ≈ 2.2–2.6 × incident (UFC 3-340-02 fig. 2-15: P_r ≈ 100 kPa).
+  assert.ok(row.pr > 2 * row.ps && row.pr < 3.5 * row.ps, `pr ${row.pr} vs ps ${row.ps}`);
+  assert.equal(row.incident, fmtPressure(row.ps));
+  assert.equal(row.reflected, fmtPressure(row.pr));
+  assert.equal(row.gas, '', 'no gas pressure in the open');
+  const confined = blastRow({ center: new THREE.Vector3(0, 0, 0), tntKg: 1, kind: 'he', normal: new THREE.Vector3(0, 1, 0), gasPressure: 180e3 }, new THREE.Vector3(5, 0, 0));
+  assert.equal(confined.gas, '180 kPa');
+  assert.match(confined.note, /^Kapalı hacim/);
 });
 
 test('weapon specifications: muzzle energy ½mv², HEAT RHA, TNT equivalent', () => {
@@ -247,9 +255,15 @@ test('follow-through hits: priorPerforations from the resolver marks the second 
   assert.equal(behind.follow, '2. hedef');
   // Same round and result on the same target, but one of them came through a wall: two rows.
   assert.notEqual(impactRow(impact({ priorPerforations: 0 })).key, impactRow(impact({ priorPerforations: 1 })).key);
-  assert.equal(followThrough(impact({})), undefined, 'unknown without the field: the HUD falls back to its own test');
+  assert.equal(followThrough(impact({ priorPerforations: 0 })), false);
   assert.equal(followThrough(impact({ priorPerforations: 2 })), true);
+  assert.equal(impactRow(impact({ priorPerforations: 2 })).follow, '3. hedef');
+  // A shaped-charge jet that came through the first layer is a follow-through hit too.
+  assert.equal(followThrough(impact({ agent: 'jet', priorPerforations: 1 })), true);
+  assert.equal(followThrough(impact({ agent: 'jet', priorPerforations: 0 })), false);
   assert.equal(followThrough(impact({ agent: 'fragment', priorPerforations: 1 })), false);
+  // A charge carried in behind the jet (the HUD marks sub-munitions secondary): labelled as such.
+  assert.equal(impactRow(impact({ priorPerforations: 0 }), true).follow, 'İkincil şarj');
 });
 
 test('collapsed weapon card: at most three defining numbers, typed indirect / placed data', () => {

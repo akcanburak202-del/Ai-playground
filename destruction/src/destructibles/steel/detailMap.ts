@@ -318,6 +318,21 @@ export class DetailMap {
     return this.data[4 * (y * this.w + x)]! >= 128;
   }
 
+  /**
+   * Is there material anywhere under a disc of half-axes (ru, rv) around (u, v)? A projectile of
+   * that radius only passes a hole it fits through: the centre and eight points just inside its rim
+   * must all be hole.
+   */
+  solidDisc(u: number, v: number, ru: number, rv: number): boolean {
+    if (this.solid(u, v)) return true;
+    if (!(ru * this.w > 0.5 || rv * this.h > 0.5)) return false;
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      if (this.solid(u + 0.9 * ru * Math.cos(a), v + 0.9 * rv * Math.sin(a))) return true;
+    }
+    return false;
+  }
+
   /** Crater depth channel at (u, v), 0..1. */
   dimpleAt(u: number, v: number): number {
     const x = Math.min(this.w - 1, Math.max(0, Math.floor(u * this.w)));

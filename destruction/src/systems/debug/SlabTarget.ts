@@ -130,6 +130,21 @@ export class SlabTarget implements Destructible {
     return best;
   }
 
+  /**
+   * Removed depth under a round of radius `radius` centred at (x, y): the shallowest point of its
+   * footprint (centre and eight points on its rim), so a hole narrower than the round is solid to it.
+   */
+  private removedUnder(x: number, y: number, back: boolean, radius: number): number {
+    let best = this.removed(x, y, back);
+    if (!(radius > 0) || best <= 0) return best;
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      best = Math.min(best, this.removed(x + radius * Math.cos(a), y + radius * Math.sin(a), back));
+      if (best <= 0) break;
+    }
+    return best;
+  }
+
   /** Accumulated micro-crack damage D at a face point: 1 − Π(1 − 0.3 (1 − (r/R)²)). */
   private damageAt(x: number, y: number): number {
     let keep = 1;
@@ -140,7 +155,7 @@ export class SlabTarget implements Destructible {
     return 1 - keep;
   }
 
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, radius = 0): RayHit | null {
     const o = _o.copy(origin).applyMatrix4(this.inv);
     const d = _d.copy(dir).transformDirection(this.inv);
     const hx = this.w / 2, hy = this.h / 2, hz = this.t / 2;
@@ -170,11 +185,13 @@ export class SlabTarget implements Destructible {
       // sign = +1: entering through the +z (front) face.
       const back = sign < 0;
       const px = o.x + d.x * t0, py = o.y + d.y * t0;
-      const rem = this.removed(px, py, back);
+      // The round meets the shallowest point under its footprint: it slips through a hole only
+      // when the hole is clean through across its whole width.
+      const rem = this.removedUnder(px, py, back, radius);
       if (rem > 0) {
-        const remOther = this.removed(px, py, !back);
+        const remOther = this.removedUnder(px, py, !back, radius);
         if (rem + remOther >= this.t - 1e-4) {
-          // Clean through: the ray passes the hole (unless it clips the wall of the hole — ignored).
+          // Clean through: the round passes the hole.
           return null;
         }
         t0 += rem / Math.max(Math.abs(d.z), 0.05);

@@ -34,6 +34,8 @@ export interface PlayerView {
    * itself kicks. The aim stays put, so on screen it sits this far from the centre.
    */
   readonly kick: { readonly pitch: number; readonly yaw: number };
+  /** Where the viewer stands: the camera, or during the bullet camera the pose it returns to */
+  readonly viewer: { readonly x: number; readonly y: number; readonly z: number };
   requestLock(): void;
 }
 

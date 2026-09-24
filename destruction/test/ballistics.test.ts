@@ -228,6 +228,37 @@ test('damaged concrete is penetrated deeper (f_c × strength factor from the pro
   assert.ok(slabHit('m855', 900, C40, 2, 0, 7, 0.4).craterRadius > slabHit('m855', 900, C40, 2, 0, 7, 1).craterRadius);
 });
 
+test('shell break-up: an HE-OR body collapses on thick or hard steel (dent), punches thin plate, digs concrete as before', () => {
+  const a = getAmmo('m908');
+  const mv = a.mass * 1400;
+  // Thick / hard steel: the plug force exceeds the body's crush load → it breaks up on the face.
+  for (const [m, t] of [[RHA, 0.1], [RHA, 0.05], [S355, 0.04], [S355, 0.025]] as const) {
+    const e = slabHit('m908', 1400, m, t);
+    assert.equal(e.outcome, 'shatter', `${m.id} ${mm(t)} mm: ${e.summary}`);
+    assert.ok(e.depth > 0.002 && e.depth < 0.8 * t, `${m.id} ${mm(t)} mm: dent ${mm(e.depth).toFixed(1)} mm`);
+    // All of the round's momentum reaches the member; the plate works against the eroding nose
+    // only and takes the Tate share u/v of its energy (≈ 25 % RHA, ≈ 40 % S355).
+    within(e.momentum.length(), 0.99 * mv, 1.001 * mv, 'momentum N·s');
+    const share = e.energyAbsorbed / (0.5 * a.coreMass! * 1400 ** 2);
+    within(share, m === RHA ? 0.2 : 0.3, m === RHA ? 0.3 : 0.45, `${m.id} energy share`);
+    assert.match(e.summary, /gövde çöktü/);
+  }
+  // Harder steel stops the nose sooner (Tate R_t ∝ hardness).
+  assert.ok(slabHit('m908', 1400, RHA, 0.1).depth < slabHit('m908', 1400, S355, 0.1).depth);
+  // Thin plates are plugged before the body gives way: the round punches through and flies on.
+  for (const t of [0.006, 0.012, 0.019]) assert.equal(slabHit('m908', 1400, S355, t).outcome, 'perforate', `S355 ${mm(t)} mm`);
+  // Repeated hits: a plate weakened by earlier strain (probe strength 0.5) no longer breaks the body up → it tears through.
+  assert.equal(slabHit('m908', 1400, S355, 0.04, 0, 7, 0.5).outcome, 'perforate');
+  // Obliquity lengthens the plug: 19 mm at 60° is 38 mm of steel on the shot line.
+  assert.equal(slabHit('m908', 1400, S355, 0.019, 60).outcome, 'shatter');
+  // Concrete is untouched by the criterion (R_t 0.44 GPa < the nose's 1.2 GPa): NDRC with the whole round.
+  within(perforationLimit('m908', 1400, C40, 0, 5), 3.2, 3.6, 'C40 perforation limit m');
+  assert.equal(slabHit('m908', 1400, C40, 1.2).outcome, 'perforate');
+  // Real penetrators are not affected: an AP core and a long rod still perforate thick steel.
+  assert.equal(slabHit('m829a4', 1500, RHA, 0.1).outcome, 'perforate');
+  assert.equal(slabHit('pgu14', 1000, S355, 0.04).outcome, 'perforate');
+});
+
 test('thin walls: rear scab below the scabbing limit, perforation below the perforation limit', () => {
   const thick = slabHit('m2ap', 880, C40, 1.0);
   assert.equal(thick.spallRadius, 0, 'no scab on a thick wall');

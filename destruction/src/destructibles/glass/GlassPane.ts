@@ -17,8 +17,8 @@ import { createGlassUniforms, createReflectionMaterial, createTransmissionMateri
 import { DICE_CAP, DiceSystem, type DieSpawn } from './DiceSystem.ts';
 import { HeapDecal } from './HeapDecal.ts';
 import { FloorProbe } from './floor.ts';
-import { allowance, blastJob, drainBlasts, dropBlasts, spend } from './budget.ts';
-import { Membrane } from './membrane.ts';
+import { allowance, blastJob, drainBlasts, dropBlasts, exhausted, spend } from './budget.ts';
+import { Membrane, SUBSTEP, SUBSTEP_COARSE, SUBSTEP_RELEASED } from './membrane.ts';
 import { Shards } from './Shards.ts';
 import { ReflectionProbes } from './probes.ts';
 
@@ -363,16 +363,21 @@ export class GlassPane implements Destructible, Structural {
 
   // ─── Destructible: queries ───────────────────────────────────────────────────────────────
 
-  /** Is there still glass at pane-local (x, y)? */
-  glassAt(x: number, y: number): boolean {
+  /**
+   * Is there still glass at pane-local (x, y) for a round of radius `radius` (m)? A round centred in
+   * a hole narrower than itself still meets the hole's rim: it passes only if its whole cross-section
+   * lies in the hole (or off the pane).
+   */
+  glassAt(x: number, y: number, radius = 0): boolean {
     if (Math.abs(x) > this.width / 2 || Math.abs(y) > this.height / 2) return false;
     if (this.type === 'tempered') return !this.broken;
     if (this.torn) return false;
-    if (this.raster && this.raster.sample(x, y, 2) > 0.5) return false;
+    const r = this.raster;
+    if (r && r.sample(x, y, 2) > 0.5) return radius > 0 && r.minWithin(x, y, radius, 2, 0.5) <= 0.5;
     return true;
   }
 
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, radius = 0): RayHit | null {
     if (this.disposed || this.torn || (this.type === 'tempered' && this.broken)) return null;
     const o = this.toLocal(origin, _o);
     const d = _d.copy(dir).transformDirection(this.inverse);
@@ -391,7 +396,7 @@ export class GlassPane implements Destructible, Structural {
       w = this.membrane.displacementAt(x, y);
     }
     if (s < 0 || s > maxDist) return null;
-    if (!this.glassAt(x, y)) return null;
+    if (!this.glassAt(x, y, radius)) return null;
     const point = this.toWorld(x, y, w + face * half, new THREE.Vector3());
     const normal = this.normalW.clone().multiplyScalar(face);
     return { target: this, point, normal, distance: s, material: this.material };
@@ -1335,7 +1340,10 @@ export class GlassPane implements Destructible, Structural {
         this.tearOut();
       }
       if (this.membrane.awake) {
-        this.membrane.step(dt);
+        // Booked in the scene's glass budget; past it, the sheets of this step take coarser substeps.
+        const t = performance.now();
+        this.membrane.step(dt, exhausted(this.ctx) ? SUBSTEP_COARSE : this.torn ? SUBSTEP_RELEASED : SUBSTEP);
+        spend(this.ctx, performance.now() - t);
         this.lamDirty = true;
         this.membraneBounds();
         if (this.torn && !this.landed && this.membrane.floorImpulse > 0.5) {

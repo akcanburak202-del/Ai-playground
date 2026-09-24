@@ -15,7 +15,12 @@ halka halinde kırılır), temas şarjları için McVay/UFC 3-340-02 kavlama ve 
 betonarme, tuğla ve çelik levhalar için basınç–itki (P–I) hasar sayıları (betonarme duvarlar için
 donatılı kesitin tek serbestlik dereceli SDOF modeli ve PDC-TR 06-08 hasar sınırları: 25 cm'lik bir
 duvarı 10 m'deki 4 kg TNT çatlatmaz, temas hâlindeki 4 kg deler), kapalı mekânda patlamalar için
-yarı-statik gaz basıncı (UFC 3-340-02, W/V), parçalar için Gurney hızı ve Mott kütle dağılımı. Uçuş oyun seviyesinde tutulmuştur: yerçekimi, hava direnci, roketlerde
+yarı-statik gaz basıncı (UFC 3-340-02, W/V), parçalar için Gurney hızı ve Mott kütle dağılımı.
+Betona gömülmek için yapılmış HE-OR mermisi kalın/sert çeliğe çarptığında gövdesi çöker (Tate'in
+rijit uç koşulu ve gövde ezilme yükü > levha tıkaç kuvveti): mermi yüzeyde parçalanır, çelikte
+7–18 mm'lik bir göçük ve 16 kN·s'lik itki bırakır, dolgu göçükte patlar — tekrarlanan isabetler
+önce ezer ve eğer, incelmiş levhayı sonra yırtar. Her mermi hedeflerin ışın testine kendi yarıçapını
+taşır: kendinden dar bir delikten geçemez, deliğin kenarına çarpar. Uçuş oyun seviyesinde tutulmuştur: yerçekimi, hava direnci, roketlerde
 basit motor itkisi; üstten saldırı fırlatıcısının yayı ise hiçbir güdüm algoritması içermeyen,
 tamamen görsel, önceden çizilmiş bir eğridir. Tasarım belgesindeki (DESIGN.md §3) bütün kalibrasyon
 hedefleri birim testleriyle doğrulanır. "1 kg TNT, 5 m: ≈70 kPa" satırı **yansıyan** (duvara dik
@@ -132,9 +137,43 @@ x/d = G + 1           for G > 1
   (plug = ρ π d²/4 t cos θ).
 * **Capped HE shells** (M908 HE-OR: a hardened 1.2 kg steel nose cap on a thin HE body): against
   steel only the cap is the penetrator (Lambert–Jonas with the cap's mass, calibre and length
-  m/(ρ π d²/4)); the light body behind it collapses. The whole round's momentum goes into the
-  member (perforation: m(v − v_r); stopped: outcome `shatter`, all of m v), while the energy the
-  plate absorbs is the cap's. Into concrete NDRC still sees the whole round (it is built to dig).
+  m/(ρ π d²/4)) — *if the body holds* (next item). The whole round's momentum goes into the
+  member (perforation: m(v − v_r); stopped: outcome `shatter`, all of m v). Into concrete NDRC
+  still sees the whole round (it is built to dig).
+* **Shell break-up on steel** (`shellBreakup`; every steel-cased HE/HESH/thermobaric round that
+  reaches a target kinetically: M908, delay-fuzed bombs, follow-through charges). An HE-OR is made
+  to defeat concrete; on thick or hard steel its nose and body break up and the charge fires on the
+  face. Three steps, only on a *struck steel face* (a bar inside concrete is cut, not plugged):
+  1. *No rigid nose on steel* (Tate 1967, *J. Mech. Phys. Solids* 15): a penetrator whose flow
+     stress Y_p is below the target resistance R_t deforms at every speed. R_t = 2.7 GPa (S355),
+     5 GPa (RHA) (the Lanz–Odermatt σ_T of §4) against Y_p ≈ 1.2 GPa for a hardened nose
+     (`SHELL_NOSE_STRENGTH`, estimate ≈ HRC 40). Concrete (R_t = 0.44 GPa, Forrestal) does not
+     meet the condition, so **concrete behaviour is unchanged** (C40 perforation limit 3.4 m).
+  2. *Body strength*: the deforming nose is only driven as hard as the thin body behind it can push.
+     The force to plug the plate, `F_plug = τ π d t_los` with τ = 0.6 σ_u (Recht & Ipson 1963
+     plugging; von Mises τ ≈ σ/√3), is compared with the body's crush load `F_crush = A_wall σ_case`,
+     A_wall = casing mass / (ρ · 0.6 L) (the casing geometry of `fragments.ts`), σ_case ≈ 1 GPa
+     (`SHELL_CASE_STRENGTH`, estimate for quenched-and-tempered shell steel). M908: 16 cm² →
+     1.6 MN; S355 plugs at 77 MN/m × t (1.5 MN for 19 mm, 3.1 MN for 40 mm), RHA at 166 MN/m × t.
+     The line-of-sight thickness is used, so obliquity loads the body harder (19 mm at 60° breaks it).
+  3. *Nose depth*: the nose alone then erodes into the plate — Alekseevskii–Tate (§4) with the nose
+     as a short rod (cap 1.2 kg → L = 30 mm, L/D 0.38; a round without a cap: 15 % of its casing
+     steel, estimate). This is Tate's primary penetration (a lower estimate for L/D < 1, where
+     after-flow adds some): 17.5 mm in S355, 7.3 mm in RHA at 1.4 km/s. The plate absorbs the Tate
+     share u/v of the nose's energy (the interface force does F·u of work on the target and
+     F·(v − u) eroding the nose): 40 % on S355, 25 % on RHA (475 / 298 kJ of the cap's 1.18 MJ).
+  Outcome `shatter`: dent of the nose depth, all of m v (16 kN·s) into the member, and the delay
+  fuze fires in the dent (tamping 1.1). *Cross-check:* the collapsing body behind the nose (10 kg
+  in 3.9 L, mean density ≈ 2.6 t/m³) arrives with a stagnation pressure ½ρv² = 2.6 GPa at 1.4 km/s
+  — below R_t of either steel, so the debris cannot follow the nose in: it splashes (and hands over
+  its momentum), whereas into concrete (0.44 GPa) it can. A plate the body *can* plug (thin, or
+  weakened by earlier hits: the probe's strength factor scales τ and R_t) is punched through as
+  before and the round flies on to its delay; that is the dent → tear progression of repeated hits
+  on heavy steel. M908 at 1.4 km/s, square-on: perforates S355 up to 21 mm (18 / 15 / 11 mm at
+  30 / 45 / 60°), RHA up to 10 mm; breaks up on anything thicker (was: 124 mm S355, 78 mm RHA with
+  the rigid-cap model, which perforated the 40 mm box girder and 50 mm RHA at the first hit).
+  Impact-fuzed HESH and HEAT-MP never reach the resolver: their fuzes function on the face (HEAT:
+  jet first, §5), i.e. they "break up" there by design.
 * Hole ≈ 1.05–1.4 d (petalling on thin plates), plastic zone from `E_abs = σ_y ε̄ π r² t`, ε̄ ≈ 0.05.
 * Validity: sub-ordnance to ordnance velocities (≈ 300–1 800 m/s), L/D ≲ 10 (bullets, AP cores);
   long rods use §4.
@@ -343,7 +382,15 @@ hundreds of milliseconds (UFC 3-340-02 ch. 2, fig. 2-152).
 * **Self-destruct** timers (RPG-7 grenades, 4.5 s).
 * Every hit: `probe()` → pure resolver → `target.applyImpact(ev)` → `impact` event; perforation and
   ricochet continue within the same fixed step (up to 8 interactions per step), so one round can
-  chain through several targets. A target whose ray test reports a surface but whose probe finds
+  chain through several targets. **Projectile radius:** every segment ray carries the round's
+  presented radius (`presentedRadius`: half the calibre; a long rod's diameter; the hard core
+  once an AP bullet has stripped its jacket in a plate; a fragment's presented-area diameter) as
+  `Destructible.raycast(…, radius)`, and HEAT jets carry ≈ 0.025 CD (a jet a few mm thick opens a
+  hole ≈ 0.2 CD in steel; Walters & Zukas 1989): a hole narrower than the round is solid to it, so
+  repeated tank rounds at one spot strike the rim of the earlier hole instead of slipping through
+  a jet hole a tenth of their calibre. (The element modules implement the test; `SlabTarget`
+  samples the round's footprint — centre and eight rim points — for the shallowest removed depth.)
+  A target whose ray test reports a surface but whose probe finds
   no material on the shot line (the rim of a hole) is passed without an event.
 * **Timing inside the step.** The sweep keeps track of time along the segment flown in the step,
   so every `impact` event, detonation and fuze carries the moment it happened (a 5.56 round
@@ -441,12 +488,12 @@ reflected impulse integrated over the face):
 
 | Target | M908 HE-OR kinetic | M908 blast (1.6 kg) | M830A1 HEAT-MP | L31A7 HESH (4.8 kg) |
 | --- | --- | --- | --- | --- |
-| S355 50 mm | perforates, 1 244 m/s out, 1.8 kN·s to plate, Ø92 mm | dish 17.5 mm, scab Ø171 × 18 mm @ 77 m/s; ∫i_r 1.3 kN·s over Ø0.3 m, 1.7 kN·s over 1 m² | jet Ø15 mm through; blast (25 %) dish 4.9 mm | dish 44 mm, scab Ø389 × 22 mm @ 191 m/s; ∫i_r 3.5 kN·s over Ø0.3 m, 4.8 kN·s over 1 m² |
-| S355 100 mm | perforates, 762 m/s out, 7.3 kN·s | dish 8.7 mm | jet through; dish 2.4 mm | dish 24 mm, scab Ø340 × 39 mm @ 158 m/s |
-| RHA 50 mm | perforates, 1 035 m/s out, 4.2 kN·s | dish 10.7 mm, scab Ø141 × 15 mm | jet through; dish 3.0 mm | dish 29 mm, scab Ø366 × 21 mm @ 176 m/s |
-| RHA 100 mm | **shatters** on the face, 16.0 kN·s (all of m v), dent 42 mm | dish 5.3 mm (then fires tamped in the dent) | jet through; dish 1.5 mm | dish 14.5 mm, scab Ø294 × 34 mm @ 126 m/s |
-| HEB 300 flange 19 mm | perforates, Ø112 mm, 0.3 kN·s | breach Ø128 mm, dish 34 mm | jet Ø15 mm; dish 12.9 mm, scab Ø123 mm | dish 84 mm, scab Ø420 × 9 mm @ 212 m/s |
-| HEB 500 flange 28 mm | perforates, 0.6 kN·s | dish 27.5 mm, scab Ø199 × 12 mm | dish 8.7 mm | dish 61 mm, scab Ø411 × 13 mm @ 206 m/s |
+| S355 50 mm | **breaks up** (plug 3.9 MN > body 1.6 MN): dent 17.5 mm, 16.0 kN·s, 475 kJ | dish 17.5 mm, scab Ø171 × 18 mm @ 77 m/s; ∫i_r 1.3 kN·s over Ø0.3 m, 1.7 kN·s over 1 m² | jet Ø15 mm through; blast (25 %) dish 4.9 mm | dish 44 mm, scab Ø389 × 22 mm @ 191 m/s; ∫i_r 3.5 kN·s over Ø0.3 m, 4.8 kN·s over 1 m² |
+| S355 100 mm | breaks up: dent 17.5 mm, 16.0 kN·s | dish 8.7 mm | jet through; dish 2.4 mm | dish 24 mm, scab Ø340 × 39 mm @ 158 m/s |
+| RHA 50 mm | breaks up: dent 7.3 mm, 16.0 kN·s, 298 kJ | dish 10.7 mm, scab Ø141 × 15 mm | jet through; dish 3.0 mm | dish 29 mm, scab Ø366 × 21 mm @ 176 m/s |
+| RHA 100 mm | breaks up: dent 7.3 mm, 16.0 kN·s (was 42 mm with the rigid cap) | dish 5.3 mm (then fires tamped in the dent) | jet through; dish 1.5 mm | dish 14.5 mm, scab Ø294 × 34 mm @ 126 m/s |
+| HEB 300 flange 19 mm | perforates (plug 1.5 MN < body 1.6 MN), Ø112 mm, 0.3 kN·s | breach Ø128 mm, dish 34 mm | jet Ø15 mm; dish 12.9 mm, scab Ø123 mm | dish 84 mm, scab Ø420 × 9 mm @ 212 m/s |
+| HEB 500 flange 28 mm | breaks up: dent 17.5 mm, 16.0 kN·s | dish 27.5 mm, scab Ø199 × 12 mm | dish 8.7 mm | dish 61 mm, scab Ø411 × 13 mm @ 206 m/s |
 
 The HESH and HE contact impulses (Nurick–Martin I ≈ 1 000 N·s per kg: 1.6 / 4.8 kN·s) and the
 ∫i_r over the face (1.7 / 4.8 kN·s over 1 m²) agree; both are of the order of the momentum needed
@@ -482,16 +529,19 @@ Screenshots of the final run are in `.shots/ballistics/`. Results:
 * **120 mm M830A1 HEAT-MP on 20 mm S355:** jet event first (perforates, ≈ 17 mm RHA-e used,
   461 mm RHA left), then the shaped blast (contact damage number 3.96: dish and soot), and ≈ 30 body
   fragments that splash/embed on the plate. **M908 HE-OR:** the hardened nose cap perforates
-  20 mm steel (cap-only Lambert–Jonas, see §3; Ø 0.1 m hole) and its 0.4 ms delay fires it ≈ 0.55 m
-  behind the plate; against 100 mm RHA it breaks up on the face instead (all 16 kN·s into the
-  plate) and fires in the dent; the second round goes through the first hole and skips off the ground 150 m down range
-  (0.4° graze, ricochet as a steel-bodied shell). *No "dent first, perforate after repeats" regime
+  20 mm steel (cap-only Lambert–Jonas, see §3; Ø 0.1 m hole; plug force 1.5 MN is under the body's
+  1.6 MN crush load) and its 0.4 ms delay fires it ≈ 0.55 m behind the plate; against thicker or
+  harder steel the body breaks up on the face (§3, shell break-up: all 16 kN·s into the plate, a
+  7–18 mm nose dent) and fires in the dent. A second round down the same line passes a hole wider
+  than itself (the Ø112 mm cap hole) and skips off the ground 150 m down range (0.4° graze,
+  ricochet as a steel-bodied shell); it strikes the rim of a narrower one (radius, §9). *No "dent first, perforate after repeats" regime
   exists for 120 mm rounds against 20 mm plate: every published model perforates it on the first
   hit.* Dent-then-tear accumulation is what small arms and fragments do here (M855 splashes on
   10 mm, 120 mm body fragments shatter/embed on 20 mm).
 * **HEB 300 column:** M908 perforates the front flange (19 mm) and the HEAT round holes it; the
   column shows the holes, soot and a permanent bow. Down the web plane the probe reports flange +
-  262 mm of web + flange and the M908 still gets through (640 m/s out). Rear flanges are *not*
+  262 mm of web + flange: the M908 body breaks up on that 300 mm run (it got through, 640 m/s out,
+  with the rigid-cap model). Rear flanges are *not*
   struck after a front-flange perforation because of a steel-module ray-test issue (report).
 * **M829A4 APFSDS through wall A, 60 m:** perforates 258 mm in one hit, 1 550 → 1 530 m/s, rod
   800 → 736 mm, front crater Ø 0.47 m, rear scab Ø 0.61 m, 66 mm tunnel (Tate, R_t = 444 MPa).
@@ -509,6 +559,35 @@ Screenshots of the final run are in `.shots/ballistics/`. Results:
 * **Top-attack launcher, 120 m onto wall B:** scripted loft to ≈ 30 m, 2.0 s flight, 28 → 130 m/s,
   strikes from above.
 
+### 11.1 Tank rounds on the range's steel stand, realised by the steel elements
+
+`node .tmp/qa/ballistics/stand.ts` (Node, real Rapier world, `installBallistics` and the steel
+module's `createSteelPlate` / `createSteelBeam`; three rounds from 25 m at one aim point, 1 s
+between rounds; beams pinned at both ends as on the piers). "Handed over" is the `ImpactEvent` /
+`BlastLoad` from this module, "realised" what the element made of it (plate: largest particle
+displacement, thinnest triangle; beam: node displacement = bow, dish patches, torn).
+
+| Round → member | Handed over, hit 1 | Realised, hits 1 → 2 → 3 |
+| --- | --- | --- |
+| M908 → RHA 50 mm | break-up: dent 7.4 mm, 16.0 kN·s, 301 kJ; 1.6 kg contact: dish 11 mm, scab Ø146 × 15 mm @ 58 m/s | hit 2 break-up again (run 29 mm, dent 24 mm), plate torn (32 → 117 triangles); hit 3 passes the tear |
+| M908 → RHA 100 mm | break-up: dent 7.4 mm, 16.0 kN·s; contact dish 5.6 mm, no scab | dents 7.4 → 9.1 → 11.6 mm, run 100 → 92 → 83 mm, displacement 25 → 38 → 217 mm |
+| M908 → HEB 300 flange 19 mm | perforates both flanges (plug 1.5 MN < body 1.6 MN), Ø112 mm holes, 0.3 kN·s each; fires 0.55 m behind | rear-flange dish 18.5 mm; hits 2–3 pass the Ø112 mm hole (wider than the round) |
+| M908 → box 500×400×40 | break-up: dent 17.5 mm, 16.0 kN·s, 478 kJ; contact dish 24 mm, scab Ø193 × 16 mm @ 87 m/s | bow 39 → 63 → 70 mm; face dish 210 mm (hit 1) → torn (hit 2) |
+| L31A7 HESH → RHA 50 mm | contact 4.8 kg: dish 29 mm, scab Ø366 × 21 mm @ 176 m/s | thickness 51 → 29 → 18 %, torn at hit 2 |
+| L31A7 HESH → RHA 100 mm | dish 14.5 mm, scab Ø294 × 34 mm @ 126 m/s | thickness 67 → 41 → 24 %, displacement 6 → 15 → 27 mm |
+| L31A7 HESH → HEB 300 flange | dish 84 mm, scab Ø420 × 9 mm @ 212 m/s | dish 84 → 150 mm torn; bow 49 → 116 → 123 mm |
+| L31A7 HESH → box | dish 49 mm, scab Ø399 × 18 mm @ 198 m/s | dish 49 → 95 mm torn (hit 2); no bow |
+| M830A1 HEAT-MP → RHA 50 / 100 mm | jet Ø15 mm through (50 / 100 mm RHA used); 25 % blast dish 3.0 / 1.5 mm | hits 2–3: the jet threads its own hole, the 80 mm round strikes the rim and fires on the face again |
+| M830A1 → HEB 300 flange | jet through both flanges; dish 12.9 mm, scab Ø123 × 8 mm | flange dish 12.9 → 21.8 mm torn (hit 2) |
+| M830A1 → box | jet through both walls; dish 6.1 mm, scab Ø97 × 13 mm | dish 6 → 11 → 19 mm, thickness loss 13 → 24 → 31 mm |
+| 2.3 kg contact on tower HEB 200 flange (0.8 MN) | P_r 847 MPa, i_r 147 kPa·s at the face; flange 15 mm: breach Ø192 mm (limit 26 mm), crater Ø317 mm; 9 mm web in contact would breach Ø224 mm | section area → 0, column severed and failed at the first charge |
+
+The progression the stand is built to show — dent and bend first, tear on a later hit — appears
+for HESH on every member, HE-OR on the box girder and the armour, and HEAT-MP's blast on the
+flanges. The HE-OR's first-hit face dish on the box (210 mm, the steel module's Nurick–Martin dish
+for the 16 kN·s of the shell's own momentum) is the largest number in the table: see the report to
+M3 on spreading a `shatter` event's momentum over the splash footprint.
+
 ## 12. Known limitations and estimates (not from a published relation)
 
 * Confined detonations: the vent-area smoothstep (A/V^⅔ 0.15 → 0.6), the 50 ms gas-duration cap
@@ -521,6 +600,14 @@ Screenshots of the final run are in `.shots/ballistics/`. Results:
   same thickness of RHA) and the 1.5 d rod cavity are game-level estimates chosen to match open
   descriptions/photographs; they are isolated as named constants.
 * Rigid-projectile NDRC above 1 km/s is extended linearly in V (`NDRC_VMAX`); long rods leave it.
+  A thin-walled HE shell at 1.4 km/s (M908) would in reality not survive a 2.7 m NDRC run through
+  C40 either (the body-strength argument of §3 predicts break-up in thick concrete too); concrete
+  was deliberately left unchanged this round (the round is made for it; 1.2 m obstacles).
+* Shell break-up: `SHELL_NOSE_STRENGTH` 1.2 GPa, `SHELL_CASE_STRENGTH` 1 GPa and the 15 % nose
+  share of rounds without a cap are estimates; the Tate nose depth is the primary penetration only.
+* Impact-fuzed shells (HESH, HEAT-MP, PD-fuzed HE) hand the member no kinetic event: their body's
+  momentum (HESH 11.5 kN·s, HEAT-MP 16 kN·s) reaches it only through the representative casing
+  fragments, which carry a small part of the casing mass.
 * P–I curves treat every member as a 3 m one-way strip (walls) or a 1.5 × 1 m pane (glass). The
   RC/masonry curves are *global* (flexural) response limits; very close charges are local
   problems (spall/breach), handled by `contactDamage` inside ≈ 0.3 m and only approximately by the

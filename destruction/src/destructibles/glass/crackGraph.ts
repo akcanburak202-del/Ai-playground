@@ -509,21 +509,27 @@ export class CrackGraph {
         faces.push({ outer: cy.poly, holes: [], area: cy.area, edge: cy.edge, sample: [0, 0], bounds: polyBounds(cy.poly), links: EMPTY_LINKS, comp: cy.comp, cycles: [c] });
       } else if (cy.comp !== mainComp) islands.push(c);
     }
-    // Each island outline is a hole in the smallest face of another component that contains it.
+    // Each island outline is a hole in the smallest face of another component that contains it:
+    // faces are tried in ascending order of outline area and the first that contains it wins. (Was
+    // a scan of every face per island that recomputed both polygon areas per candidate: a pane
+    // peppered by blast fragments — hundreds of hole islands — then took seconds per blast.)
+    const byArea = faces.map((_, k) => k);
+    const outerArea = faces.map((f) => f.area);
+    if (islands.length) byArea.sort((a, b) => outerArea[a]! - outerArea[b]!);
     for (const c of islands) {
       const isl = cycles[c]!;
       const x = isl.poly[0]!, y = isl.poly[1]!;
       let best: Built | null = null;
       let bestK = -1;
-      for (let k = 0; k < faces.length; k++) {
+      for (const k of byArea) {
         const f = faces[k]!;
         if (f.comp === isl.comp) continue;
         const b = f.bounds;
         if (x < b[0] || x > b[2] || y < b[1] || y > b[3]) continue;
-        if (best && polyArea(f.outer) >= polyArea(best.outer)) continue;
         if (pointInPoly(f.outer, x, y)) {
           best = f;
           bestK = k;
+          break;
         }
       }
       if (best) {

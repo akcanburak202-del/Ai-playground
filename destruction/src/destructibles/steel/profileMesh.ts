@@ -191,7 +191,13 @@ export function offsetOutline(o: Outline, d: number): Outline {
   };
 }
 
-/** A local dent: displacement of the surface near (s, y, z) along (dy, dz), Gaussian of radius R. */
+/**
+ * A permanent dish of one profile plate, centred on the struck face point (s, y, z) and pushed
+ * along the inward direction (dy, dz): the parabolic dish w = δ (1 − r²/R²) of radius R (the shape
+ * the dish strain is computed for, steelMaterial.dishStrain) — smooth inside, a crisp crease at the
+ * rim where the plate hinges. It moves the struck plate through its thickness `t` and fades into
+ * what stands behind it (a web root is pushed in with a flange) over R; the far side stays put.
+ */
 export interface Dent {
   s: number;
   y: number;
@@ -200,6 +206,35 @@ export interface Dent {
   dz: number;
   R: number;
   depth: number;
+  /** Thickness of the struck plate, m */
+  t?: number;
+  /**
+   * The struck plate has free edges across the dish (the outstands of an I-section flange,
+   * cruciform arms): they fold in with it about the web root instead of holding the rim, so
+   * across the face the dish keeps half its depth out to the tips.
+   */
+  freeEdges?: boolean;
+}
+
+/** Inward displacement of an outline point (rest arc s, section y, z) by a dent, m. */
+export function dentDisplacement(d: Dent, s: number, y: number, z: number, shift = 0): number {
+  const ry = y - d.y, rz = z - d.z;
+  // Depth behind the struck face and position across it (in the section plane); `shift` is how
+  // far an offset outline (a coat over the steel) stands out from the face.
+  const h = ry * d.dy + rz * d.dz + shift;
+  if (h < -0.005) return 0;
+  const lat = -ry * d.dz + rz * d.dy;
+  const R2 = d.R * d.R;
+  const as = (s - d.s) ** 2 / R2, al = (lat * lat) / R2;
+  const t = d.t ?? 0.02;
+  const fade = h <= 1.5 * t ? 1 : Math.max(0, 1 - (h - 1.5 * t) / Math.max(d.R, 1e-3));
+  if (d.freeEdges) {
+    // Along the member the rim holds (crisp crease at |Δs| = R); across, the tips follow.
+    if (as >= 1 || al > 1.21) return 0;
+    return d.depth * (1 - as) * Math.max(0, 1 - 0.5 * al) * fade;
+  }
+  if (as + al >= 1) return 0;
+  return d.depth * (1 - as - al) * fade;
 }
 
 export interface SweepFrameSource {
@@ -233,6 +268,8 @@ export class SweptMesh {
   private readonly capTris: number[][];
   private readonly length: number;
   private readonly s0: number;
+  /** Offset of this outline from the steel surface (a coat), m: dents are measured from the steel */
+  dentShift = 0;
 
   constructor(outline: Outline, length: number, s0: number, ringSpacing: number) {
     this.outline = outline;
@@ -356,14 +393,13 @@ export class SweptMesh {
       const strain = Math.max(src.plast[i]!, src.plast[j]!) * 0.5;
       const sRest = this.s0 + s;
       near.length = 0;
-      for (const d of dents) if (Math.abs(sRest - d.s) < 3 * d.R) near.push(d);
+      for (const d of dents) if (Math.abs(sRest - d.s) < d.R) near.push(d);
       for (let q = 0; q < m; q++) {
         const ov = this.outline.verts[q]!;
         let y = ov.y, z = ov.z;
         for (const d of near) {
-          const ddist2 = (sRest - d.s) ** 2 + (y - d.y) ** 2 + (z - d.z) ** 2;
-          if (ddist2 > 9 * d.R * d.R) continue;
-          const w = d.depth * Math.exp(-ddist2 / (d.R * d.R));
+          const w = dentDisplacement(d, sRest, ov.y, ov.z, this.dentShift);
+          if (w <= 0) continue;
           y += w * d.dy;
           z += w * d.dz;
           if (w > 2e-4) {

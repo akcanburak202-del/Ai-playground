@@ -388,7 +388,7 @@ export class AudioSystem implements AudioApi, System {
     if (down) {
       const p = reportProfile(w, wc.currentAmmo);
       if (!p.rotary || this.rotary || this.spin) return;
-      const spinUp = (w as { spinUp?: number }).spinUp ?? 0.4;
+      const spinUp = w.spinUp ?? 0.4;
       const heavy = w.sound === 'gau8';
       this.spatial.pan = 0;
       this.spatial.cutoff = 12000;

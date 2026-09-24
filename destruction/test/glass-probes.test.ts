@@ -14,7 +14,7 @@ import {
  */
 function fakeRenderer() {
   const r = {
-    info: { render: { frame: 0 } },
+    info: { render: { frame: 0 }, programs: [] as string[] },
     coordinateSystem: THREE.WebGLCoordinateSystem,
     autoClear: false,
     shadowMap: { autoUpdate: true, needsUpdate: false },
@@ -29,10 +29,40 @@ function fakeRenderer() {
       r.target = t;
       r.face = face;
     },
-    render(_s: THREE.Scene, _c: THREE.Camera) {
+    /** Materials with a program (three's program cache, keyed here by material only) */
+    known: new Set<THREE.Material>(),
+    compiles: [] as { objects: THREE.Object3D[]; target: unknown }[],
+    /** What each render drew and which lights it saw */
+    drawn: [] as { objects: THREE.Object3D[]; lights: THREE.Light[] }[],
+    extensions: { get: (_name: string) => null as unknown },
+    program(m: THREE.Material) {
+      if (r.known.has(m)) return;
+      r.known.add(m);
+      r.info.programs.push(m.uuid);
+    },
+    compile(scene: THREE.Object3D, _c: THREE.Camera, _t: THREE.Scene) {
+      const objects: THREE.Object3D[] = [];
+      scene.traverse((o) => {
+        objects.push(o);
+        const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+        if (m) r.program(m);
+      });
+      r.compiles.push({ objects, target: r.target });
+      return new Set();
+    },
+    render(s: THREE.Scene, _c: THREE.Camera) {
       r.info.render.frame++;
       const t = r.target as THREE.WebGLCubeRenderTarget | null;
       r.renders.push({ face: r.face, shadowAuto: r.shadowMap.autoUpdate, target: t, mips: !!t?.texture.generateMipmaps });
+      const objects: THREE.Object3D[] = [], lights: THREE.Light[] = [];
+      s.traverseVisible((o) => {
+        if ((o as THREE.Light).isLight) lights.push(o as THREE.Light);
+        const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+        if (!m) return;
+        objects.push(o);
+        r.program(m);
+      });
+      r.drawn.push({ objects, lights });
     },
     /** The app's own frame: the composer renders a few times */
     mainFrame() {
@@ -143,6 +173,27 @@ test('probes: blasts and collapses recapture once after the scene settles (sim t
     frame(probes, renderer, 3);
   }
   assert.ok(probes.stats.units - u1 >= 18 && probes.stats.units - u1 <= 36, `units during an 8 s stream: ${probes.stats.units - u1}`);
+  // A capture in progress pauses while a blast unfolds (its fresh rubble is the main pass's first),
+  // and resumes once the scene has settled.
+  for (let f = 0; f < 120; f++) {
+    ctx.time.now += 1 / 60;
+    frame(probes, renderer, 3);
+  }
+  const u2 = probes.stats.units;
+  for (const pr of (probes as unknown as { probes: { dirty: boolean }[] }).probes) pr.dirty = true;
+  frame(probes, renderer, 3);
+  assert.equal(probes.stats.units, u2 + 1, 'a capture started');
+  ctx.events.emit('blast', { time: ctx.time.now, center: new THREE.Vector3(), tntKg: 1, kind: 'he', fireballRadius: 1 });
+  for (let f = 0; f < 30; f++) {
+    ctx.time.now += 1 / 60;
+    frame(probes, renderer, 3);
+  }
+  assert.equal(probes.stats.units, u2 + 1, 'paused while the blast unfolds');
+  for (let f = 0; f < 60; f++) {
+    ctx.time.now += 1 / 60;
+    frame(probes, renderer, 3);
+  }
+  assert.ok(probes.stats.units > u2 + 6, 'resumed after it settled');
   probes.release();
 });
 
@@ -186,4 +237,70 @@ test('glass shaders: sun glint no sharper than the sun disc, capped, and never n
     if (m.name.includes('reflection')) assert.ok(fs.includes('textureLod( uProbe, gR, gLod )'), `${m.name}: probe IBL`);
     m.dispose();
   }
+});
+
+test('probes: the capture keeps the lights, waits for shadow maps, and compiles new programs ahead', () => {
+  const { ctx, renderer, scene, glass } = makeCtx();
+  // Effects: particles (hidden in the capture) and the solid layer holding chips and the light pool.
+  const fxRoot = new THREE.Group();
+  fxRoot.name = 'fx-root';
+  const fxSolid = new THREE.Group();
+  fxSolid.name = 'fx-solid';
+  const chips = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
+  const pool = new THREE.Group();
+  pool.name = 'fx-lights';
+  const flash = new THREE.PointLight();
+  pool.add(flash);
+  fxSolid.add(chips, pool);
+  fxRoot.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial()));
+  const sun = new THREE.DirectionalLight();
+  sun.castShadow = true;
+  const wall = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
+  glass.add(new THREE.Mesh(new THREE.BoxGeometry(), glassMat()));
+  scene.add(fxRoot, fxSolid, sun, wall);
+  // The main pass has drawn the wall (its program exists) but not rendered the sun's shadow map yet.
+  renderer.program(wall.material);
+  const probes = ReflectionProbes.acquire(ctx)!;
+  probes.attach(new THREE.Vector3(0, 2, 0), glassMat());
+  frame(probes, renderer, 1);
+  assert.equal(probes.stats.units, 0, 'no capture before the shadow maps exist');
+  assert.equal(probes.stats.waits, 1);
+  sun.shadow.map = new THREE.WebGLRenderTarget(4, 4);
+  // A rubble mesh appears that the main pass has not drawn: its program is compiled ahead (in the
+  // capture's render target), in a frame of its own, before any face is rendered.
+  const rubble = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial());
+  scene.add(rubble);
+  frame(probes, renderer, 1);
+  assert.equal(probes.stats.units, 0);
+  // (The wall is looked up too: found in the program cache, it costs nothing and does not count.)
+  assert.ok(renderer.compiles.some((c) => c.objects.includes(rubble)));
+  assert.ok(renderer.compiles.every((c) => c.target), 'compiled with the probe target bound');
+  assert.equal(probes.stats.compiled, 1);
+  for (let f = 0; f < 6; f++) frame(probes, renderer, 1);
+  assert.equal(probes.stats.captures, 1);
+  assert.equal(probes.stats.missed, 0, 'no face render compiled a program');
+  // Every face saw the effect light (same light set as the main pass, so the same programs), and
+  // neither the glass, the particles nor the chips.
+  const d = renderer.drawn;
+  assert.equal(d.length, 6);
+  for (const x of d) {
+    assert.ok(x.lights.includes(flash) && x.lights.includes(sun));
+    assert.ok(x.objects.includes(wall) && x.objects.includes(rubble));
+    assert.ok(!x.objects.includes(chips) && !x.objects.some((o) => o.parent === glass || o.parent === fxRoot));
+  }
+  assert.ok(chips.visible && glass.visible && fxRoot.visible);
+  // One new program per frame at most when there is no parallel compile.
+  const more = [0, 1, 2].map(() => new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial()));
+  scene.add(...more);
+  ctx.events.emit('blast', { time: ctx.time.now, center: new THREE.Vector3(), tntKg: 1, kind: 'he', fireballRadius: 1 });
+  ctx.time.now += 2;
+  const c0 = renderer.compiles.length;
+  for (let f = 0; f < 3; f++) frame(probes, renderer, 1);
+  assert.equal(renderer.compiles.length - c0, 3);
+  assert.equal(probes.stats.compiled, 4);
+  assert.equal(probes.stats.captures, 1, 'the recapture starts once they are compiled');
+  for (let f = 0; f < 6; f++) frame(probes, renderer, 1);
+  assert.equal(probes.stats.captures, 2);
+  assert.equal(probes.stats.missed, 0);
+  probes.release();
 });

@@ -8,6 +8,7 @@ import { Rng } from '../src/core/rng.ts';
 import { MATERIALS, type MaterialId } from '../src/physics/materials.ts';
 import { getAmmo } from '../src/physics/ballistics/ammo.ts';
 import { getAtmosphere } from '../src/render/atmosphere.ts';
+import { motionAt } from '../src/fx/motion.ts';
 import type { Simulation } from '../src/app/Simulation.ts';
 import type { Projectile, SimContext, SimEvents } from '../src/app/contracts.ts';
 import type { ImpactEvent } from '../src/physics/ballistics/types.ts';
@@ -59,6 +60,52 @@ test('particle layer: frames stepped without a draw keep their particles queued 
   layer.emit(p);
   layer.flush(0);
   assert.deepEqual(a0.updateRanges, [{ start: 0, count: 64 }]);
+  layer.dispose();
+});
+
+test('sorted particle layer: draws only the live particles, farthest first, at their current positions', () => {
+  const layer = new ParticleLayer('t', 16, new THREE.ShaderMaterial(), { sorted: true });
+  const p = newRecord();
+  p.life = 2;
+  p.drag = 1e-4;
+  // Camera at the origin looking down −Z; particles at depths 3, 9, 1, 6 (and one already dead).
+  for (const z of [-3, -9, -1, -6]) {
+    p.z = z;
+    layer.emit(p);
+  }
+  p.z = -20;
+  p.t0 = -5;
+  layer.emit(p);
+  const cam = new THREE.PerspectiveCamera();
+  cam.updateMatrixWorld();
+  layer.flush(0.5);
+  layer.sort(cam, 0.5, new THREE.Vector3());
+  const a0 = layer.mesh.geometry.getAttribute('a0') as THREE.InstancedBufferAttribute;
+  const g = layer.mesh.geometry as THREE.InstancedBufferGeometry;
+  assert.equal(layer.drawn, 4);
+  assert.equal(g.instanceCount, 4);
+  assert.deepEqual([0, 1, 2, 3].map((i) => (a0.array as Float32Array)[i * 4 + 2]), [-9, -6, -3, -1]);
+  assert.deepEqual(a0.updateRanges, [{ start: 0, count: 16 }]);
+  // Turn around: the order reverses. A particle flying towards the camera is sorted where it is now.
+  cam.rotation.y = Math.PI;
+  cam.updateMatrixWorld();
+  layer.sort(cam, 0.5, new THREE.Vector3());
+  assert.deepEqual([0, 1, 2, 3].map((i) => (a0.array as Float32Array)[i * 4 + 2]), [-1, -3, -6, -9]);
+  p.t0 = 0; p.z = -12; p.vz = 20; // at t = 0.5 it is at z ≈ −2
+  layer.emit(p);
+  cam.rotation.y = 0;
+  cam.updateMatrixWorld();
+  layer.sort(cam, 0.5, new THREE.Vector3());
+  assert.deepEqual([0, 1, 2, 3, 4].map((i) => (a0.array as Float32Array)[i * 4 + 2]), [-9, -6, -3, -12, -1]);
+  // Everything dead: nothing drawn, layer hidden. clear() empties the draw list too.
+  layer.flush(10);
+  layer.sort(cam, 10, new THREE.Vector3());
+  assert.equal(layer.drawn, 0);
+  assert.equal(layer.mesh.visible, false);
+  assert.equal(layer.countAlive(0.5), 5);
+  layer.clear();
+  assert.equal(layer.countAlive(0.5), 0);
+  assert.equal(g.instanceCount, 0);
   layer.dispose();
 });
 
@@ -173,14 +220,17 @@ test('fx system: sustained 30 mm fire (GAU-8, 65 rounds/s) is thinned before it 
   fx.dispose();
 });
 
-/** Live smoke particles as {pos, size0, size1, t0, life}. */
+/** Live smoke particles as {pos, size0, size1, t0, life} (what the depth-sorted layer would draw at `now`). */
 function smokeParticles(fx: FxSystem, now: number): { x: number; y: number; z: number; s0: number; s1: number; life: number }[] {
+  const cam = new THREE.PerspectiveCamera();
+  cam.updateMatrixWorld();
+  fx.smokeLayer.sort(cam, now + 0.05, new THREE.Vector3()); // puffs are born within ≈ 40 ms
   const g = fx.smokeLayer.mesh.geometry;
   const a0 = (g.getAttribute('a0') as THREE.InstancedBufferAttribute).array as Float32Array;
   const a1 = (g.getAttribute('a1') as THREE.InstancedBufferAttribute).array as Float32Array;
   const a3 = (g.getAttribute('a3') as THREE.InstancedBufferAttribute).array as Float32Array;
   const out = [];
-  for (let i = 0; i < fx.smokeLayer.capacity; i++) {
+  for (let i = 0; i < fx.smokeLayer.drawn; i++) {
     const t0 = a0[i * 4 + 3]!, life = a1[i * 4 + 3]!;
     if (t0 > now + 1 || now - t0 > life) continue;
     out.push({ x: a0[i * 4]!, y: a0[i * 4 + 1]!, z: a0[i * 4 + 2]!, s0: a3[i * 4]!, s1: a3[i * 4 + 1]!, life });
@@ -256,3 +306,61 @@ test('fx: a 1 kg detonation flash is brief and local', () => {
   for (const p of smokeParticles(fx, 1)) assert.ok(Math.hypot(p.x, p.z) < 3 * 1.75, `puff at r = ${Math.hypot(p.x, p.z).toFixed(2)}`);
   fx.dispose();
 });
+
+test('fx: chips and sparks stop at a wall in their way (ricochet / die there) with a bounded number of rays', () => {
+  const { sim, ctx } = fakeSim();
+  // A wall: the plane z = −2 facing +Z (a registry answering rays like one thick slab).
+  let rays = 0;
+  const wall = { kind: 'voxel', name: 'wall' };
+  (ctx as unknown as { registry: unknown }).registry = {
+    raycast(o: THREE.Vector3, d: THREE.Vector3, max: number) {
+      rays++;
+      if (d.z >= -1e-6 || o.z <= -2) return null;
+      const t = (-2 - o.z) / d.z;
+      return t <= max ? { target: wall, point: o.clone().addScaledVector(d, t), normal: new THREE.Vector3(0, 0, 1), distance: t } : null;
+    },
+  };
+  const fx = new FxSystem(sim);
+  ctx.fx = fx;
+  ctx.time.now = 1;
+  const p = new THREE.Vector3(0, 1.5, 0);
+  fx.emitChips(p, new THREE.Vector3(0, 0, -1), 0.3, 30, 100, 0.01, 0x999999, 'stone');
+  assert.ok(rays <= 12, `rays for 100 chips: ${rays}`);
+  const g = fx.chipLayer.mesh.geometry;
+  const c0 = (g.getAttribute('c0') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const c1 = (g.getAttribute('c1') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const c2 = (g.getAttribute('c2') as THREE.InstancedBufferAttribute).array as Float32Array;
+  let ended = 0, ricochets = 0;
+  for (let i = 0; i < fx.chipLayer.emitted; i++) {
+    const o = i * 4;
+    if (c2[o + 1] === 0) {
+      // A segment that ends at the wall: where it is at the end of its life is (about) the wall.
+      ended++;
+      const m = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+      motionAt(c0[o]!, c0[o + 1]!, c0[o + 2]!, c1[o]!, c1[o + 1]!, c1[o + 2]!, c2[o]!, 1, 0.48, 0, 0.21, c1[o + 3]!, m);
+      assert.ok(Math.abs(m.z + 2) < 0.08, `segment ends at z = ${m.z.toFixed(3)}`);
+    } else if (c0[o + 3]! > 1.001) {
+      // Its ricochet starts in front of the wall and moves away from it.
+      ricochets++;
+      assert.ok(c0[o + 2]! > -2 && c0[o + 2]! < -1.9, `ricochet starts at z = ${c0[o + 2]!.toFixed(3)}`);
+      assert.ok(c1[o + 2]! > 0, 'bounces off the wall');
+    }
+  }
+  assert.ok(ended > 60 && ended === ricochets, `ended ${ended}, ricochets ${ricochets}`);
+  // Sparks die at the wall: nothing lives past it.
+  rays = 0;
+  fx.emitSparks(p, new THREE.Vector3(0, 0, -1), 200, 60, 1900, 0.3, 0.001, 0);
+  assert.ok(rays <= 12, `rays for 200 sparks: ${rays}`);
+  const sg = fx.sparkLayer.mesh.geometry;
+  const a0 = (sg.getAttribute('a0') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const a1 = (sg.getAttribute('a1') as THREE.InstancedBufferAttribute).array as Float32Array;
+  const a2 = (sg.getAttribute('a2') as THREE.InstancedBufferAttribute).array as Float32Array;
+  for (let i = 0; i < fx.sparkLayer.emitted; i++) {
+    const o = i * 4;
+    const m = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+    motionAt(a0[o]!, a0[o + 1]!, a0[o + 2]!, a1[o]!, a1[o + 1]!, a1[o + 2]!, a2[o]!, 1, 0.48, 0, 0.21, a1[o + 3]!, m);
+    assert.ok(m.z > -2.1, `spark ends at z = ${m.z.toFixed(3)}`);
+  }
+  fx.dispose();
+});
+

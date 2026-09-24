@@ -108,8 +108,10 @@ export class Chips {
           #endif`)
         .replace('#include <begin_vertex>', `
           vec3 chipVel; float chipRest;
-          vec3 chipPos = motionBounce(c0.xyz, c1.xyz, c2.x, c2.y, uWind * 0.3, max(chipAge, 0.0), c2.z, c2.w, chipVel, chipRest);
-          float chipFade = 1.0 - smoothstep(0.85, 1.0, chipAge / max(c1.w, 1e-3));
+          vec3 chipPos = motionBounce(c0.xyz, c1.xyz, c2.x, 1.0, uWind * 0.3, max(chipAge, 0.0), c2.z, c2.w, chipVel, chipRest);
+          // c2.y: 1 = the chip shrinks away at the end of its life; 0 = this flight segment ends
+          // against a wall where its ricochet (a second slot) takes over.
+          float chipFade = 1.0 - c2.y * smoothstep(0.85, 1.0, chipAge / max(c1.w, 1e-3));
           vec3 transformed = chipAlive ? chipPos + chipR * (position * chipScale * chipFade) : vec3(0.0, -1e5, 0.0);
           vChipKind = c3.w;`)
         .replace('#include <shadowmap_vertex>', `#include <shadowmap_vertex>
@@ -132,7 +134,7 @@ export class Chips {
         .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = vChipKind < 0.5 ? 0.92 : (vChipKind < 1.5 ? 0.06 : 0.38);')
         .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = vChipKind > 1.5 ? 1.0 : 0.0;');
     };
-    m.customProgramCacheKey = () => 'fx-chips-v3';
+    m.customProgramCacheKey = () => 'fx-chips-v4';
     this.material = m;
     this.mesh = new THREE.Mesh(g, m);
     this.mesh.name = 'fx-chips';
@@ -143,12 +145,13 @@ export class Chips {
   }
 
   /**
-   * One chip: position, velocity, drag, gravity scale, floor & landing time (−1: none), size (m),
-   * spin (rad/s), seed, kind, linear colour.
+   * One chip: position, velocity, drag, floor & landing time (−1: none), size (m), spin (rad/s),
+   * seed, kind, linear colour. `fade` false: the chip does not shrink at the end of its life (a
+   * flight segment that ends against a wall, continued by its ricochet).
    */
   emit(t0: number, life: number, px: number, py: number, pz: number, vx: number, vy: number, vz: number,
     drag: number, floor: number, tLand: number, size: number, spin: number, seed: number, kind: ChipKind,
-    r: number, g: number, b: number): void {
+    r: number, g: number, b: number, fade = true): void {
     if (!Number.isFinite(px + py + pz + vx + vy + vz)) return;
     const i = this.head;
     this.head = (i + 1) % this.capacity;
@@ -156,7 +159,7 @@ export class Chips {
     const a0 = this.c0.array as Float32Array, a1 = this.c1.array as Float32Array, a2 = this.c2.array as Float32Array, a3 = this.c3.array as Float32Array;
     a0[o] = px; a0[o + 1] = py; a0[o + 2] = pz; a0[o + 3] = t0;
     a1[o] = vx; a1[o + 1] = vy; a1[o + 2] = vz; a1[o + 3] = life;
-    a2[o] = Math.max(1e-4, drag); a2[o + 1] = 1; a2[o + 2] = floor; a2[o + 3] = tLand;
+    a2[o] = Math.max(1e-4, drag); a2[o + 1] = fade ? 1 : 0; a2[o + 2] = floor; a2[o + 3] = tLand;
     a3[o] = size; a3[o + 1] = spin; a3[o + 2] = seed; a3[o + 3] = KIND_ID[kind];
     const c = this.col.array as Float32Array;
     c[i * 3] = r; c[i * 3 + 1] = g; c[i * 3 + 2] = b;

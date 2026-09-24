@@ -46,6 +46,12 @@ export interface Atmosphere {
   /** Root of the transparent effects (rendered by the pipeline's soft-particle pass) */
   fxRoot: THREE.Object3D | null;
   /**
+   * Called with the render camera right before the effects root is drawn (depth-sorts the
+   * alpha-blended particles). The full pipeline calls it from its effects pass; under BasicPipeline
+   * the effects module calls it from the scene's onBeforeRender.
+   */
+  beforeFx: ((camera: THREE.Camera) => void) | null;
+  /**
    * Set by the full pipeline, which owns these values and applies camera shake around the whole
    * frame. When false (BasicPipeline) the effects derive the lighting from the scene's lights.
    */
@@ -97,6 +103,7 @@ export function getAtmosphere(scene: THREE.Scene): Atmosphere {
       sunShadowSplit: { value: 30 },
       hasSunShadow: { value: 0 },
       fxRoot: null,
+      beforeFx: null,
       pipelineHandlesShake: false,
       shake: { position: new THREE.Vector3(), rotation: new THREE.Euler(), active: false },
     };

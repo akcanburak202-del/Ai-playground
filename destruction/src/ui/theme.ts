@@ -119,7 +119,7 @@ const CSS = /* css */ `
     repeating-linear-gradient(90deg, var(--rule-2) 0 1px, transparent 1px 80px) 0 0 / 100% 6px no-repeat,
     repeating-linear-gradient(90deg, var(--rule) 0 1px, transparent 1px 16px) 0 0 / 100% 3px no-repeat;
 }
-.dx-slowmo-tag { color: var(--amber); font-family: var(--f-label); font-weight: 600; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; }
+.dx-slowmo-tag { color: var(--amber); font-family: var(--f-label); font-weight: 600; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; white-space: nowrap; }
 
 /* ── Telemetry: the newest impact large, older ones one line each, fading ── */
 .dx-tele { right: var(--pad); top: 44px; width: 316px; padding: 9px 12px 10px; transition: opacity 0.8s ease; }
@@ -181,7 +181,10 @@ const CSS = /* css */ `
 .dx-orow .dx-tag { font-size: 8.5px; padding: 0 4px; }
 .dx-empty { padding: 0 0 2px; color: var(--ink-3); font-size: 11px; line-height: 1.4; }
 .dx-blast { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--rule); }
-.dx-blast .dx-tele-head { margin-bottom: 4px; }
+.dx-blast.dx-solo { margin-top: 0; padding-top: 0; border-top: 0; }
+.dx-blast .dx-tele-head { margin-bottom: 4px; gap: 10px; }
+.dx-blast .dx-tele-head .dx-title { white-space: nowrap; flex: none; }
+.dx-blast .dx-tele-head .dx-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dx-blast-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px 12px; }
 .dx-blast-grid div { display: flex; flex-direction: column; min-width: 0; }
 .dx-blast-grid .dx-lbl { font-size: 8.5px; letter-spacing: 0.12em; }
@@ -293,10 +296,10 @@ const CSS = /* css */ `
 .dx-root.dx-lite .dx-menu::before { -webkit-backdrop-filter: none; backdrop-filter: none; }
 
 /* Clean view: only the reticle (and transient messages) remain. */
-.dx-root.dx-clean :is(.dx-top, .dx-ruler, .dx-tele, .dx-dock, .dx-readout, .dx-keys) { display: none; }
+.dx-root.dx-clean :is(.dx-top, .dx-ruler, .dx-tele, .dx-dock, .dx-readout, .dx-keys, .dx-marks) { display: none; }
 
 /* With the menu up, the play HUD is not drawn under the translucent sheet. */
-.dx-root.dx-menu-open :is(.dx-top, .dx-ruler, .dx-tele, .dx-dock, .dx-strip, .dx-reticle, .dx-readout, .dx-hit, .dx-banner, .dx-scope, .dx-lockhint, .dx-frame, .dx-keys, .dx-loading) { visibility: hidden; }
+.dx-root.dx-menu-open :is(.dx-top, .dx-ruler, .dx-tele, .dx-dock, .dx-strip, .dx-reticle, .dx-readout, .dx-hit, .dx-banner, .dx-scope, .dx-lockhint, .dx-frame, .dx-keys, .dx-loading, .dx-marks) { visibility: hidden; }
 .dx-touch-hidden { display: none !important; }
 
 /* Looking through a scope, the panels step back. */
@@ -325,6 +328,12 @@ const CSS = /* css */ `
   position: absolute; left: 50%; top: 50%; transform: translate(-50%, 96px); padding: 7px 14px;
   font-family: var(--f-label); font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--ink);
 }
+/* Placed charges: a marker on each (numbered in firing order), projected from the world each frame. */
+.dx-marks { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.dx-mark { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
+.dx-mark i { position: absolute; left: -5px; top: -5px; width: 8px; height: 8px; transform: rotate(45deg); border: 1.5px solid var(--amber); background: rgba(255, 181, 71, 0.25); box-shadow: 0 0 0 1px rgba(10, 8, 6, 0.55); }
+.dx-mark b { position: absolute; left: 9px; top: -14px; font-family: var(--f-mono); font-stretch: 87.5%; font-weight: 600; font-size: 10px; color: var(--amber); text-shadow: 0 0 3px rgba(0, 0, 0, 0.9); white-space: nowrap; }
+.dx-mark.dx-far i { width: 6px; height: 6px; left: -4px; top: -4px; }
 .dx-frame { position: absolute; inset: 14px; pointer-events: none; opacity: 0; transition: opacity 0.4s ease; }
 .dx-frame.dx-show { opacity: 1; }
 .dx-frame i { position: absolute; width: 26px; height: 26px; border: 0 solid var(--amber-2); }
@@ -509,11 +518,15 @@ const CSS = /* css */ `
   .dx-help-cols { grid-template-columns: 1fr; gap: 10px; }
   .dx-help { max-height: calc(100vh - 40px); overflow: auto; }
   .dx-toast { top: 56%; }
+  /* Bullet camera (armed or riding): its banner in the weapon card's place, wrapping if it must. */
+  .dx-root.dx-banner-on .dx-dock { visibility: hidden; }
+  .dx-banner { top: 34px; left: var(--pad); right: var(--pad); transform: none; white-space: normal; text-align: center; line-height: 1.5; }
 }
 /* Landscape phones: card and telemetry side by side along the top. */
 @media (max-height: 520px) and (min-width: 761px) {
   .dx-dock { right: auto; width: min(360px, 44vw); }
   .dx-tele { left: auto; right: var(--pad); top: 34px !important; width: min(360px, 44vw); }
+  .dx-banner { right: auto; width: min(360px, 44vw); }
 }
 @media (prefers-reduced-motion: reduce) {
   .dx-root *, .dx-root *::before, .dx-root *::after { transition: none !important; animation: none !important; }

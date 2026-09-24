@@ -134,13 +134,13 @@ function buildTargets(ctx: SimContext, site: Site): void {
     // S355), so the first hit dishes and scabs it and bows the span; the next ones tear it.
     const s = next();
     heavyMember(site, s.x, 'HEB 300 kiriş (yan)', PROFILES.HEB300, [0, 0, 1], 0x6b2d24);
-    signs.push({ x: s.x, lines: ['HEB 300 · L = 3,6 m', 'Başlık tabana dönük, 19 mm', 'Beam on its side: dents, bends'] });
+    signs.push({ x: s.x, lines: ['HEB 300 KİRİŞ · 19 mm başlık', '120 mm HESH / HE-OR ile tekrar vurun', 'Dents and bends, then tears'] });
   }
   {
     // Welded box girder, 40 mm walls: dishes 5 cm at the first HESH hit and tears at the next.
     const s = next();
     heavyMember(site, s.x, 'Kutu kiriş 500×400×40', { type: 'box', h: 0.5, b: 0.4, t: 0.04 }, [0, 1, 0], 0x3f4c55);
-    signs.push({ x: s.x, lines: ['KUTU KİRİŞ · 40 mm', 'Kaynaklı S355, 500×400 mm', 'Welded box girder'] });
+    signs.push({ x: s.x, lines: ['KUTU KİRİŞ · 40 mm cidar', '120 mm HESH / HE-OR ile tekrar vurun', 'Welded box: dent, bow, then tear'] });
   }
   const standTo = slots[i - 1]!;
   const standX = (standFrom.x - standFrom.w / 2 + standTo.x + standTo.w / 2) / 2;
@@ -202,8 +202,11 @@ function buildTargets(ctx: SimContext, site: Site): void {
     ...signs.map((s) => ({ at: [s.x, 0, 2.2] as V3, lines: s.lines, width: 0.9, height: 0.45 })),
     // The stand's header, a step closer to the gun.
     {
-      at: [standX, 0, 3.4] as V3, width: 1.8, height: 0.45, accent: '#b8412c',
-      lines: ['120 mm TANK TOPU · ÇELİK', 'HESH / HE-OR: önce ezik ve eğilme, tekrarında yırtılma', 'Tank gun vs heavy steel: dent and bend, then tear'],
+      at: [standX, 0, 3.4] as V3, width: 1.8, height: 0.55, accent: '#b8412c',
+      lines: [
+        'TANK TOPU · AĞIR ÇELİK', '120 mm HESH / HE-OR ile tekrar tekrar vurun',
+        'İlk atış ezer ve eğer, aynı noktaya tekrarı yırtar', 'Tank gun on heavy steel: dent and bend, then tear',
+      ],
     },
   ]));
 }

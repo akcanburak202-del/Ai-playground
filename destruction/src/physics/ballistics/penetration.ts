@@ -381,6 +381,97 @@ function rodStrength(a: AmmoData): number {
   return a.rodStrength ?? (a.coreDensity > 15000 ? 1.4e9 : 1.0e9);
 }
 
+// ─── Shell break-up on steel ────────────────────────────────────────────────────────────────
+
+/** Flow stress of a hardened steel shell nose (cap or solid ogive), Tate's Y_p, Pa (estimate: ≈ HRC 40 steel). */
+export const SHELL_NOSE_STRENGTH = 1.2e9;
+/** Flow stress of quenched-and-tempered shell-body steel, Pa (estimate). */
+export const SHELL_CASE_STRENGTH = 1.0e9;
+/** Share of the casing steel in a solid nose when the round has no separate nose cap (estimate). */
+const SHELL_NOSE_FRACTION = 0.15;
+const STEEL_DENSITY = 7850;
+
+/** A steel-cased explosive round that reaches targets kinetically (delay-fuzed or unfuzed HE, HESH, thermobaric). */
+export function isShellBody(a: AmmoData): boolean {
+  return (a.kind === 'he' || a.kind === 'hesh' || a.kind === 'thermobaric') && !!a.explosiveTNT && (a.casingMass ?? 0) > 0;
+}
+
+/**
+ * Axial load a shell body carries before its wall collapses, N: the wall section (casing mass
+ * over a body length of 0.6 L — the casing geometry of fragments.ts) × the case steel's flow stress.
+ * M908: 6 kg over 0.47 m → 16 cm² → 1.6 MN.
+ */
+export function shellCrushLoad(a: AmmoData): number {
+  const Lc = Math.max(0.6 * a.length, a.diameter);
+  return ((a.casingMass ?? 0) / (STEEL_DENSITY * Lc)) * SHELL_CASE_STRENGTH;
+}
+
+/**
+ * Force to punch a plug of diameter d out of a steel run of length t: F = τ π d t with the
+ * dynamic shear strength τ ≈ 0.6 σ_u (plugging model of Recht & Ipson 1963 / Woodward 1990;
+ * von Mises τ = σ/√3). The line-of-sight length is used, so obliquity also loads the body harder.
+ */
+export function plugForce(m: MaterialProps, strength: number, d: number, t: number): number {
+  return 0.6 * m.tensileStrength * strength * Math.PI * d * t;
+}
+
+export interface ShellBreakup {
+  /** Depth the nose reaches before it is used up, m */
+  depth: number;
+  /** Mass of the nose that worked against the plate, kg */
+  noseMass: number;
+  /**
+   * Share of the nose's kinetic energy the plate absorbs: u/v, the interface speed over the
+   * impact speed (the interface force does work F·u on the target and F·(v − u) eroding the nose).
+   */
+  share: number;
+  /** Body crush load and plate plugging force, N */
+  crush: number;
+  plug: number;
+}
+
+/**
+ * Does a steel-cased HE shell break up on the face of this steel run?
+ *  1. The nose cannot penetrate steel as a rigid body: Tate (1967, J. Mech. Phys. Solids 15) — a
+ *     penetrator whose flow stress Y_p is below the target resistance R_t deforms at every speed
+ *     (R_t = 2.7 GPa for S355, 5 GPa for RHA against Y_p ≈ 1.2 GPa). Concrete (R_t = 0.44 GPa) does
+ *     not meet this condition, so HE-OR's purpose — digging into concrete — is unchanged.
+ *  2. The deforming nose is driven only as hard as the thin body behind it can push: when the force
+ *     needed to plug the plate (τ π d t) exceeds the body's crush load (wall area × case flow
+ *     stress), the body collapses on the face and the charge goes off there.
+ *  3. The nose alone then erodes into the plate: Alekseevskii–Tate with the nose as a short rod
+ *     (the primary penetration; a lower estimate for L/D < 1, where the after-flow adds some).
+ * Returns null when the body holds (thin or already weakened plate: the round punches through as a
+ * rigid nose, Lambert–Jonas) or when the nose alone would get through anyway.
+ */
+export function shellBreakup(a: AmmoData, m: MaterialProps, strength: number, len: number, v: number, massNow: number): ShellBreakup | null {
+  if (!isShellBody(a) || m.class !== 'ductile' || !(len > 0) || !(v > 0)) return null;
+  const Rt = tateTargetResistance(m, strength);
+  if (Rt <= SHELL_NOSE_STRENGTH) return null;
+  const crush = shellCrushLoad(a);
+  const plug = plugForce(m, strength, a.diameter, len);
+  if (plug <= crush) return null;
+  const noseMass = Math.min(a.coreMass ?? SHELL_NOSE_FRACTION * (a.casingMass ?? 0), massNow);
+  const L = noseMass / (a.coreDensity * Math.PI * 0.25 * a.diameter * a.diameter);
+  const r = tatePenetration(v, L, a.diameter, a.coreDensity, SHELL_NOSE_STRENGTH, m.density, Rt, len);
+  if (r.depth >= len - 1e-6 && r.v > 1 && r.length > 1e-4) return null;
+  const share = tateInterfaceSpeed(v, a.coreDensity, SHELL_NOSE_STRENGTH, m.density, Rt) / v;
+  return { depth: Math.min(r.depth, len), noseMass, share, crush, plug };
+}
+
+/**
+ * Steady-state Alekseevskii–Tate interface speed u < v: ½ρp(v − u)² + Y_p = ½ρt u² + R_t
+ * (0 when the nose cannot push the interface at all; v when it stays rigid).
+ */
+export function tateInterfaceSpeed(v: number, rhoP: number, Yp: number, rhoT: number, Rt: number): number {
+  if (0.5 * rhoT * v * v + Rt <= Yp) return v;
+  const A = 0.5 * (rhoP - rhoT);
+  const B = -rhoP * v;
+  const C = 0.5 * rhoP * v * v + Yp - Rt;
+  const u = Math.abs(A) < 1e-6 ? -C / B : (-B - Math.sqrt(Math.max(0, B * B - 4 * A * C))) / (2 * A);
+  return clamp(u, 0, v);
+}
+
 interface MarchState {
   v: number;
   mass: number;
@@ -388,6 +479,10 @@ interface MarchState {
   depth: number;
   stoppedIn: ProbeSegment | null;
   perforated: boolean;
+  /** A shell body collapsed on the struck steel face (see `shellBreakup`): mass of its nose, kg */
+  brokeUp: number;
+  /** …and the share of the nose's energy the plate took (Tate u/v) */
+  brokeUpShare: number;
   /** Short model note for the summary */
   note: string;
 }
@@ -484,6 +579,20 @@ function marchKinetic(a: AmmoData, st: MarchState, probe: ThicknessProbe, obliq:
     }
 
     if (m.class === 'ductile') {
+      if (i === 0) {
+        // A steel-cased HE shell whose body cannot push its nose through this plate breaks up on
+        // the face (only on a struck steel face: a bar inside concrete is cut, not plugged).
+        const bu = shellBreakup(a, m, s, len, v, st.mass);
+        if (bu) {
+          st.note = `gövde çöktü: tıkaç ${(bu.plug / 1e6).toFixed(1)} MN > gövde ${(bu.crush / 1e6).toFixed(1)} MN, burun (Tate) ${fmtLength(bu.depth)}`;
+          st.depth += bu.depth;
+          st.v = 0;
+          st.stoppedIn = seg;
+          st.brokeUp = bu.noseMass;
+          st.brokeUpShare = bu.share;
+          return;
+        }
+      }
       // Lambert–Jonas limit (RHA) × target-strength factor × deformable-core penalty.
       const k = steelStrengthFactor(m, s) * deformSteel(pen, a);
       const vbl = lambertLimit(len, obliq, pen.d, pen.len, pen.mass) * k;
@@ -584,7 +693,7 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
     return ricochet(ev, a, dir, hit.normal, graze, bc, rng, name);
   }
 
-  const st: MarchState = { v: speed, mass: p.mass, length: p.length, depth: 0, stoppedIn: null, perforated: false, note: '' };
+  const st: MarchState = { v: speed, mass: p.mass, length: p.length, depth: 0, stoppedIn: null, perforated: false, brokeUp: 0, brokeUpShare: 1, note: '' };
   marchKinetic(a, st, probe, obliq);
   if (probe.segments.length === 0) st.perforated = speed > 0;
   const runLen = probe.segments.length ? probe.segments[probe.segments.length - 1]!.end : 0;
@@ -600,7 +709,9 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   // Lead-core ball that fails to perforate steel splashes (shatters) on the face.
   if (!st.perforated && a.kind === 'ball' && st.stoppedIn?.material.class === 'ductile' && st.stoppedIn === seg0) outcome = 'shatter';
   if (!st.perforated && a.kind === 'fragment' && mat.class === 'ductile' && speed > 600) outcome = 'shatter';
-  // A capped HE shell stopped by steel breaks up on the face and hands the plate all its momentum.
+  // A shell whose body collapsed on the steel face (or a capped shell whose nose was stopped by it)
+  // breaks up there and hands the plate all its momentum.
+  if (!st.perforated && st.brokeUp > 0) outcome = 'shatter';
   if (!st.perforated && isCappedShell(a) && st.stoppedIn?.material.class === 'ductile' && st.stoppedIn === seg0) outcome = 'shatter';
   ev.outcome = outcome;
 
@@ -618,11 +729,12 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   ev.momentum.copy(dir).multiplyScalar(p.mass * speed);
   if (ev.residualDirection) ev.momentum.addScaledVector(ev.residualDirection, -ev.residualMass * ev.residualSpeed);
   if (outcome === 'shatter') ev.energyAbsorbed *= 0.4; // most of the energy leaves in the radial splash
-  if (mat.class === 'ductile' && isCappedShell(a)) {
-    // The plate works against the cap; the light body's energy goes into its own break-up (and
-    // its momentum, above, still reaches the plate).
-    const mc = Math.min(a.coreMass!, p.mass);
-    ev.energyAbsorbed = 0.5 * mc * (speed * speed - ev.residualSpeed * ev.residualSpeed);
+  if (mat.class === 'ductile' && (isCappedShell(a) || st.brokeUp > 0)) {
+    // The plate works against the nose; the light body's energy goes into its own break-up (and
+    // its momentum, above, still reaches the plate). An eroding nose spends the share (v − u)/v of
+    // its energy on its own erosion and splash (Tate), the plate takes u/v.
+    const mc = st.brokeUp > 0 ? st.brokeUp : Math.min(a.coreMass!, p.mass);
+    ev.energyAbsorbed = 0.5 * mc * (speed * speed - ev.residualSpeed * ev.residualSpeed) * (st.brokeUp > 0 ? st.brokeUpShare : 1);
   }
 
   sizeCrater(ev, a, pen, mat, probe, st, speed, obliq);

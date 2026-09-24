@@ -4,8 +4,8 @@ import type RAPIER from '@dimforge/rapier3d-compat';
 import type { SimContext, VoxelElementSpec } from '../../app/contracts.ts';
 import { AIR_DENSITY, G } from '../../core/units.ts';
 import { MATERIALS, type MaterialProps } from '../../physics/materials.ts';
-import type { PhysicsOwner, ContactForceInfo } from '../../physics/PhysicsWorld.ts';
-import type { BlastLoad, ContactDamage, ImpactEvent, ProbeSegment, ThicknessProbe } from '../../physics/ballistics/types.ts';
+import { groups, type PhysicsOwner, type ContactForceInfo } from '../../physics/PhysicsWorld.ts';
+import type { BlastLoad, ContactDamage, ImpactEvent, MemberInfo, ProbeSegment, ThicknessProbe } from '../../physics/ballistics/types.ts';
 import { allocateDestructibleId, type Destructible, type RayHit, type Structural } from '../Destructible.ts';
 import { CHUNK, EMPTY, FULL, ISO, VoxelGrid, densityFromSdf } from './grid.ts';
 import { fillGrid, layoutFor, makeShape, type ShapeSdf, BoxShape, CylinderShape } from './shape.ts';
@@ -69,6 +69,15 @@ const MAX_BLAST_PATCHES = 24000;
  * size (≈ 5–10 cm near the camera) its shadow is a blur of a few texels.
  */
 const SHADOW_MIN_SIZE = 0.3;
+/** Share of a member's face at P–I damage ≥ 2 that fails it as a whole panel (yield-line mechanism) */
+const PANEL_FAILURE_SHARE = 0.5;
+/** A severe region at least this many span² in area fails as one region (half a span square) */
+const PANEL_REGION_SPANS = 0.25;
+/** Face area of one slab of a panel failure, m² (≈ 1 m pieces) */
+const PANEL_PIECE_AREA = 1.0;
+const PANEL_MAX_PIECES = 32;
+/** Cap on the rigid-plastic throw speed of blast-driven pieces, m/s (as for breach plugs) */
+const PANEL_MAX_SPEED = 80;
 /** Cantilever reach from one support, in element thicknesses */
 const CANTILEVER_FACTOR = 10;
 /** Largest span between two supports, in element thicknesses (RC slab span/depth ≈ 35) */
@@ -82,6 +91,10 @@ const _q = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
 const _s = new THREE.Vector3();
 const _hit: TraceHit = { t: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, bar: -1 };
+const _best: TraceHit = { t: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, bar: -1 };
+function copyHit(a: TraceHit, b: TraceHit): void {
+  b.t = a.t; b.x = a.x; b.y = a.y; b.z = a.z; b.nx = a.nx; b.ny = a.ny; b.nz = a.nz; b.bar = a.bar;
+}
 const _vSnap = new THREE.Vector3();
 const _runs: RunSegment[] = [];
 const _bm = new THREE.Matrix4();
@@ -100,6 +113,18 @@ interface PieceInit {
   cell: { seeds: number[]; index: number } | null;
 }
 
+/**
+ * Speed a piece may gain in one step beyond gravity before the contact-gain limit looks at it,
+ * m/s, and the coefficient of restitution the limit allows (debris uses 0.08; generous margin).
+ */
+const CONTACT_GAIN_SLACK = 1;
+const CONTACT_RESTITUTION = 0.3;
+/** Pushes from blasts and hits are real: the limit leaves a piece alone this long after one (s) */
+const PUSH_GRACE = 0.1;
+/** Freshly split siblings do not push each other apart for this long (s): their hulls are disjoint */
+const SIBLING_SOLVER_GRACE = 0.07;
+/** Pieces of gravity releases and landings smaller than this become chips, not bodies (m) */
+const RUBBLE_MIN_SIZE = 0.1;
 /** Contacts in the first steps of a piece's life are spawn transients, not landings (s) */
 const SPAWN_SETTLE = 0.05;
 /** Siblings bumping into each other this soon after the split do not crack each other (s) */
@@ -201,6 +226,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   /** Inward axis of the contact charge being realised (bar bending direction), local */
   private blastAxis: THREE.Vector3 | null = null;
   private lastContactEvent = -1;
+  /** Set by panelFailure during applyBlast: material left as pieces, supports must be re-checked */
+  private panelReleased = false;
   private eventSeed = 1;
   private invQ = new THREE.Quaternion();
   /** Spawn event id shared with sibling pieces (0 for original elements) */
@@ -209,12 +236,18 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   private hullCell: { seeds: number[]; index: number } | null = null;
   /** Body velocity at the end of the previous fixed step (contact energy bookkeeping) */
   private readonly prevLin = new THREE.Vector3();
+  private readonly prevAng = new THREE.Vector3();
+  /** Last explicit push (projectile hit, blast load) on this piece, sim s */
+  private pushedAt = -1;
+  /** Solver contacts with same-event siblings are off until then (sim s); −1 once restored */
+  private siblingSolverUntil = -1;
 
   constructor(ctx: SimContext, spec: VoxelElementSpec, piece?: PieceInit) {
     this.ctx = ctx;
     this.spec = spec;
     this.material = MATERIALS[spec.material];
     this.scheduler = schedulerFor(ctx);
+    watchBlasts(ctx);
     if (piece) {
       this.name = `${piece.parent.name}·${++pieceCounter}`;
       this.shape = piece.parent.shape;
@@ -851,13 +884,16 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   private hullPoints(): Float32Array {
     const g = this.grid, b = this.sampleBox;
     const surf: number[] = [];
-    for (let k = b[2]; k <= b[5]; k++)
-      for (let j = b[1]; j <= b[4]; j++)
-        for (let i = b[0]; i <= b[3]; i++) {
+    // Large pieces (a slab of a blown-out wall is ~20 k samples) are scanned on every other
+    // sample: ~120 points are kept anyway, and the hull shrinks by at most a voxel.
+    const st = (b[3] - b[0] + 1) * (b[4] - b[1] + 1) * (b[5] - b[2] + 1) > 16000 ? 2 : 1;
+    for (let k = b[2]; k <= b[5]; k += st)
+      for (let j = b[1]; j <= b[4]; j += st)
+        for (let i = b[0]; i <= b[3]; i += st) {
           if (g.density(i, j, k) < ISO) continue;
           if (
-            g.density(i - 1, j, k) < ISO || g.density(i + 1, j, k) < ISO || g.density(i, j - 1, k) < ISO ||
-            g.density(i, j + 1, k) < ISO || g.density(i, j, k - 1) < ISO || g.density(i, j, k + 1) < ISO
+            g.density(i - st, j, k) < ISO || g.density(i + st, j, k) < ISO || g.density(i, j - st, k) < ISO ||
+            g.density(i, j + st, k) < ISO || g.density(i, j, k - st) < ISO || g.density(i, j, k + st) < ISO
           ) surf.push(i, j, k);
         }
     const cell = this.hullCell;
@@ -907,6 +943,14 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
         .setTranslation(g.lx((b[0] + b[3]) / 2), g.ly((b[1] + b[4]) / 2), g.lz((b[2] + b[5]) / 2));
     }
     desc.setMass(Math.max(0.05, this.mass)).setFriction(0.85).setRestitution(0.08);
+    // Siblings of one split start apart (disjoint planar-cell hulls); for a few steps they are
+    // kept from pushing each other anyway (solver groups: membership bit of the spawn event,
+    // filter everything else), so a residual overlap cannot kick them apart.
+    const sib = this.siblingBit();
+    if (sib) {
+      desc.setSolverGroups(groups(sib, 0xffff & ~sib));
+      if (this.siblingSolverUntil < 0) this.siblingSolverUntil = this.bornAt + SIBLING_SOLVER_GRACE;
+    }
     const fast = (linvel?.length() ?? 0) > 6;
     this.body = p.createDynamic({
       position: this.root.position,
@@ -923,7 +967,72 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     });
     this.hullVolume = this.grid.solidVolume();
     if (linvel) this.prevLin.copy(linvel);
+    if (angvel) this.prevAng.copy(angvel);
     if (sleeping) this.body.sleep();
+  }
+
+  /** Solver-group bit of this piece's spawn event while the sibling window is open, else 0. */
+  private siblingBit(): number {
+    if (!this.spawnGroup || this.siblingSolverUntil === -2) return 0;
+    if (this.siblingSolverUntil >= 0 && this.ctx.time.now >= this.siblingSolverUntil) return 0;
+    return 1 << (4 + (this.spawnGroup % 12));
+  }
+
+  /** Close the sibling window: full solver contacts again. */
+  private restoreSolverGroups(): void {
+    this.siblingSolverUntil = -2;
+    const b = this.body;
+    if (!b) return;
+    try {
+      for (let i = 0; i < b.numColliders(); i++) b.collider(i).setSolverGroups(0xffffffff);
+    } catch {
+      /* world replaced */
+    }
+  }
+
+  /**
+   * Contact-gain limit. A light piece squeezed between heavy ones (a brick under a falling slab)
+   * or started inside another collider is driven out by the solver at whatever speed resolves the
+   * overlap — measured: 1–2 kg pieces of a collapsing roof left at 24–47 m/s. A collision cannot
+   * do that: Newton's restitution law bounds the speed a light body leaves a heavy one with at
+   * (1 + e)·V_other + e·v_own (V the other body's speed, e the restitution), and resting or
+   * static neighbours (V ≈ 0) cannot launch anything. A gain beyond that bound (plus gravity) is
+   * solver error and is removed; spin is bounded alike (ω·r ≤ the speed bound). Blasts and hits
+   * push for real and are exempt for PUSH_GRACE.
+   */
+  private limitContactGain(dt: number): void {
+    const b = this.body!;
+    if (b.isSleeping()) return;
+    const v = b.linvel();
+    const s1 = Math.hypot(v.x, v.y, v.z), s0 = this.prevLin.length();
+    const w = b.angvel();
+    const w1 = Math.hypot(w.x, w.y, w.z), w0 = this.prevAng.length();
+    const r = 0.5 * Math.cbrt(Math.max(1e-6, this.grid.solidVolume()));
+    const free = s0 + G * dt + CONTACT_GAIN_SLACK;
+    if (s1 <= free && w1 * r <= Math.max(w0 * r, free)) return;
+    const now = this.ctx.time.now;
+    if (now - this.pushedAt <= PUSH_GRACE || recentBlastNear(this.ctx, this.root.position, now)) return;
+    let vOther = 0;
+    try {
+      this.ctx.physics.world.contactPairsWith(b.collider(0), (c2) => {
+        const pb = c2.parent();
+        if (!pb || !pb.isDynamic()) return;
+        const u = pb.linvel();
+        vOther = Math.max(vOther, Math.hypot(u.x, u.y, u.z));
+      });
+    } catch {
+      return;
+    }
+    const cap = Math.max(free, (1 + CONTACT_RESTITUTION) * vOther + CONTACT_RESTITUTION * s0 + G * dt + CONTACT_GAIN_SLACK);
+    if (s1 > cap) {
+      const k = cap / s1;
+      b.setLinvel({ x: v.x * k, y: v.y * k, z: v.z * k }, true);
+    }
+    const wCap = Math.max(w0, cap / r);
+    if (w1 > wCap) {
+      const k = wCap / w1;
+      b.setAngvel({ x: w.x * k, y: w.y * k, z: w.z * k }, true);
+    }
   }
 
   private syncFromBody(): void {
@@ -974,26 +1083,53 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     if (this.pendingSplit || size < 2 * MIN_PIECE_SIZE) return;
     const fcm = this.material.compressiveStrength / 1e6 + 8;
     const Gf = 73 * Math.pow(fcm, 0.18);
-    if (dE > 25 * Gf * size * size && this.ctx.physics.dynamicCount < this.ctx.physics.maxDynamicBodies * 0.8) {
+    // Past 60 % of the body budget landings only clatter: the remaining bodies are kept for new
+    // failures (a blown-out wall alone throws 32 slabs that would otherwise cascade into ~700).
+    if (dE > 25 * Gf * size * size && this.ctx.physics.dynamicCount < this.ctx.physics.maxDynamicBodies * 0.6) {
       this.pendingSplit = { point: (info.point ?? this.root.position).clone() };
     }
   }
 
   // ── Destructible: queries ─────────────────────────────────────────────────────────────────
 
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
+  /**
+   * `radius` is the round's radius: a hole or gap narrower than the round must stop it. Rounds of
+   * at least 0.3 voxel radius (sub-voxel holes cannot be represented anyway, so small arms keep
+   * the single ray) are traced as their centre line plus a ring of six parallel rays at 0.9 r;
+   * the nearest material any of them meets is where the round's body strikes (the rim of a hole
+   * smaller than the round, or the edge of one it passes off-centre).
+   */
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, radius = 0): RayHit | null {
     if (this.disposed || this.grid.totalSolid === 0) return null;
     this.toLocal(origin, _v);
     this.toLocalDir(dir, _v2);
-    if (!traceRay(this.grid, this.sampleBox, this.rebar, _v.x, _v.y, _v.z, _v2.x, _v2.y, _v2.z, maxDist, _hit)) return null;
-    const bar = _hit.bar >= 0;
+    const g = this.grid, box = this.sampleBox, rb = this.rebar;
+    const dx = _v2.x, dy = _v2.y, dz = _v2.z;
+    _best.t = Infinity;
+    if (traceRay(g, box, rb, _v.x, _v.y, _v.z, dx, dy, dz, maxDist, _hit)) copyHit(_hit, _best);
+    if (radius >= 0.3 * g.h) {
+      // Ring basis: u ⟂ d, w = d × u.
+      const hx = Math.abs(dy) < 0.9 ? 0 : 1, hy = 1 - hx;
+      let ux = -dz * hy, uy = dz * hx, uz = dx * hy - dy * hx;
+      const ul = Math.hypot(ux, uy, uz) || 1;
+      ux /= ul; uy /= ul; uz /= ul;
+      const wx = dy * uz - dz * uy, wy = dz * ux - dx * uz, wz = dx * uy - dy * ux;
+      const rr = 0.9 * radius;
+      for (let q = 0; q < 6; q++) {
+        const c = Math.cos((q * Math.PI) / 3) * rr, sn = Math.sin((q * Math.PI) / 3) * rr;
+        const ox = _v.x + ux * c + wx * sn, oy = _v.y + uy * c + wy * sn, oz = _v.z + uz * c + wz * sn;
+        if (traceRay(g, box, rb, ox, oy, oz, dx, dy, dz, Math.min(maxDist, _best.t), _hit) && _hit.t < _best.t) copyHit(_hit, _best);
+      }
+    }
+    if (!Number.isFinite(_best.t)) return null;
+    const bar = _best.bar >= 0;
     return {
       target: this,
-      point: this.toWorld(_hit.x, _hit.y, _hit.z, new THREE.Vector3()),
-      normal: this.toWorldDir(_hit.nx, _hit.ny, _hit.nz, new THREE.Vector3()),
-      distance: _hit.t,
+      point: this.toWorld(_best.x, _best.y, _best.z, new THREE.Vector3()),
+      normal: this.toWorldDir(_best.nx, _best.ny, _best.nz, new THREE.Vector3()),
+      distance: _best.t,
       material: bar ? REBAR : this.material,
-      part: bar ? _hit.bar : undefined,
+      part: bar ? _best.bar : undefined,
     };
   }
 
@@ -1089,6 +1225,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     this.afterMaterialLoss(removed > 0 || e.damageRadius > 0);
     this.impactFx(e, removed, barHit);
     if (this.body && this.dynamic) {
+      this.pushedAt = this.ctx.time.now;
       try {
         this.ctx.physics.applyImpulseAt(this.body, e.momentum, e.point);
       } catch {
@@ -1201,6 +1338,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
 
   applyBlast(load: BlastLoad): void {
     if (this.disposed || this.grid.totalSolid === 0) return;
+    // The BlastSystem pushes this piece's body in the same step (contact-gain limit exemption).
+    if (this.dynamic) this.pushedAt = this.ctx.time.now;
     const t0 = performance.now();
     const g = this.grid, h = g.h;
     const c = this.toLocal(load.center, new THREE.Vector3());
@@ -1232,14 +1371,16 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     // hazards and evaluation"); only surfaces facing the charge.
     const Rs = (contact ? 0.7 : 1.0) * Math.cbrt(W);
     this.carver.sootSplat(c.x, c.y, c.z, Rs, 0.95, seed);
-    const barsMoved = this.rebar && this.barsMayBend(load) ? this.bendBars(load, c) : false;
+    const barsMoved = this.rebar && this.grid.totalSolid > 0 && this.barsMayBend(load) ? this.bendBars(load, c) : false;
     this.blastAxis = null;
     this.pendingBlast = { load, thickness, until: this.ctx.time.now + 0.5 };
     this.stats.lastCarveMs = performance.now() - t0;
     // Supports only need re-checking when material or bars actually moved; cracking and soot
     // alone just remesh. The static collider must lose the blown-out material now: the thrown
     // plug is flying through it this very step.
-    if (this.carver.stats.removed > 0 || barsMoved) {
+    const released = this.panelReleased;
+    this.panelReleased = false;
+    if (this.carver.stats.removed > 0 || barsMoved || released) {
       this.refreshOccupancy();
       this.afterMaterialLoss(true, 0.02);
     } else this.flushDirty();
@@ -1353,24 +1494,35 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     // Upper bound for the whole element: the load at its nearest point, on a face turned to the
     // charge, at half its thickness (P–I damage grows as the member thins). Below the onset of
     // cracking used per patch there is nothing to realise, so skip the scan (a charge loads every
-    // element within tens of metres).
-    this.bounds.clampPoint(load.center, _v);
-    const toC = _v2.copy(load.center).sub(_v);
-    const d0 = toC.length();
+    // element within tens of metres). The nearest point is taken on the element's own (oriented)
+    // material box: the world AABB of a rotated wall reaches metres closer to the charge than
+    // the wall does.
+    const member = this.memberInfo();
+    const near = this.nearestBoxPoint(c, new THREE.Vector3());
+    const facing = new THREE.Vector3().copy(load.center).sub(near);
+    const d0 = facing.length();
     const tRef = 0.5 * this.shape.thickness;
     if (d0 > 1e-3) {
-      toC.divideScalar(d0);
-      if (load.overpressureAt(_v) < 15e3 || load.damageAt(_v, toC, this.material, tRef) < 1) return this.shape.thickness;
-    } else toC.set(0, 1, 0);
+      facing.divideScalar(d0);
+      if (load.overpressureAt(near) < 15e3 || load.damageAt(near, facing, this.material, tRef, member) < 1) return this.shape.thickness;
+    } else facing.set(0, 1, 0);
     // Reach of the load: the distance out to which a face turned to the charge, at the same
     // reference thickness, still sees ≥ 15 kPa and a damage number ≥ 1 (both fall monotonically
     // with distance). Only patches inside that sphere can be realised, so the scan is bounded by
     // it instead of evaluating the Kingery–Bulmash fits at every patch of every element in range
     // (measured: 1.0–1.6 s of realisation per 2.3 kg charge among the pavilion's elements, most
-    // of it in the fits).
-    const away = toC.negate();
-    const reach = blastReach(load, away, (q) => load.overpressureAt(q) >= 15e3 && load.damageAt(q, toC, this.material, tRef) >= 1, Math.max(d0, 1e-3));
-    toC.negate();
+    // of it in the fits). The test face must be turned *towards* the charge (normal = −away):
+    // a face turned away sees neither the reflection nor the gas pressure of a confined charge,
+    // which shrank the reach of a 12 kg charge in the chapel to ~3 m and left walls 5 m away
+    // untouched under a damage number of 2.3.
+    // A panel loaded to damage ≥ 2 over most of its face fails as a whole: decided on a coarse
+    // sample of the face, without the patch scan and crack field the pieces would carry away.
+    if (this.wholePanelLoaded(load, c, member)) {
+      this.panelFailure(load, c, [], 0, true, seed);
+      return this.shape.thickness;
+    }
+    const away = facing.clone().negate();
+    const reach = blastReach(load, away, (q) => load.overpressureAt(q) >= 15e3 && load.damageAt(q, facing, this.material, tRef, member) >= 1, Math.max(d0, 1e-3));
     const g = this.grid, h = g.h, conn = this.conn;
     const F = conn.F;
     // Coarse surface patches (~10 cm) facing the charge; coarser when the sphere of reach would
@@ -1397,6 +1549,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const wp = new THREE.Vector3(), wn = new THREE.Vector3(), n = new THREE.Vector3(), pc = new THREE.Vector3();
     let tSum = 0, tN = 0;
     const breaches: { p: THREE.Vector3; a: THREE.Vector3; t: number; r: number; v: number }[] = [];
+    // Patches at damage ≥ 2 (local surface point, inward axis, thickness) for the flexural check.
+    const severe: number[] = [];
     // Damage splats (x, y, z, R, peak), applied together after the scan.
     const splats: number[] = [];
     for (let K = K0; K <= K1; K++)
@@ -1428,7 +1582,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
           tSum += t;
           tN++;
           // P–I damage number (contract: < 1 none, 1 onset of cracking, ≥ 2 severe / breach).
-          const dmg = load.damageAt(wp, wn, this.material, t);
+          const dmg = load.damageAt(wp, wn, this.material, t, member);
           if (dmg < 1) continue;
           const r = cellSize * 0.75;
           const s2 = seed + (I * 7 + J * 13 + K * 17) * 0.01;
@@ -1452,11 +1606,25 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
             const ir = load.reflectedImpulseAt(wp, wn);
             const v = Math.min(80, ir / (this.material.density * t));
             breaches.push({ p: sp, a: n.clone().negate(), t, r, v });
+            severe.push(sp.x, sp.y, sp.z, -n.x, -n.y, -n.z, t);
           }
         }
     // Flexural cracking of the whole loaded face in one pass; a repeated blast of similar strength
     // extends the existing crack field only a little (see Carver.damage).
     this.carver.damageBatch(splats, splats.length / 5, seed, BLAST_DAMAGE_ACCUMULATION);
+    // Global flexural failure: when the severe patches cover most of the panel (or a region at
+    // least half a span across), the member does not punch out in 10 cm plugs — it fails along
+    // yield lines as a whole and is thrown off in large slabs (see panelFailure).
+    const severeArea = (severe.length / 7) * cellSize * cellSize;
+    const [e0, e1] = this.panelExtents();
+    const faceArea = e0 * e1;
+    const whole = severeArea >= PANEL_FAILURE_SHARE * faceArea;
+    if (whole || severeArea >= PANEL_REGION_SPANS * (member.span ?? 3) ** 2) {
+      const st0 = this.carver.stats;
+      if (!st0.empty) this.carver.crumble(st0.i0, st0.j0, st0.k0, st0.i1, st0.j1, st0.k1);
+      this.panelFailure(load, c, severe, cellSize, whole, seed);
+      breaches.length = 0;
+    }
     // Breached patches: throw a few plugs as pieces, pulverise the rest.
     breaches.sort((x, y) => y.v - x.v);
     for (let q = 0; q < breaches.length; q++) {
@@ -1477,6 +1645,189 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       this.ctx.fx.dust({ position: cw, radius: 0.6, amount: Math.min(5, st.removed * 30), color: this.material.dustColor });
     }
     return tN ? tSum / tN : this.shape.thickness;
+  }
+
+  /**
+   * Coarse whole-panel test for box members: 12 × 12 points on the face turned to the charge
+   * (just inside it, so holes already shot through do not count as loaded material). True when
+   * at least PANEL_FAILURE_SHARE of the face is still there and loaded to damage ≥ 2.
+   */
+  private wholePanelLoaded(load: BlastLoad, c: THREE.Vector3, member: MemberInfo): boolean {
+    if (!(this.shape instanceof BoxShape)) return false;
+    const g = this.grid, half = this.shape.half, ta = this.thicknessAxis();
+    const a = (ta + 1) % 3, b = (ta + 2) % 3;
+    const side = c.getComponent(ta) >= 0 ? 1 : -1;
+    const N = 12;
+    const p = new THREE.Vector3(), wp = new THREE.Vector3(), wn = new THREE.Vector3();
+    p.set(0, 0, 0).setComponent(ta, side);
+    this.toWorldDir(p.x, p.y, p.z, wn);
+    let sev = 0;
+    for (let u = 0; u < N; u++)
+      for (let v = 0; v < N; v++) {
+        p.setComponent(a, -half[a]! + ((u + 0.5) / N) * 2 * half[a]!);
+        p.setComponent(b, -half[b]! + ((v + 0.5) / N) * 2 * half[b]!);
+        p.setComponent(ta, side * (half[ta]! - 0.75 * g.h));
+        if (g.densityAt(g.gx(p.x), g.gy(p.y), g.gz(p.z)) < ISO) continue;
+        p.setComponent(ta, side * half[ta]!);
+        this.toWorld(p.x, p.y, p.z, wp);
+        if (load.damageAt(wp, wn, this.material, this.shape.thickness, member) >= 2) sev++;
+      }
+    return sev >= PANEL_FAILURE_SHARE * N * N;
+  }
+
+  /** Nearest point of the element's (oriented) material box to local point c, in world space. */
+  private nearestBoxPoint(c: THREE.Vector3, out: THREE.Vector3): THREE.Vector3 {
+    const g = this.grid, b = this.sampleBox, e = 0.5 * g.h;
+    const cl = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+    return this.toWorld(cl(c.x, g.lx(b[0]) - e, g.lx(b[3]) + e), cl(c.y, g.ly(b[1]) - e, g.ly(b[4]) + e), cl(c.z, g.lz(b[2]) - e, g.lz(b[5]) + e), out);
+  }
+
+  /** Local axis through the member's thickness (the smallest extent). */
+  private thicknessAxis(): number {
+    const [hx, hy, hz] = this.shape.half;
+    return hx <= hy && hx <= hz ? 0 : hy <= hz ? 1 : 2;
+  }
+
+  /** The two in-plane extents of the member (across its thickness axis), m. */
+  private panelExtents(): [number, number] {
+    const ta = this.thicknessAxis(), half = this.shape.half;
+    const a = (ta + 1) % 3, b = (ta + 2) % 3;
+    return [2 * half[a]!, 2 * half[b]!];
+  }
+
+  /**
+   * Local axis along which the member spans: walls and columns (thickness axis horizontal) bend
+   * over their height, slabs (thickness axis vertical) over their shorter plan dimension.
+   */
+  private spanAxis(): number {
+    const ta = this.thicknessAxis(), half = this.shape.half;
+    const a = (ta + 1) % 3, b = (ta + 2) % 3;
+    const up = _v.copy(UP).applyQuaternion(this.invQ);
+    const u = [Math.abs(up.x), Math.abs(up.y), Math.abs(up.z)];
+    if (u[ta]! > 0.7) return half[a]! <= half[b]! ? a : b;
+    return u[a]! >= u[b]! ? a : b;
+  }
+
+  /**
+   * The loaded member for the P–I damage number (BlastLoad.damageAt): reinforcement ratio per
+   * face ρ = A_s / (b·d) of its RebarSpec (A_s = π d_b²/4 per bar spacing s, effective depth
+   * d = t − cover − d_b/2; a central mesh works at d = t/2 — EN 1992-1-1 notation) and the span
+   * it bends over. Unreinforced elements report ρ = 0.
+   */
+  private memberInfo(): MemberInfo {
+    const t = this.shape.thickness;
+    const r = this.spec.rebar;
+    let rho = 0;
+    if (r) {
+      const d = r.layout === 'center' ? 0.5 * t : Math.max(0.5 * t, t - r.cover - 0.5 * r.diameter);
+      rho = (Math.PI * r.diameter * r.diameter) / 4 / (r.spacing * d);
+    }
+    return { reinforcementRatio: rho, span: 2 * this.shape.half[this.spanAxis()]! };
+  }
+
+  /**
+   * Global flexural failure of a blast-loaded panel (damage ≥ 2 over most of its face, or over a
+   * region at least half a span across): the loaded region breaks along yield lines into large
+   * Voronoi slabs that go through the whole thickness, each thrown away from the charge at the
+   * rigid-plastic velocity of the impulsively loaded plate, v = i_r / (ρ t) (momentum balance,
+   * resistance neglected — an upper bound, cf. Baker et al. 1983, "Explosion Hazards and
+   * Evaluation", ch. 6 on fragments of frangible walls), shaped by the transverse velocity field
+   * of a rigid-plastic mechanism hinged at the held edges (Jones, "Structural Impact", 1989,
+   * ch. 3): slow at a support, fastest mid-span or at a free edge. `severe` holds the damage ≥ 2
+   * patches (local surface point, inward axis, thickness) of blastPatches.
+   */
+  private panelFailure(load: BlastLoad, c: THREE.Vector3, severe: number[], cellSize: number, whole: boolean, seed: number): void {
+    const t0 = performance.now();
+    const g = this.grid, conn = this.conn, F = conn.F, h = g.h;
+    this.refreshOccupancy();
+    const mask = new Uint8Array(conn.n);
+    if (whole) {
+      for (let q = 0; q < conn.n; q++) if (conn.count[q]) mask[q] = 1;
+    } else {
+      // Through the thickness under every severe patch, widened by a patch: the yield lines run
+      // just outside the loaded region.
+      const step = 0.5 * F * h, r = cellSize;
+      for (let s = 0; s < severe.length; s += 7) {
+        const px = severe[s]!, py = severe[s + 1]!, pz = severe[s + 2]!, ax = severe[s + 3]!, ay = severe[s + 4]!, az = severe[s + 5]!, t = severe[s + 6]!;
+        for (let d = 0; d <= t + step; d += step) {
+          const x = px + ax * d, y = py + ay * d, z = pz + az * d;
+          conn.markBox(g, x - r, y - r, z - r, x + r, y + r, z + r, mask);
+        }
+      }
+    }
+    const cells: number[] = [];
+    let samples = 0;
+    const min: [number, number, number] = [Infinity, Infinity, Infinity], max: [number, number, number] = [-1, -1, -1];
+    for (let q = 0; q < conn.n; q++) {
+      if (!mask[q]) continue;
+      if (!conn.count[q]) { mask[q] = 0; continue; }
+      cells.push(q);
+      samples += conn.count[q]!;
+      const I = q % conn.nx, J = Math.floor(q / conn.nx) % conn.ny, K = Math.floor(q / (conn.nx * conn.ny));
+      if (I < min[0]) min[0] = I; if (J < min[1]) min[1] = J; if (K < min[2]) min[2] = K;
+      if (I > max[0]) max[0] = I; if (J > max[1]) max[1] = J; if (K > max[2]) max[2] = K;
+    }
+    if (!cells.length) return;
+    const vol = samples * h * h * h;
+    const tk = this.shape.thickness;
+    const area = vol / Math.max(tk, h);
+    const budget = Math.max(1, Math.floor(this.ctx.physics.maxDynamicBodies * 0.85 - this.ctx.physics.dynamicCount));
+    const n = Math.max(1, Math.min(budget, Math.min(PANEL_MAX_PIECES, Math.max(2, Math.round(area / PANEL_PIECE_AREA)))));
+    const cellLen = Math.sqrt(area / n);
+    const cand = new Float64Array(cells.length * 3);
+    cells.forEach((cell, q) => {
+      const I = cell % conn.nx, J = Math.floor(cell / conn.nx) % conn.ny, K = Math.floor(cell / (conn.nx * conn.ny));
+      cand[q * 3] = g.lx((I + 0.5) * F); cand[q * 3 + 1] = g.ly((J + 0.5) * F); cand[q * 3 + 2] = g.lz((K + 0.5) * F);
+    });
+    const seeds = pickSeeds(cand, cells.length, n, null, 0.6 * cellLen, this.ctx.rng);
+    // Yield-line slabs run through the whole thickness: seeds on the mid-plane of the box, so the
+    // bisector planes cut across it and never split it into layers.
+    const ta = this.thicknessAxis();
+    if (this.shape instanceof BoxShape) for (let q = ta; q < seeds.length; q += 3) seeds[q] = 0;
+    // Soot of the fireball on the loaded face before it leaves (applyBlast adds it to the rest).
+    this.carver.sootSplat(c.x, c.y, c.z, Math.cbrt(Math.max(1e-3, load.tntKg)), 0.95, seed);
+    const barOwner = this.rebar ? this.assignBars(mask, seeds) : null;
+    const sel: Selection = {
+      box: [min[0] * F, min[1] * F, min[2] * F, max[0] * F + F - 1, max[1] * F + F - 1, max[2] * F + F - 1],
+      sdf: false,
+      cells: { mask, F, nx: conn.nx, ny: conn.ny },
+      test: () => 1,
+    };
+    const pieces = splitSelection(g, sel, seeds, 0.5 * h, 0.12 * cellLen, this.eventSeed++);
+    this.refreshOccupancy();
+    // Velocity profile of the mechanism along the span: held edges from the anchors.
+    const sa = this.spanAxis();
+    const hs = this.shape.half[sa]!;
+    let lowHeld = false, highHeld = false;
+    for (const b of this.anchors.values()) {
+      if (b.min.getComponent(sa) < -hs + 0.25 * 2 * hs) lowHeld = true;
+      if (b.max.getComponent(sa) > hs - 0.25 * 2 * hs) highHeld = true;
+    }
+    const profile = (s: number) => {
+      const u = Math.min(1, Math.max(0, (s + hs) / (2 * hs)));
+      const f = lowHeld && highHeld ? Math.sin(Math.PI * u) : lowHeld ? Math.sin(0.5 * Math.PI * u) : highHeld ? Math.sin(0.5 * Math.PI * (1 - u)) : 1;
+      return 0.3 + 0.7 * f;
+    };
+    const nl = new THREE.Vector3(), wn = new THREE.Vector3(), wp = new THREE.Vector3();
+    const rho = this.material.density;
+    let vMax = 0;
+    const made = this.spawnPieces(pieces, (p, out) => {
+      nl.set(0, 0, 0).setComponent(ta, c.getComponent(ta) >= p.seed[ta] ? 1 : -1);
+      this.toWorld(p.seed[0], p.seed[1], p.seed[2], wp);
+      this.toWorldDir(nl.x, nl.y, nl.z, wn);
+      const v = Math.min(PANEL_MAX_SPEED, load.reflectedImpulseAt(wp, wn) / (rho * tk)) * profile(p.seed[sa]);
+      vMax = Math.max(vMax, v);
+      // Away from the loaded face, fanning a little along the rays from the charge.
+      out.copy(wp).sub(load.center).normalize().multiplyScalar(0.2).sub(wn).normalize().multiplyScalar(v);
+    }, barOwner, 0.3);
+    this.afterCut();
+    this.panelReleased = true;
+    this.stats.lastReleaseMs = performance.now() - t0;
+    const wc = this.toWorld(g.lx(((min[0] + max[0] + 1) * F) / 2), g.ly(((min[1] + max[1] + 1) * F) / 2), g.lz(((min[2] + max[2] + 1) * F) / 2), new THREE.Vector3());
+    this.toWorldDir(ta === 0 ? 1 : 0, ta === 1 ? 1 : 0, ta === 2 ? 1 : 0, wn);
+    if (wn.dot(_v.copy(load.center).sub(wc)) > 0) wn.negate();
+    this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: wc, volume: vol, pieces: made, material: this.material, direction: wn.clone() });
+    this.ctx.fx.dust({ position: wc, velocity: wn.clone().multiplyScalar(Math.min(10, 0.5 * vMax)), radius: Math.max(1, Math.sqrt(area) * 0.6), amount: 5, color: this.material.dustColor });
   }
 
   private cylinderSelection(px: number, py: number, pz: number, a: THREE.Vector3, len: number, rad: number, lobe: number, seed: number): Selection {
@@ -1838,8 +2189,21 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
         away.divideScalar(dist);
         const ir = blast.load.reflectedImpulseAt(_v, _s.copy(away).negate());
         out.copy(away).multiplyScalar(Math.min(60, ir / (this.material.density * Math.max(0.05, blast.thickness))));
-      }, barOwner, 0.4);
+      }, barOwner, 0.4, blast ? MIN_PIECE_SIZE * 0.6 : RUBBLE_MIN_SIZE);
     }
+    this.afterCut();
+    this.stats.lastReleaseMs = performance.now() - t0;
+    if (totalVol > 0) {
+      const wc = this.bounds.getCenter(new THREE.Vector3());
+      this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: wc, volume: totalVol, pieces: totalPieces, material: this.material });
+    }
+    if (g.totalSolid === 0) this.fail('support-lost');
+    else if (this.dynamic) this.rebuildHull();
+  }
+
+  /** Housekeeping after material was cut out into pieces: chunks, meshes, occupancy, bars, bounds. */
+  private afterCut(): void {
+    const g = this.grid;
     for (let ci = 0; ci < g.chunkCount; ci++) if (g.state[ci] === 2 && g.solid[ci] === 0) g.compact(ci);
     this.flushDirty();
     this.refreshOccupancy();
@@ -1854,13 +2218,6 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     }
     this.sampleBox = g.solidSampleBounds() ?? [0, 0, 0, 0, 0, 0];
     if (!this.dynamic) this.updateBounds();
-    this.stats.lastReleaseMs = performance.now() - t0;
-    if (totalVol > 0) {
-      const wc = this.bounds.getCenter(new THREE.Vector3());
-      this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: wc, volume: totalVol, pieces: totalPieces, material: this.material });
-    }
-    if (g.totalSolid === 0) this.fail('support-lost');
-    else if (this.dynamic) this.rebuildHull();
   }
 
   /** Map bar segments inside the island mask to the nearest seed (piece index), −1 otherwise. */
@@ -1888,7 +2245,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
    * Turn piece grids into rigid-body elements (or chips when small / over the body budget).
    * `velocity` gives each piece's initial world velocity. Returns the number of bodies made.
    */
-  private spawnPieces(pieces: Piece[], velocity: (p: Piece, out: THREE.Vector3) => void, barOwner: Int32Array | null, spin: number): number {
+  private spawnPieces(pieces: Piece[], velocity: (p: Piece, out: THREE.Vector3) => void, barOwner: Int32Array | null, spin: number, minSize = MIN_PIECE_SIZE * 0.6): number {
     let made = 0;
     const fx = this.ctx.fx;
     const phys = this.ctx.physics;
@@ -1906,7 +2263,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       v.add(inherit);
       const wp = this.toWorld(p.seed[0], p.seed[1], p.seed[2], new THREE.Vector3());
       const overBudget = phys.dynamicCount >= phys.maxDynamicBodies * 0.9;
-      if (p.volume < CHIP_VOLUME || size < MIN_PIECE_SIZE * 0.6 || overBudget) {
+      if (p.volume < CHIP_VOLUME || size < minSize || overBudget) {
         // Bar bits inside pulverised material go with it.
         if (barOwner && this.rebar) {
           const rb = this.rebar;
@@ -1923,9 +2280,11 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
         rebar = this.rebar.split((s) => own[s] === p.seedIndex);
       }
       const w = new THREE.Vector3(this.ctx.rng.gaussian(0, spin), this.ctx.rng.gaussian(0, spin), this.ctx.rng.gaussian(0, spin)).add(inheritW);
-      this.clearColliderUnder(p.grid);
+      // A parent left without material loses its whole collider (refreshOccupancy) anyway.
+      const parentLeft = this.grid.totalSolid > 0;
+      if (parentLeft) this.clearColliderUnder(p.grid);
       const piece = new VoxelElement(this.ctx, { ...this.spec, dynamic: true, name: `${this.name}·piece` }, { parent: this, grid: p.grid, rebar, linvel: v, angvel: w, group, cell: p.seeds.length > 3 ? { seeds: p.seeds, index: p.seedIndex } : null });
-      this.clearColliderUnderHull(piece);
+      if (parentLeft) this.clearColliderUnderHull(piece);
       this.ctx.addDestructible(piece);
       this.stats.pieces++;
       made++;
@@ -1989,7 +2348,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const seeds = pickSeeds(cand, island.cells.length, n, [this.lastImpact.x, this.lastImpact.y, this.lastImpact.z], 0.5 * cellLen, this.ctx.rng);
     const barOwner = this.rebar ? this.assignBars(mask, seeds) : null;
     const pieces = splitSelection(g, sel, seeds, 0.5 * g.h, 0.25 * cellLen, this.eventSeed++);
-    const made = this.spawnPieces(pieces, (_p, out) => out.set(0, 0, 0), barOwner, 0.8);
+    const made = this.spawnPieces(pieces, (_p, out) => out.set(0, 0, 0), barOwner, 0.8, RUBBLE_MIN_SIZE);
     this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: this.bounds.getCenter(new THREE.Vector3()), volume: vol, pieces: made, material: this.material });
     this.fail('severed');
   }
@@ -2205,9 +2564,12 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     if (this.dynamic) {
       this.syncFromBody();
       if (this.body) {
+        if (this.siblingSolverUntil >= 0 && this.ctx.time.now >= this.siblingSolverUntil) this.restoreSolverGroups();
+        this.limitContactGain(dt);
         this.airDrag(dt);
-        const v = this.body.linvel();
+        const v = this.body.linvel(), w = this.body.angvel();
         this.prevLin.set(v.x, v.y, v.z);
+        this.prevAng.set(w.x, w.y, w.z);
       }
       if (this.root.position.y < -60) {
         this.dispose();
@@ -2329,4 +2691,36 @@ function blastReach(load: BlastLoad, dir: THREE.Vector3, loaded: (p: THREE.Vecto
     else hi = mid;
   }
   return hi;
+}
+
+/** Recent detonations per simulation (for the contact-gain limit's blast exemption). */
+const blastMarks = new WeakMap<SimContext, { x: number; y: number; z: number; r: number; t: number }[]>();
+
+/**
+ * True while a detonation's pushes may still be arriving at world point p: within its reach
+ * (Z = 25 m/kg^⅓, where the Kingery–Bulmash incident overpressure is down to ~3 kPa and body
+ * pushes are negligible) until its front has passed plus PUSH_GRACE (fronts outrun sound).
+ */
+function recentBlastNear(ctx: SimContext, p: THREE.Vector3, now: number): boolean {
+  for (const m of watchBlasts(ctx)) {
+    const d = Math.hypot(p.x - m.x, p.y - m.y, p.z - m.z);
+    if (d < m.r && now >= m.t - 1e-6 && now - m.t <= d / 340 + PUSH_GRACE) return true;
+  }
+  return false;
+}
+
+/** The recent-detonation list of a simulation; the first call subscribes to its 'blast' events. */
+function watchBlasts(ctx: SimContext): { x: number; y: number; z: number; r: number; t: number }[] {
+  let list = blastMarks.get(ctx);
+  if (!list) {
+    const l: { x: number; y: number; z: number; r: number; t: number }[] = [];
+    blastMarks.set(ctx, l);
+    ctx.events.on('blast', (e) => {
+      const t = e.time;
+      for (let i = l.length - 1; i >= 0; i--) if (t - l[i]!.t > 2) l.splice(i, 1);
+      l.push({ x: e.center.x, y: e.center.y, z: e.center.z, r: 25 * Math.cbrt(Math.max(1e-3, e.tntKg)), t });
+    });
+    list = l;
+  }
+  return list;
 }

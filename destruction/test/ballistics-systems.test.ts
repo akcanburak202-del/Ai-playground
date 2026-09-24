@@ -10,7 +10,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import { createTestSim, type TestSim } from './ballistics-harness.ts';
-import { ProjectileSystem } from '../src/systems/ProjectileSystem.ts';
+import { ProjectileSystem, presentedRadius } from '../src/systems/ProjectileSystem.ts';
+import { fragmentAmmo } from '../src/physics/ballistics/fragments.ts';
+import type { AmmoData } from '../src/physics/ballistics/ammo.ts';
 import { BlastSystem, type ExtendedBlastRequest } from '../src/systems/BlastSystem.ts';
 import { installBallistics } from '../src/systems/index.ts';
 import { SlabTarget, type SlabOptions } from '../src/systems/debug/SlabTarget.ts';
@@ -601,4 +603,87 @@ test('delay fuze timing is exact at normal step length (BLU-109: 15 ms after fir
   const e = byAgent(r.impacts, 'projectile')[0]!;
   const b = r.blastEvents[0]!;
   assert.ok(Math.abs(b.time - e.time - spec.fuzeDelay!) < 1e-6, `${((b.time - e.time) * 1000).toFixed(3)} ms after contact`);
+});
+
+test('the sweep passes the round\'s radius to the ray tests: calibre, stripped AP core, fragment, jet', async () => {
+  const r = await rig();
+  const seen: { name: string; radius: number | undefined }[] = [];
+  const spy = (name: string, z: number): Destructible => {
+    const d: Destructible = {
+      id: allocateDestructibleId(), kind: 'voxel', name, root: new THREE.Object3D(), bounds: new THREE.Box3(V(-1, 0, z - 0.05), V(1, 3, z + 0.05)), disposed: false,
+      raycast(_o, _d, _m, radius) {
+        seen.push({ name, radius });
+        return null;
+      },
+      probe: () => ({ segments: [], exits: true }), applyImpact() {}, applyBlast() {}, dispose() {},
+    };
+    r.ctx.addDestructible(d);
+    return d;
+  };
+  spy('front', 5);
+  r.slab({ name: 'plate', material: MATERIALS.steel_s355, thickness: 0.006, position: V(0, 1.5, 0) });
+  spy('behind', -5);
+  r.fire('m2ap', V(0, 1.5, 20), V(0, 1.5, -20));
+  r.step(0.1);
+  const a = r.ctx.ammo('m2ap') as AmmoData;
+  within(seen.find((s) => s.name === 'front')!.radius!, a.diameter / 2 - 1e-9, a.diameter / 2 + 1e-9, 'calibre radius in flight');
+  // Through the plate the jacket stripped: the hard core flies on.
+  within(seen.filter((s) => s.name === 'behind').at(-1)!.radius!, a.coreDiameter! / 2 - 1e-9, a.coreDiameter! / 2 + 1e-9, 'core radius after the plate');
+  assert.equal(presentedRadius({ ammo: r.ctx.ammo('m829a4'), mass: 5.7 }), 0.011);
+  const frag = fragmentAmmo(0.01, 1200);
+  within(presentedRadius({ ammo: frag, mass: 0.01 }), 0.5 * Math.sqrt((4 * 0.0047 * 0.01 ** (2 / 3)) / Math.PI) - 1e-9, 1, 'fragment presented radius');
+  // A jet threads the ray tests with its own (thin) radius.
+  seen.length = 0;
+  r.projectiles.jet(r.ctx.ammo('pg7vl'), 0.5, 0.085, V(0.3, 1.5, 6), V(0, 0, -1), 'jet', 3);
+  const jr = seen.find((s) => s.name === 'front')!.radius!;
+  assert.ok(jr > 0.001 && jr < 0.005, `jet radius ${jr}`);
+});
+
+test('a round larger than an existing hole strikes its rim; a smaller one slips through', async () => {
+  const r = await rig();
+  const plate = r.slab({ name: 'plate', material: MATERIALS.steel_s355, thickness: 0.006, position: V(0, 1.5, 0) });
+  const from = V(0, 1.5, 4), to = V(0, 1.5, -4);
+  // First M855 holes the 6 mm plate (hole Ø ≈ 8 mm: 1.4 × calibre on thin plate).
+  r.fire('m855', from, to);
+  r.step(0.05);
+  const first = byAgent(r.impacts, 'projectile').filter((e) => e.targetName === 'plate');
+  assert.equal(first.length, 1);
+  assert.equal(first[0]!.outcome, 'perforate');
+  assert.ok(first[0]!.tunnelRadius > 0.0029 && first[0]!.tunnelRadius < 0.0045, `hole radius ${first[0]!.tunnelRadius}`);
+  // A second 5.56 (r = 2.85 mm) down the same line goes through the hole without touching it…
+  r.fire('m855', from, to);
+  r.step(0.05);
+  assert.equal(byAgent(r.impacts, 'projectile').filter((e) => e.targetName === 'plate').length, 1, 'no event for the round that threads the hole');
+  // …a .50 (r = 6.5 mm) cannot: it strikes the rim, and the plate takes the hit.
+  r.fire('m2ap', from, to);
+  r.step(0.05);
+  const hits = byAgent(r.impacts, 'projectile').filter((e) => e.targetName === 'plate');
+  assert.equal(hits.length, 2, 'the larger round hit material again');
+  assert.equal(hits[1]!.ammo.id, 'm2ap');
+  assert.ok(hits[1]!.depth > 0.004, 'it met the rim of the hole, not a sliver');
+  assert.equal(plate.log.filter((l) => l.kind === 'impact').length, 2);
+});
+
+test('HE-OR on thick armour breaks up and fires on the face; on thin plate it punches through and fires behind', async () => {
+  const r = await rig();
+  const armour = r.slab({ name: 'armour', material: MATERIALS.rha, thickness: 0.1, position: V(0, 1.5, 0) });
+  r.fire('m908', V(0, 1.5, 30), V(0, 1.5, -5));
+  r.step(0.1);
+  const e = byAgent(r.impacts, 'projectile').find((x) => x.targetName === 'armour')!;
+  assert.equal(e.outcome, 'shatter');
+  const mv = r.ctx.ammo('m908').mass * e.speed;
+  within(e.momentum.length(), 0.99 * mv, 1.001 * mv, 'whole round momentum into the plate');
+  assert.equal(r.blastEvents.length, 1);
+  const b = r.blastEvents[0]!;
+  // In the dent on the face (face at z = 0.05), as a contact charge on the plate.
+  within(b.center.z, 0.05 - 0.03, 0.05 + 1e-6, 'blast centre z');
+  assert.equal(b.contactTargetId, armour.id);
+
+  const r2 = await rig();
+  r2.slab({ name: 'thin', material: MATERIALS.steel_s355, thickness: 0.012, position: V(0, 1.5, 0) });
+  r2.fire('m908', V(0, 1.5, 30), V(0, 1.5, -5));
+  r2.step(0.1);
+  assert.equal(byAgent(r2.impacts, 'projectile').find((x) => x.targetName === 'thin')!.outcome, 'perforate');
+  assert.equal(r2.blastEvents.length, 1);
+  assert.ok(r2.blastEvents[0]!.center.z < -0.3, `delay fuze fired behind the plate (${r2.blastEvents[0]!.center.z.toFixed(2)})`);
 });

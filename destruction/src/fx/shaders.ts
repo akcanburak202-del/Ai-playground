@@ -4,8 +4,11 @@ import { MOTION_GLSL } from './motion.ts';
 
 /**
  * Particle shaders. All layers share the analytic motion (motion.ts) and the atmosphere block
- * (sun, sky fill, haze, soft depth, sun shadow). Output is premultiplied: smoke is alpha-blended,
- * fire and sparks write alpha 0 so the same blend state makes them purely additive. Under the full
+ * (sun, sky fill, haze, soft depth, sun shadow). Output is premultiplied: smoke (including the
+ * incandescent fireball) and flames are alpha-blended ('over': an optically thick emitter shows the
+ * gas in front, so overlapping flames saturate at their own radiance instead of adding up to
+ * white); sparks and tracers write alpha 0 so the same blend state makes them purely additive
+ * (sub-pixel streaks that rarely overlap). Under the full
  * Pipeline they render linear HDR into the composer target (the tone-mapping includes compile to
  * nothing there); under BasicPipeline they draw straight to the canvas and tone-map themselves.
  */
@@ -108,9 +111,16 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         // size of the camera (the viewer standing in a muzzle or dust cloud sees into it, not a wall).
         float nearFade = clamp((-mv.z - 0.2) / max(1.2 * size, 0.3), 0.0, 1.0);
         vColor = vec4(a4.rgb * mix(a5.w, 1.0, smoothstep(0.0, 0.75, x)), tau0 * grow * grow * fadeIn * fadeOut * nearFade);
-        // Incandescent puffs cool into soot within the first third of their life (radiative and
-        // entrainment cooling of the detonation products).
-        vHeat = a5.z > 0.0 ? a5.z * mix(1.0, 0.3, smoothstep(0.0, 0.45, x)) : 0.0;
+        // Temperature history of the detonation products (fireball puffs), on the puff's cooling
+        // time t_c (hot puffs carry τ_growth = 0.3 t_c; t_c ≈ 0.6–1.35 t_F from the rim to the core of
+        // the ball, t_F ∝ W^⅓ — cube-root scaling, Baker et al. 1983; see FxSystem.onBlast): a
+        // white-hot flash that radiates and expands away (e-folding 0.05 t_c, a few ms·kg^−⅓ in
+        // high-speed footage), then the afterburn of the fuel-rich products mixing with air holds
+        // the gas near 0.76 T₀ (≈ 1600–1800 K, the orange of daylight footage and of pyrometry of
+        // TNT fireballs), then entrainment cools it into soot. Visible radiance falls ≈ 10× per
+        // −150 K there (Wien), so a 10–15 % drop in T is enough to put a puff out.
+        float uF = age / max(a3.z / 0.3, 1e-3);
+        vHeat = a5.z > 0.0 ? a5.z * (0.76 + 0.24 * exp(-uF / 0.05)) * (1.0 - 0.4 * smoothstep(0.5, 1.4, uF)) : 0.0;
         vViewDepth = -mv.z;
         vSoft = clamp(size * 0.3, 0.05, 1.5);
         vRight = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
@@ -182,7 +192,11 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         float dark = 1.0 - smoothstep(0.03, 0.12, dot(vColor.rgb, vec3(0.2126, 0.7152, 0.0722)));
         vec3 albedo = mix(vColor.rgb, 1.0 - s2 * s2, 0.8 * dark * clamp(1.0 - a, 0.0, 1.0));
         vec3 lit = albedo * (sun + amb);
-        vec3 emis = vHeat > 0.0 ? blackbody(vHeat) * glow(vHeat) * smoothstep(0.1, 0.8, dens) : vec3(0.0);
+        // Emission of an optically thick puff: black-body radiance at the local gas temperature,
+        // hottest in the thick heart of each lobe and cooler at its rim (the atlas thickness), so
+        // the ball reads as rolling orange cells with darker seams rather than one flat disc.
+        float Tpix = vHeat * (0.88 + 0.16 * tx.b);
+        vec3 emis = vHeat > 0.0 ? blackbody(Tpix) * glow(Tpix) * smoothstep(0.1, 0.8, dens) : vec3(0.0);
         vec3 col = mix(vHazeC, lit, vHazeT) * a + emis * a * vHazeT;
         gl_FragColor = vec4(col, a);
           #include <tonemapping_fragment>
@@ -192,7 +206,7 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
   });
 }
 
-/** Additive flames, fireball cores, muzzle flashes and rocket exhaust. */
+/** Flames: muzzle flashes, backblast, incendiary flashes and rocket exhaust (premultiplied 'over'). */
 export function createFireMaterial(atmo: Atmosphere, atlas: THREE.Texture): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     name: 'fx-fire',
@@ -240,7 +254,8 @@ export function createFireMaterial(atmo: Atmosphere, atlas: THREE.Texture): THRE
         a *= softFade(vViewDepth, vSoft);
         float T = vHeat * (0.6 + 0.4 * tx.r);
         vec3 col = blackbody(T) * glow(T) * vColor.rgb * (0.35 + 0.65 * tx.r);
-        gl_FragColor = vec4(col * a * vHazeT, 0.0);
+        // 'Over', not additive: where flames overlap the pixel shows the front flame's radiance.
+        gl_FragColor = vec4(col * a * vHazeT, a);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
       }`,

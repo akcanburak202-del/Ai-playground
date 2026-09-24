@@ -241,6 +241,26 @@ test('laminated pane: holds together, sags with damage, tears out when heavily b
   p.dispose();
 });
 
+test('projectile radius: a round wider than a bullet hole meets its rim, a thin ray passes', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'laminated', { width: 1.2, height: 1.6, position: [0, 1.2, 0] });
+  const from = new THREE.Vector3(0.2, 1.3, 15);
+  const at = new THREE.Vector3(0.2, 1.3, 0);
+  const dir = at.clone().sub(from).normalize();
+  assert.ok(shoot(ctx, p, 'm855', from, at));
+  ctx.step(1 / 60);
+  // The 5.56 mm hole (≈ 2–3 mm radius): an ideal ray through its centre passes...
+  assert.equal(p.raycast(from, dir, 100), null, 'thin ray passes the hole');
+  assert.equal(p.raycast(from, dir, 100, 0), null);
+  // ...a 60 mm tank round (radius 30 mm) aimed at the same point strikes the glass around it.
+  const hit = p.raycast(from, dir, 100, 0.03);
+  assert.ok(hit, 'a round wider than the hole hits its rim');
+  assert.ok(Math.abs(hit.point.z) < 0.05 && Math.abs(hit.point.x - 0.2) < 1e-6);
+  // Off the hole, the radius changes nothing.
+  assert.ok(p.raycast(new THREE.Vector3(-0.3, 1.0, 15), dir, 100, 0));
+  p.dispose();
+});
+
 test('P–I hookup: panes fail at the distance the pressure–impulse curve says, tempered ≈ 4× stronger', async () => {
   const ctx = await makeCtx();
   const mat = MATERIALS.glass_annealed;

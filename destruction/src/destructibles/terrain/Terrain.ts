@@ -267,7 +267,11 @@ export class Terrain implements Destructible {
 
   // ─── Destructible ────────────────────────────────────────────────────────────────────────
 
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null {
+  /**
+   * `_radius` (the projectile radius) changes nothing here: a height field has no holes a round
+   * could slip through — a crater is a dish, never a gap.
+   */
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, _radius?: number): RayHit | null {
     const f = this.field;
     // Most bullet segments are well above the ground: reject them in O(1).
     const endY = origin.y + dir.y * maxDist;

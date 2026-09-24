@@ -10,7 +10,6 @@ import { Menu } from './menu.ts';
 import { ensureFonts, ensureStyle } from './theme.ts';
 import { HitGroups, ammoLine, blastRow, followThrough, groupLine, impactRow, weaponSpecs, weaponSummary, type ImpactRow } from './telemetry.ts';
 import { buildSlots, slotOf, weaponForKey, type Slot } from '../player/slots.ts';
-import { closestApproach } from '../audio/acoustics.ts';
 
 export interface HudOptions {
   scenes: SceneDef[];
@@ -46,7 +45,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
 
 let reducedMq: MediaQueryList | null = null;
 const _fwd = new THREE.Vector3();
-const _ca = { s: 0, distance: 0 };
+const _mark = new THREE.Vector3();
 
 const REDUCED_MOTION = (): boolean => (reducedMq ??= matchMedia('(prefers-reduced-motion: reduce)')).matches;
 
@@ -149,6 +148,7 @@ export class Hud implements HudHooks {
   private blastBox!: HTMLDivElement;
   private blastVals: HTMLSpanElement[] = [];
   private blastNote!: HTMLDivElement;
+  private blastGas!: HTMLDivElement;
   private blastTitle!: HTMLSpanElement;
   // Weapon card and list (docked bottom-left)
   private dock!: HTMLDivElement;
@@ -188,16 +188,22 @@ export class Hud implements HudHooks {
   private loadingText!: HTMLSpanElement;
   private frameEl!: HTMLDivElement;
   private help!: HTMLDivElement;
+  /** Markers on the placed charges, by charge id */
+  private marksEl!: HTMLDivElement;
+  private readonly marks = new Map<number, { root: HTMLDivElement; num: HTMLElement; tf: string }>();
 
   private impacts: ImpactRow[] = [];
+  /** Rounds the weapons fire: an impact of any other ammunition is a sub-munition (a follow-through charge) */
+  private readonly firedAmmo: Set<string>;
   private impactsDirty = false;
   private fragmentHits = 0;
-  private lastBlast: { e: BlastEvent; wall: number } | null = null;
+  private lastBlast: { e: BlastEvent; wall: number; at: THREE.Vector3 } | null = null;
   private blastDirty = false;
   private lastWeapon: WeaponSpec | null = null;
   private lastAmmo: AmmoSpec | null = null;
   private lastFired = -1;
   private lastCharges = -1;
+  private chargesTouch = false;
   private coolMax = 0;
   private fps = 60;
   private statTimer = 0;
@@ -242,6 +248,7 @@ export class Hud implements HudHooks {
     this.bridge = bridgeOf(sim);
     this.bridge.weapons ??= weapons;
     this.slots = buildSlots(weapons.weapons);
+    this.firedAmmo = new Set(weapons.weapons.flatMap((w) => w.ammo));
     ensureStyle();
     ensureFonts();
     this.root = el('div', 'dx-root dx-hud');
@@ -266,7 +273,9 @@ export class Hud implements HudHooks {
     this.unsub.push(
       ev.on('impact', (e) => this.onImpact(e)),
       ev.on('blast', (e) => {
-        this.lastBlast = { e, wall: this.clock };
+        // The blast as felt where the viewer stands when it goes off (not wherever the camera
+        // is when a late fragment hit redraws the panel, nor on a bullet camera riding the round).
+        this.lastBlast = { e, wall: this.clock, at: new THREE.Vector3().copy(this.bridge.player?.viewer ?? sim.ctx.camera.position) };
         this.lastActivity = this.clock;
         this.fragmentHits = 0;
         this.blastDirty = true;
@@ -417,7 +426,8 @@ export class Hud implements HudHooks {
     el('span', 'dx-sep dx-hide-s', undefined, top);
     this.sceneName = el('span', 'dx-scene dx-hide-s', '', top);
     el('span', 'dx-grow', undefined, top);
-    this.slowTag = el('span', 'dx-slowmo-tag', '', top);
+    // Phones: the amber time scale and the frame corners carry slow motion (no room for the tag).
+    this.slowTag = el('span', 'dx-slowmo-tag dx-hide-s', '', top);
     const stat = (label: string, cls = '') => {
       const s = el('span', `dx-stat ${cls}`, undefined, top);
       el('span', 'dx-lbl', label, s);
@@ -491,14 +501,27 @@ export class Hud implements HudHooks {
 
     this.blastBox = el('div', 'dx-blast', undefined, p);
     const bh = el('div', 'dx-tele-head', undefined, this.blastBox);
-    el('span', 'dx-title', 'Patlama · kamerada', bh);
+    el('span', 'dx-title', 'Patlama · konumunda', bh);
     this.blastTitle = el('span', 'dx-lbl', '', bh);
     const grid = el('div', 'dx-blast-grid', undefined, this.blastBox);
-    for (const l of ['TNT-e', 'Mesafe', 'Aşırı basınç', 'Varış', 'Ses düzeyi']) {
+    // Incident (side-on) peak overpressure at the viewer, and the normally reflected peak a wall
+    // facing the charge at that range would take (Kingery–Bulmash); phones show the first three.
+    const cells: [string, string][] = [
+      ['TNT-e', 'TNT eşdeğeri kütle'],
+      ['Mesafe', 'Patlama merkezine uzaklık'],
+      ['Gelen basınç', 'Gelen (yan) tepe aşırı basınç: bulunduğun yerde, açık havada'],
+      ['Yansıyan basınç', 'Normal yansıyan tepe aşırı basınç: bu mesafede patlamaya dönük bir duvarın gördüğü'],
+      ['Varış', 'Şok cephesinin varış süresi'],
+      ['Ses düzeyi', 'Gelen tepe basıncın ses basınç düzeyi'],
+      ['Gaz basıncı', 'Kapalı hacimde patlama: yarı-statik gaz basıncı'],
+    ];
+    for (const [l, tip] of cells) {
       const c = el('div', undefined, undefined, grid);
+      c.title = tip;
       el('span', 'dx-lbl', l, c);
       this.blastVals.push(el('span', 'dx-v', '', c));
     }
+    this.blastGas = this.blastVals[6]!.parentElement as HTMLDivElement;
     this.blastNote = el('div', 'dx-note', '', this.blastBox);
     this.blastBox.style.display = 'none';
   }
@@ -600,6 +623,7 @@ export class Hud implements HudHooks {
   }
 
   private buildOverlays(): void {
+    this.marksEl = el('div', 'dx-marks', undefined, this.root);
     this.frameEl = el('div', 'dx-frame', undefined, this.root);
     for (let i = 0; i < 4; i++) el('i', undefined, undefined, this.frameEl);
     this.keysEl = el('div', 'dx-keys', undefined, this.root);
@@ -732,17 +756,20 @@ export class Hud implements HudHooks {
 
   private onImpact(e: ImpactEvent): void {
     this.lastActivity = this.clock;
+    // Casing and behind-armour fragments are counted under the blast, never as rows: a shell's
+    // hundreds of fragment hits must not push the round's own result out of the telemetry.
     if (e.agent === 'fragment') {
       this.fragmentHits++;
       this.blastDirty = true;
       return;
     }
     // Rows are the latest distinct results: a burst on concrete is one row (×60) with the newest
-    // numbers. A round that has already gone through something lands behind the target (the
-    // ground beyond a holed wall): its row goes in under the top one and it does not count as a
-    // hit on a spot, so the top row, the description and the spot readout stay with what the
-    // viewer is shooting at.
-    const secondary = followThrough(e) ?? this.flewThrough(e);
+    // numbers. A round (or jet) that has already gone through something lands behind the target
+    // (the ground beyond a holed wall), and a charge a round carries in behind its jet (a
+    // sub-munition no weapon fires) is not the viewer's shot: those rows go in under the top one
+    // and do not count as hits on a spot, so the top row, the description and the spot readout
+    // stay with what the viewer is shooting at.
+    const secondary = followThrough(e) || !this.firedAmmo.has(e.ammo.id);
     if (!secondary) {
       // A dispersed weapon's burst is still one spot: its 95 % group radius (2.45 σ) at this range.
       const sigma = this.weapons.current.dispersionMOA * MOA;
@@ -757,32 +784,17 @@ export class Hud implements HudHooks {
       row.count = this.impacts[i]!.count + 1;
       this.impacts.splice(i, 1);
     }
-    this.impacts.splice(secondary && this.impacts.length ? 1 : 0, 0, row);
+    // A secondary row never takes the top: under the newest primary row, or first when only
+    // secondary rows are left.
+    const primary = this.impacts.findIndex((r) => !r.secondary);
+    this.impacts.splice(secondary && primary >= 0 ? primary + 1 : 0, 0, row);
     if (this.impacts.length > ROWS) this.impacts.length = ROWS;
     this.impactsDirty = true;
     const now = performance.now();
-    if (e.agent === 'projectile' && !secondary && now - this.lastHitFlash > 60) {
+    if (!secondary && now - this.lastHitFlash > 60) {
       this.lastHitFlash = now;
       this.reticle.flashHit();
     }
-  }
-
-  /**
-   * Fallback when the resolver does not report `priorPerforations`: did the round behind this
-   * impact already go through something? The projectile is still in flight when its impact is
-   * reported, with its perforation count not yet raised for this one, and the point lies on the
-   * segment it flew this step.
-   */
-  private flewThrough(e: ImpactEvent): boolean {
-    if (e.agent !== 'projectile') return false;
-    for (const p of this.sim.ctx.projectiles.active) {
-      if (p.perforations === 0 || p.ammo !== e.ammo) continue;
-      if (e.projectileId !== undefined && p.id !== e.projectileId) continue;
-      const a = p.previous, b = p.position, q = e.point;
-      closestApproach(a.x, a.y, a.z, b.x, b.y, b.z, q.x, q.y, q.z, _ca);
-      if (_ca.distance < 0.25) return true;
-    }
-    return false;
   }
 
   private onScene(): void {
@@ -848,6 +860,7 @@ export class Hud implements HudHooks {
       this.tele.classList.toggle('dx-idle', idle);
     }
     this.updateReticle();
+    this.updateMarks();
     this.updateOverlays(nowMs);
     this.frameMs += (performance.now() - t0 - this.frameMs) * 0.05;
   }
@@ -874,7 +887,7 @@ export class Hud implements HudHooks {
       this.lastAmmo = a;
       this.renderCard(w, a, weaponChanged);
     }
-    const stripOn = !this.menu.visible && (nowMs < this.stripUntil || this.detailOn);
+    const stripOn = !this.menu.visible && !this.bridge.player?.bulletCam && (nowMs < this.stripUntil || this.detailOn);
     if (stripOn !== this.strip.classList.contains('dx-show')) this.strip.classList.toggle('dx-show', stripOn);
     const fired = this.weapons.roundsFired;
     if (fired !== this.lastFired) {
@@ -890,15 +903,19 @@ export class Hud implements HudHooks {
     setText(this.coolLbl, cd > 0.05 ? `${num(cd, 1)} s` : 'Hazır');
     this.coolLbl.classList.toggle('dx-live', cd <= 0.05);
     const n = this.weapons.charges.length;
-    if (n !== this.lastCharges) {
+    const touch = !!this.bridge.player?.touch;
+    if (n !== this.lastCharges || touch !== this.chargesTouch) {
       this.lastCharges = n;
+      this.chargesTouch = touch;
       const placed = w.delivery === 'placed' || n > 0;
       this.chargesEl.style.display = placed ? '' : 'none';
       this.chargesEl.replaceChildren();
       if (placed) {
+        // The controls this viewer has: keys and mouse, or the touch buttons (Ateş places, Patlat fires all).
         this.chargesEl.append('Yerleştirilen şarj ');
         el('b', undefined, String(n), this.chargesEl);
-        this.chargesEl.append(n > 0 ? ' · X: hepsi birden · B: sırayla' : ' · sol tık: yüzeye yerleştir');
+        if (touch) this.chargesEl.append(n > 0 ? ' · Patlat: hepsi birden' : ' · Ateş: yüzeye yerleştir');
+        else this.chargesEl.append(n > 0 ? ' · X: hepsi birden · B: sırayla' : ' · sol tık: yüzeye yerleştir');
       }
       this.hintsKey = '';
       this.layoutDirty = true;
@@ -970,7 +987,7 @@ export class Hud implements HudHooks {
     this.impactsDirty = false;
     const list = this.impacts;
     const top = list[0];
-    show(this.emptyEl, !top);
+    show(this.emptyEl, !top && !this.lastBlast);
     show(this.latest, !!top);
     if (top) {
       // Arrival flash on the newest result (Web Animations: no forced reflow to restart it).
@@ -1005,6 +1022,7 @@ export class Hud implements HudHooks {
     }
     show(this.olderBox, shown > 0);
     this.tele.classList.toggle('dx-none', !top && !this.lastBlast);
+    this.blastBox.classList.toggle('dx-solo', !top);
     this.renderGroup();
   }
 
@@ -1014,7 +1032,10 @@ export class Hud implements HudHooks {
    * hit) to right (latest), and the member's back face as a dashed rule once a round went through.
    */
   private renderGroup(): void {
-    const g = this.groups.current;
+    // Under the newest result only a spot on the same target: a rocket on the next wall after a
+    // burst on a plate must not read as that plate's cavity.
+    const newest = this.impacts[0];
+    const g = newest && this.groups.current?.spot === newest.spot ? this.groups.current : null;
     const line = groupLine(g);
     this.groupEl.style.display = line ? '' : 'none';
     if (!line || !g) return;
@@ -1046,10 +1067,13 @@ export class Hud implements HudHooks {
     const b = this.lastBlast;
     this.blastBox.style.display = b ? '' : 'none';
     this.tele.classList.toggle('dx-none', !b && !this.impacts.length);
+    show(this.emptyEl, !b && !this.impacts.length);
+    this.blastBox.classList.toggle('dx-solo', !this.impacts.length);
     if (!b) return;
-    const row = blastRow(b.e, this.sim.ctx.camera.position);
-    const vals = [row.tnt, row.distance, row.overpressure, row.arrival, row.spl];
-    for (let i = 0; i < 5; i++) setText(this.blastVals[i]!, vals[i]!);
+    const row = blastRow(b.e, b.at);
+    const vals = [row.tnt, row.distance, row.incident, row.reflected, row.arrival, row.spl, row.gas];
+    for (let i = 0; i < vals.length; i++) setText(this.blastVals[i]!, vals[i]!);
+    show(this.blastGas, !!row.gas);
     const frag = this.fragmentHits > 0 ? ` · ${this.fragmentHits} parça isabeti` : '';
     setText(this.blastNote, row.note + frag);
     this.blastNote.classList.toggle('dx-warn', row.warn);
@@ -1091,6 +1115,51 @@ export class Hud implements HudHooks {
     if (this.reticle.el.style.transform !== tr) this.reticle.el.style.transform = tr;
   }
 
+  /**
+   * A marker on every placed charge, numbered in the order the detonator fires them (B), so the
+   * viewer can see what is set and where. World → screen through the camera; with a render-only
+   * recoil kick the picture moves by the same offset as the reticle.
+   */
+  private updateMarks(): void {
+    const charges = this.weapons.charges;
+    if (!charges.length && !this.marks.size) return;
+    const cam = this.sim.ctx.camera;
+    const p = this.bridge.player;
+    const pxPerRad = this.canvasH / 2 / Math.tan((cam.fov * Math.PI) / 360);
+    const kx = p && !this.scoped ? p.kick.yaw * pxPerRad : 0;
+    const ky = p && !this.scoped ? p.kick.pitch * pxPerRad : 0;
+    const live = new Set<number>();
+    charges.forEach((c, i) => {
+      live.add(c.id);
+      let m = this.marks.get(c.id);
+      if (!m) {
+        const root = el('div', 'dx-mark', undefined, this.marksEl);
+        root.title = c.label;
+        el('i', undefined, undefined, root);
+        m = { root, num: el('b', undefined, '', root), tf: '' };
+        this.marks.set(c.id, m);
+      }
+      setText(m.num, String(i + 1));
+      _mark.copy(c.position).project(cam);
+      const on = _mark.z > -1 && _mark.z < 1 && Math.abs(_mark.x) < 1.2 && Math.abs(_mark.y) < 1.2;
+      show(m.root, on);
+      if (!on) return;
+      const x = ((_mark.x + 1) / 2) * this.vw + kx;
+      const y = ((1 - _mark.y) / 2) * this.vh + ky;
+      const tf = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+      if (tf !== m.tf) {
+        m.tf = tf;
+        m.root.style.transform = tf;
+      }
+      m.root.classList.toggle('dx-far', c.position.distanceTo(cam.position) > 30);
+    });
+    for (const [id, m] of this.marks) {
+      if (live.has(id)) continue;
+      m.root.remove();
+      this.marks.delete(id);
+    }
+  }
+
   private updateOverlays(nowMs: number): void {
     const p = this.bridge.player;
     const bc = p?.bulletCam ?? null;
@@ -1105,6 +1174,8 @@ export class Hud implements HudHooks {
       setText(this.bannerAmmo, '');
       setText(this.bannerNum, '');
     } else this.banner.style.display = 'none';
+    // Phones: the banner takes the weapon card's place along the top while it shows.
+    this.root.classList.toggle('dx-banner-on', !!bc || !!p?.bulletCamArmed);
     const showHint = !!p && !p.locked && !p.touch && !this.menu.visible && this.hudVisible && !this.scoped && !bc;
     this.lockHint.style.display = showHint ? '' : 'none';
     if (showHint) setText(this.lockHint, upperTr(p!.lockUnavailable ? 'Sağ tuşla sürükle: bakış · sol tık: ateş' : 'Tıkla · fare kilidi'));

@@ -29,7 +29,8 @@ export interface SceneLook {
   /**
    * Local cube-map reflection probes for this scene's glass (default on). The glass module
    * budgets them — one cube face per rendered frame, recaptured after a debounce once a blast or
-   * a collapse has settled (glass/probes.ts) — so every scene can afford them.
+   * a collapse has settled, shader programs compiled ahead of a capture instead of inside it
+   * (glass/probes.ts) — so every scene can afford them, the glazed tower and pavilion included.
    */
   glassProbes?: boolean;
 }
@@ -38,15 +39,23 @@ export interface SceneLook {
 export interface LookablePipeline {
   skyParams?: SkyParams;
   exposureBias?: number;
+  /** Render quality 0 | 1 | 2 (0: phones and small screens) */
+  quality?: number;
 }
+
+/** Cube face size of glass probes above quality 0 (the glass module's default), px */
+const PROBE_RESOLUTION = ReflectionProbes.resolution;
+/** At quality 0: a quarter of the fill per face, a little softer mirror image (glass/probes.ts) */
+const PROBE_RESOLUTION_LOW = 128;
 
 const DEFAULT_SKY: SkyParams = { turbidity: 2.6, rayleigh: 2.4, mieCoefficient: 0.0035, mieDirectionalG: 0.8 };
 
-/** Before `sim.loadScene(def)`: sky constants, exposure and glass probes. */
+/** Before `sim.loadScene(def)`: sky constants, exposure and glass probes (switch and size). */
 export function applyLookBeforeLoad(pipeline: LookablePipeline, look: SceneLook | undefined): void {
   if (pipeline.skyParams) Object.assign(pipeline.skyParams, DEFAULT_SKY, look?.sky ?? {});
   if (pipeline.exposureBias !== undefined) pipeline.exposureBias = look?.exposure ?? 1;
   ReflectionProbes.enabled = look?.glassProbes ?? true;
+  ReflectionProbes.resolution = pipeline.quality === 0 ? PROBE_RESOLUTION_LOW : PROBE_RESOLUTION;
 }
 
 /** After `sim.loadScene(def)`: lens and air. */

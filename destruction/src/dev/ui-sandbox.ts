@@ -315,8 +315,8 @@ class MockWeapons implements WeaponControllerApi, System {
   }
 }
 
-function emitBlast(ctx: SimContext, center: THREE.Vector3, tntKg: number, kind: BlastKind, ammo?: AmmoSpec): void {
-  ctx.events.emit('blast', { center: center.clone(), tntKg, kind, time: ctx.time.now, fireballRadius: 1.75 * Math.cbrt(tntKg), normal: new THREE.Vector3(0, 1, 0), source: ammo, label: ammo?.name });
+function emitBlast(ctx: SimContext, center: THREE.Vector3, tntKg: number, kind: BlastKind, ammo?: AmmoSpec, gasPressure?: number): void {
+  ctx.events.emit('blast', { center: center.clone(), tntKg, kind, time: ctx.time.now, fireballRadius: 1.75 * Math.cbrt(tntKg), normal: new THREE.Vector3(0, 1, 0), source: ammo, label: ammo?.name, gasPressure });
 }
 
 /**
@@ -456,8 +456,9 @@ const api = {
       floor += 0.0035 + 0.00008 * i;
     }
   },
-  blast(at: number[], tntKg: number, kind: BlastKind = 'he', ammo = 'pg7vl') {
-    emitBlast(ctx, v3(at), tntKg, kind, ctx.ammo(ammo));
+  /** Mock blast; `gasPressure` (Pa) stands for a confined detonation's quasi-static gas load. */
+  blast(at: number[], tntKg: number, kind: BlastKind = 'he', ammo = 'pg7vl', gasPressure?: number) {
+    emitBlast(ctx, v3(at), tntKg, kind, ctx.ammo(ammo), gasPressure);
   },
   /** Hold the trigger for `seconds` of sim time (advancing the simulation). */
   fire(seconds: number) {

@@ -83,6 +83,30 @@ export class CrackRaster {
   }
 
   /**
+   * Smallest channel value over the texels whose centres lie within radius r (m) of (x, y), inside
+   * the image (1 when none does). Early out once a texel at or below `stop` is found.
+   */
+  minWithin(x: number, y: number, r: number, channel: 0 | 1 | 2 | 3, stop = 0): number {
+    const ci = this.fx(x), cj = this.fy(y);
+    const ri = r / this.sx, rj = r / this.sy;
+    const s = Math.round(stop * 255);
+    let m = 255;
+    for (let j = Math.max(0, Math.ceil(cj - rj)); j <= Math.min(this.h - 1, Math.floor(cj + rj)); j++) {
+      const dy = (j - cj) / rj;
+      // Half-width of the disc on this row, in texels.
+      const hw = ri * Math.sqrt(Math.max(0, 1 - dy * dy));
+      for (let i = Math.max(0, Math.ceil(ci - hw)); i <= Math.min(this.w - 1, Math.floor(ci + hw)); i++) {
+        const v = this.data[4 * (j * this.w + i) + channel]!;
+        if (v < m) {
+          m = v;
+          if (m <= s) return m / 255;
+        }
+      }
+    }
+    return m / 255;
+  }
+
+  /**
    * Visit the texels within `r` px of the segment (x0,y0)→(x1,y1) (pixel coordinates), walking the
    * major axis so a long diagonal touches ~length × (2r + 1) texels, not its whole bounding box.
    * `fn(k, dist)` gets the texel index and its distance to the segment in pixels.

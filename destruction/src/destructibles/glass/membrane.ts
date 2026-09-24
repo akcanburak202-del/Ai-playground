@@ -31,8 +31,17 @@ const ALPHA_STRETCH = 2e-6;
 /** Bending (skip-one distance) compliance of intact and fully cracked glass, m/N. */
 const ALPHA_BEND_INTACT = 1e-8;
 const ALPHA_BEND_CRACKED = 4e-4;
-/** Substep length, s (≈ 1/600 s). */
-const SUBSTEP = 1 / 600;
+/** Substep length, s (≈ 1/600 s): the in-frame sheet, whose bulge under fire the player studies. */
+export const SUBSTEP = 1 / 600;
+/**
+ * Substep of a sheet torn out of its frame (falling, folding, lying), s. With small-step XPBD the
+ * substep sets how closely the stiff stretch links are met, not stability (Macklin et al. 2019):
+ * half the substeps let a falling sheet stretch a little more, which nobody can see, for half the
+ * cost — four such sheets were most of the glass CPU in a pavilion collapse.
+ */
+export const SUBSTEP_RELEASED = 1 / 300;
+/** Substep when the scene's glass budget for the step is spent (several sheets at once), s. */
+export const SUBSTEP_COARSE = 1 / 200;
 /** Air and interlayer damping rate, 1/s */
 const DAMPING = 1.2;
 /** Strain beyond which the interlayer yields (rest length follows), and the rate it follows at. */
@@ -49,6 +58,12 @@ const MAX_SPEED = 120;
  */
 const SLEEP_WINDOW = 0.5;
 const SLEEP_DRIFT = 0.0005;
+/**
+ * The same for a torn-out sheet: once down, the crumpled sheet keeps creeping by a few mm/s for
+ * seconds (position-level floor contact against stiff links, plastic updates) where a real one
+ * stops within a second; a mean drift under 4 mm per window (≈ 1 cm/s at the fastest) is rest.
+ */
+const SLEEP_DRIFT_RELEASED = 0.004;
 
 export class Membrane {
   readonly nx: number;
@@ -266,9 +281,10 @@ export class Membrane {
     this.snap.set(this.x);
   }
 
-  step(dt: number): void {
+  /** Advance by dt in substeps of at most `substep` s (see SUBSTEP). */
+  step(dt: number, substep = SUBSTEP): void {
     if (!this.awake || !(dt > 0)) return;
-    const subs = Math.max(1, Math.ceil(dt / SUBSTEP));
+    const subs = Math.max(1, Math.ceil(dt / substep - 1e-9));
     const h = dt / subs;
     const { x, p, v, w } = this;
     const gx = this.gravity[0]!, gy = this.gravity[1]!, gz = this.gravity[2]!;
@@ -370,11 +386,12 @@ export class Membrane {
       let drift = 0;
       for (let k = 0; k < this.n; k++) {
         const o = 3 * k;
-        drift += Math.hypot(x[o]! - this.snap[o]!, x[o + 1]! - this.snap[o + 1]!, x[o + 2]! - this.snap[o + 2]!);
+        const dx = x[o]! - this.snap[o]!, dy = x[o + 1]! - this.snap[o + 1]!, dz = x[o + 2]! - this.snap[o + 2]!;
+        drift += Math.sqrt(dx * dx + dy * dy + dz * dz);
       }
       this.window = 0;
       this.snap.set(x);
-      if (drift / this.n < SLEEP_DRIFT) this.sleep();
+      if (drift / this.n < (this.released ? SLEEP_DRIFT_RELEASED : SLEEP_DRIFT)) this.sleep();
     }
   }
 
@@ -394,7 +411,9 @@ export class Membrane {
     for (let c = 0; c < this.ci.length; c++) {
       const a = this.ci[c]!, b = this.cj[c]!;
       const oa = 3 * a, ob = 3 * b;
-      const L = Math.hypot(x[oa]! - x[ob]!, x[oa + 1]! - x[ob + 1]!, x[oa + 2]! - x[ob + 2]!);
+      // (Math.hypot is several times slower than the square root in V8; this runs for every link.)
+      const dx = x[oa]! - x[ob]!, dy = x[oa + 1]! - x[ob + 1]!, dz = x[oa + 2]! - x[ob + 2]!;
+      const L = Math.sqrt(dx * dx + dy * dy + dz * dz);
       const d = 0.5 * (this.damage[a]! + this.damage[b]!);
       this.slack[c] += (1 + LAMINATED_SLACK * d - this.slack[c]!) * ramp;
       const slack = this.slack[c]!;

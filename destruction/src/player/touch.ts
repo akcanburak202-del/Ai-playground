@@ -17,7 +17,7 @@ export interface TouchActions {
   bulletCam(): void;
   menu(): void;
   unlockAudio(): void;
-  state(): { slowMo: boolean; ads: boolean; charges: number; placed: boolean; hidden: boolean };
+  state(): { slowMo: boolean; ads: boolean; charges: number; placed: boolean; hidden: boolean; bulletCam: boolean };
 }
 
 const STICK_RADIUS = 52;
@@ -133,7 +133,8 @@ export class TouchControls {
     this.hold(upBtn, (v) => (this.up = v));
     this.hold(downBtn, (v) => (this.down = v));
     // Right column above climb / descend, clear of the panels along the top.
-    this.button(layer, 'Kamera', '', 'right:18px;bottom:296px;width:84px', () => this.a.bulletCam());
+    // Lit while the bullet camera waits for a round or rides one (a second tap cancels it).
+    this.button(layer, 'Kamera', '', 'right:18px;bottom:296px;width:84px', () => this.a.bulletCam(), () => this.a.state().bulletCam);
     this.button(layer, 'Menü', '', 'right:110px;bottom:296px', () => this.a.menu());
 
     document.body.appendChild(this.root);

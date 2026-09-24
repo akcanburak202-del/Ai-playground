@@ -30,6 +30,12 @@ import type { ExtendedBlastRequest } from './BlastSystem.ts';
 const MAX_INTERACTIONS = 8;
 /** How far behind the stated origin a jet's first ray starts, m */
 const JET_BACKOFF = 0.1;
+/**
+ * Radius of a shaped-charge jet as a fraction of the cone diameter: a copper jet is a few mm thick
+ * (≈ 5 % CD across; it opens a hole ≈ 0.2 CD in steel — Walters & Zukas 1989, *Fundamentals of
+ * Shaped Charges*), so it threads holes wider than that and strikes the rim of narrower ones.
+ */
+const JET_RADIUS = 0.025;
 const KILL_Y = -50;
 const KILL_RANGE = 5000;
 const KILL_AGE = 30;
@@ -289,7 +295,8 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
       const reach = Math.min(segLen, fuzeDist);
       this.lastRaycasts++;
       // Nothing registered anywhere near this stretch (rounds fired at the sky): skip the registry.
-      let hit = rayBoxEntry(this.worldBounds, _from, _dir, reach) < Infinity ? this.ctx.registry.raycast(_from, _dir, reach, ignore) : null;
+      // The round's radius goes with the ray: a hole narrower than the round is solid to it.
+      let hit = rayBoxEntry(this.worldBounds, _from, _dir, reach) < Infinity ? this.ctx.registry.raycast(_from, _dir, reach, ignore, presentedRadius(p)) : null;
       const inert = this.castInert(_from, _dir, hit ? hit.distance : reach);
       if (inert) hit = inert;
       if (!hit) {
@@ -556,7 +563,7 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     let skip: Destructible | undefined;
     let perforated = 0;
     for (let k = 0; k < MAX_INTERACTIONS && c > 1e-4; k++) {
-      let hit = this.ctx.registry.raycast(from, dir, reach, skip);
+      let hit = this.ctx.registry.raycast(from, dir, reach, skip, JET_RADIUS * cone);
       const inert = this.castInert(from, dir, hit ? hit.distance : reach);
       if (inert) hit = inert;
       if (!hit) return;
@@ -659,6 +666,17 @@ function tagEvent(ev: ImpactEvent, projectileId: number | undefined, prior: numb
   ev.priorPerforations = prior;
   const segs = probe.segments;
   if (probe.exits && segs.length) ev.targetThickness = segs[segs.length - 1]!.end * Math.max(0.05, Math.abs(dir.dot(normal)));
+}
+
+/**
+ * Radius the flying round presents to the targets' ray tests (Destructible.raycast `radius`): the
+ * calibre (a long rod's diameter; a fragment's presented-area diameter, fragments.ts), or the
+ * hard core once an AP bullet has shed its jacket in a steel plate (its mass fell to the core's).
+ */
+export function presentedRadius(p: { ammo: AmmoSpec; mass: number }): number {
+  const a = p.ammo as AmmoData;
+  if (a.kind === 'ap' && a.coreDiameter && a.coreMass && p.mass <= a.coreMass * 1.001) return 0.5 * a.coreDiameter;
+  return 0.5 * a.diameter;
 }
 
 function clamp01(x: number): number {

@@ -237,3 +237,164 @@ export function damagedSection(s: SectionProps, fractions: ArrayLike<number>, of
   out.Sz = Iz / s.cz;
   return out;
 }
+
+// ─── Section sampling (cuts and eccentricity of damaged sections) ────────────────────────────
+
+/** A plate sampled into small cells: section coordinates and area of each (plate order kept). */
+export interface PlateSamples {
+  y: Float64Array;
+  z: Float64Array;
+  a: Float64Array;
+  /** Cells of plate p are [start[p], start[p + 1]) */
+  start: Int32Array;
+}
+
+const sampleCache = new WeakMap<SectionProps, PlateSamples>();
+
+/** Every plate as a grid of cells no coarser than `cell` (m); cached per section. */
+export function plateSamples(s: SectionProps, cell = 0.005): PlateSamples {
+  const hit = sampleCache.get(s);
+  if (hit) return hit;
+  const y: number[] = [], z: number[] = [], a: number[] = [];
+  const start = new Int32Array(s.plates.length + 1);
+  s.plates.forEach((p, k) => {
+    start[k] = a.length;
+    if (p.kind === 'rect') {
+      const ny = Math.max(2, Math.ceil((2 * p.hy) / cell)), nz = Math.max(2, Math.ceil((2 * p.hz) / cell));
+      // Cells carry the plate's own area (fillets included), spread uniformly.
+      const dA = p.A / (ny * nz);
+      for (let i = 0; i < ny; i++)
+        for (let j = 0; j < nz; j++) {
+          y.push(p.cy - p.hy + ((i + 0.5) / ny) * 2 * p.hy);
+          z.push(p.cz - p.hz + ((j + 0.5) / nz) * 2 * p.hz);
+          a.push(dA);
+        }
+    } else {
+      const nr = Math.max(2, Math.ceil((p.r1 - p.r0) / cell)), na = Math.max(4, Math.ceil(((p.a1 - p.a0) * p.r1) / cell));
+      let sum = 0;
+      const first = a.length;
+      for (let i = 0; i < nr; i++)
+        for (let j = 0; j < na; j++) {
+          const r = p.r0 + ((i + 0.5) / nr) * (p.r1 - p.r0), ang = p.a0 + ((j + 0.5) / na) * (p.a1 - p.a0);
+          y.push(r * Math.sin(ang));
+          z.push(r * Math.cos(ang));
+          const dA = r * ((p.r1 - p.r0) / nr) * ((p.a1 - p.a0) / na);
+          a.push(dA);
+          sum += dA;
+        }
+      for (let q = first; q < a.length; q++) a[q] = (a[q]! * p.A) / Math.max(sum, 1e-12);
+    }
+  });
+  start[s.plates.length] = a.length;
+  const out = { y: Float64Array.from(y), z: Float64Array.from(z), a: Float64Array.from(a), start };
+  sampleCache.set(s, out);
+  return out;
+}
+
+/**
+ * Cross-section area a placed steel-cutting charge severs, m². US Army FM 5-250 (Explosives and
+ * Demolitions, 1992, §3-7, steel-cutting formula for structural steel sections):
+ *     P = 3/8 · A      (P in lb of TNT, A in in²)
+ * inverted: a charge of W kg TNT cuts A = W · 2.2046 / 0.375 in² = 3.79·10⁻³ m² per kg. The formula
+ * is for structural (mild) steel; stronger steels are scaled like the ballistics module's contact
+ * breach threshold, × √(510 MPa / σ_u) (blast.ts contactDamage).
+ */
+export function fm5250CutArea(tntKg: number, ultimateStrength = 510e6): number {
+  const LB_PER_KG = 2.20462, M2_PER_IN2 = 6.4516e-4;
+  return ((Math.max(0, tntKg) * LB_PER_KG) / 0.375) * M2_PER_IN2 * Math.sqrt(510e6 / Math.max(ultimateStrength, 1e8));
+}
+
+/** Steel area of each plate within distance R of (y0, z0) in the section plane, m² (weighted by `fractions`). */
+export function plateAreaWithin(s: SectionProps, y0: number, z0: number, R: number, fractions?: ArrayLike<number>, offset = 0, out?: Float64Array): Float64Array {
+  const sm = plateSamples(s);
+  const res = out ?? new Float64Array(s.plates.length);
+  const R2 = R * R;
+  for (let p = 0; p < s.plates.length; p++) {
+    let A = 0;
+    for (let q = sm.start[p]!; q < sm.start[p + 1]!; q++) if ((sm.y[q]! - y0) ** 2 + (sm.z[q]! - z0) ** 2 <= R2) A += sm.a[q]!;
+    res[p] = A * (fractions ? Math.max(0, fractions[offset + p]!) : 1);
+  }
+  return res;
+}
+
+/**
+ * The cut a contact charge at (y0, z0) makes: every plate within a radius R of the charge loses the
+ * steel inside it, R growing until that steel equals the charge's FM 5-250 cut area `budget`
+ * (fm5250CutArea) or R reaches `reach`. Returns the area each plate loses (m²) and R.
+ */
+export function contactCut(s: SectionProps, y0: number, z0: number, budget: number, reach: number, fractions?: ArrayLike<number>, offset = 0): { lost: Float64Array; R: number } {
+  const lost = new Float64Array(s.plates.length);
+  const total = (R: number) => {
+    plateAreaWithin(s, y0, z0, R, fractions, offset, lost);
+    let a = 0;
+    for (let p = 0; p < lost.length; p++) a += lost[p]!;
+    return a;
+  };
+  if (!(budget > 0) || !(reach > 0)) return { lost, R: 0 };
+  if (total(reach) <= budget) return { lost, R: reach };
+  let lo = 0, hi = reach;
+  for (let k = 0; k < 24; k++) {
+    const mid = 0.5 * (lo + hi);
+    if (total(mid) > budget) hi = mid;
+    else lo = mid;
+  }
+  total(lo);
+  return { lost, R: lo };
+}
+
+/**
+ * A damaged section that has lost material on one side carries an axial force through its old
+ * centroid with an eccentricity e (the shift of its own centroid): N and M = N·e together. The
+ * squash load it can still take follows the linear N–M interaction N/N_p + N·e/M_p,e ≤ 1
+ * (EN 1993-1-1 §6.2.1(7), conservative for every section shape), with M_p,e the plastic moment of
+ * what is left about its plastic neutral axis in the plane of e (equal-area axis, sampled). Returns
+ * that capacity as an effective area N_max / f_y (m²) — the plain remaining area when e ≈ 0.
+ */
+export function eccentricAxialArea(s: SectionProps, fractions: ArrayLike<number>, offset = 0): number {
+  const sm = plateSamples(s);
+  let A = 0, Sy = 0, Sz = 0, damaged = false;
+  for (let p = 0; p < s.plates.length; p++) {
+    const f = Math.max(0, fractions[offset + p]!);
+    if (f < 0.999) damaged = true;
+    const pl = s.plates[p]!;
+    A += f * pl.A;
+    Sy += f * pl.A * (pl.kind === 'rect' ? pl.cy : 0);
+    Sz += f * pl.A * (pl.kind === 'rect' ? pl.cz : 0);
+    if (pl.kind === 'arc') {
+      // Sector centroid from the samples (cy, cz of an arc plate are its mid-radius point only).
+      let ay = 0, az = 0, aa = 0;
+      for (let q = sm.start[p]!; q < sm.start[p + 1]!; q++) {
+        ay += sm.y[q]! * sm.a[q]!;
+        az += sm.z[q]! * sm.a[q]!;
+        aa += sm.a[q]!;
+      }
+      Sy += (f * pl.A * ay) / Math.max(aa, 1e-12);
+      Sz += (f * pl.A * az) / Math.max(aa, 1e-12);
+    }
+  }
+  if (!damaged || !(A > 0)) return Math.max(A, 0);
+  const ey = Sy / A, ez = Sz / A;
+  const e = Math.hypot(ey, ez);
+  if (e < 1e-4) return A;
+  const ux = ey / e, uz = ez / e;
+  // Plastic neutral axis ⊥ e: the weighted median of the cells' coordinate along e.
+  const xs: { x: number; w: number }[] = [];
+  for (let p = 0; p < s.plates.length; p++) {
+    const f = Math.max(0, fractions[offset + p]!);
+    if (f <= 0) continue;
+    for (let q = sm.start[p]!; q < sm.start[p + 1]!; q++) xs.push({ x: sm.y[q]! * ux + sm.z[q]! * uz, w: f * sm.a[q]! });
+  }
+  xs.sort((a, b) => a.x - b.x);
+  let acc = 0, xp = 0;
+  for (const c of xs) {
+    acc += c.w;
+    if (acc >= 0.5 * A) {
+      xp = c.x;
+      break;
+    }
+  }
+  let Z = 0;
+  for (const c of xs) Z += c.w * Math.abs(c.x - xp);
+  // N_max = 1 / (1/N_p + e/M_p) with N_p = A f_y, M_p = Z f_y → as an area: 1 / (1/A + e/Z).
+  return 1 / (1 / A + e / Math.max(Z, 1e-12));
+}

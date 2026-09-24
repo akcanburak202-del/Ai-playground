@@ -33,10 +33,11 @@ vec4 finiteHdr(vec4 c) {
  * Bloom input guard: UnrealBloomPass's luminosity high pass is the only input of its blur chain, so
  * making it pass only finite values keeps a single overflowing pixel from turning into a frame-wide
  * NaN. The input is also scaled down to at most `cap` per channel (hue kept): an optically thick
- * body cannot outshine a black body at its temperature, but additive flame billboards stack to
- * several hundred where a fireball's cores overlap, and the glare of that sum veiled the whole frame
- * white. 48 ≈ the radiance of 2200–2300 K gas (fx glow()): white-hot surfaces bloom fully, stacked
- * layers add nothing more to the glare. Patched once per material; sets `userData.nanGuard`.
+ * body cannot outshine a black body at its temperature. The fireball and flames are composited
+ * 'over' (fx/shaders.ts), so they already saturate at their own radiance; the cap remains a guard
+ * against anything additive (sparks, tracers, specular glints) stacking up to veil the frame.
+ * 48 ≈ the radiance of 2200–2300 K gas (fx glow()): white-hot surfaces bloom fully, stacked layers
+ * add nothing more to the glare. Patched once per material; sets `userData.nanGuard`.
  */
 export function guardBloomInput(m: THREE.ShaderMaterial | undefined, cap = 48): void {
   if (!m || m.userData.nanGuard) return;
@@ -53,6 +54,24 @@ export function guardBloomInput(m: THREE.ShaderMaterial | undefined, cap = 48): 
 			if ( texelMax > ${cap.toFixed(1)} ) texel.rgb *= ${cap.toFixed(1)} / texelMax;`,
   );
   m.userData.nanGuard = true;
+  m.needsUpdate = true;
+}
+
+/**
+ * Camera white balance in the output pass: the HDR frame (scene, particles and bloom) is multiplied
+ * by a linear-RGB adaptation matrix (grade.ts) right before tone mapping, as a camera applies its
+ * white-balance gains to the raw sensor signal. `uniform` is shared with the pipeline, which
+ * rewrites it when the white balance changes. Patched once per material; sets `userData.whiteBalance`.
+ */
+export function patchOutputWhiteBalance(m: THREE.ShaderMaterial | THREE.RawShaderMaterial, uniform: { value: THREE.Matrix3 }): void {
+  if (m.userData.whiteBalance) return;
+  const src = 'gl_FragColor = texture2D( tDiffuse, vUv );';
+  if (!m.fragmentShader.includes(src)) throw new Error('three OutputShader changed: update patchOutputWhiteBalance');
+  m.fragmentShader = m.fragmentShader
+    .replace('uniform sampler2D tDiffuse;', 'uniform sampler2D tDiffuse;\n\t\tuniform mat3 uWhiteBalance;')
+    .replace(src, `${src}\n\t\t\tgl_FragColor.rgb = max( uWhiteBalance * gl_FragColor.rgb, 0.0 );`);
+  m.uniforms.uWhiteBalance = uniform;
+  m.userData.whiteBalance = true;
   m.needsUpdate = true;
 }
 
@@ -330,6 +349,8 @@ export class FxPass extends Pass {
   override render(renderer: THREE.WebGLRenderer, _write: THREE.WebGLRenderTarget, read: THREE.WebGLRenderTarget): void {
     const root = this.atmo.fxRoot;
     if (!root || !this.frame.depth) return;
+    // Depth-sort first: it decides which particle layers are visible this frame.
+    this.atmo.beforeFx?.(this.camera);
     const mats = this.materials;
     mats.length = 0;
     root.traverseVisible((o) => {

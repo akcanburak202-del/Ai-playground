@@ -159,6 +159,10 @@ export class PlayerController implements System, PlayerView {
     }
   }
 
+  get viewer(): THREE.Vector3 {
+    return this.cam ? this.cam.savedPos : this.ctx.camera.position;
+  }
+
   get bulletCam(): BulletCamView | null {
     const c = this.cam;
     if (!c || c.phase === 'return') return null;
@@ -490,7 +494,7 @@ export class PlayerController implements System, PlayerView {
       bulletCam: () => this.toggleBulletCam(),
       menu: () => this.bridge.hud?.showMenu(true),
       unlockAudio: () => this.ctx.audio.unlock(),
-      state: () => ({ slowMo: this.slowMo, ads: this.adsToggle, charges: this.weapons.charges.length, placed: this.weapons.current.delivery === 'placed', hidden: this.menuOpen }),
+      state: () => ({ slowMo: this.slowMo, ads: this.adsToggle, charges: this.weapons.charges.length, placed: this.weapons.current.delivery === 'placed', hidden: this.menuOpen, bulletCam: this.bulletCamArmed || !!this.cam }),
     });
   }
 

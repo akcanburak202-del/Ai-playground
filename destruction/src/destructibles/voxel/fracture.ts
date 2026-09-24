@@ -104,6 +104,30 @@ export function splitSelection(parent: VoxelGrid, sel: Selection, seeds: number[
   const sx = new Float64Array(ns), sy = new Float64Array(ns), sz = new Float64Array(ns);
   for (let q = 0; q < ns; q++) { sx[q] = seeds[q * 3]!; sy[q] = seeds[q * 3 + 1]!; sz[q] = seeds[q * 3 + 2]!; }
   const candReady = new Uint8Array(64), candN = new Int32Array(64), cand = new Int32Array(64 * ns), candDist = new Float64Array(ns);
+  // The warp is low-frequency (features ≥ 0.18 m ≈ 7 samples): evaluate it on the 5³ corners of
+  // the chunk's 4-sample blocks and interpolate trilinearly (~30× fewer noise evaluations; the
+  // warp field was ~40 % of the time to split a whole wall).
+  const WL = 5, warpX = new Float64Array(WL * WL * WL), warpY = new Float64Array(WL * WL * WL), warpZ = new Float64Array(WL * WL * WL);
+  let warpChunk = -1;
+  const warpLattice = (A: number, B: number, C: number) => {
+    for (let c = 0; c < WL; c++)
+      for (let b = 0; b < WL; b++)
+        for (let a = 0; a < WL; a++) {
+          const x = parent.ox + (A * CHUNK + 4 * a) * h, y = parent.oy + (B * CHUNK + 4 * b) * h, z = parent.oz + (C * CHUNK + 4 * c) * h;
+          const u = x * fw + so, w = y * fw, e = z * fw - so;
+          const q = a + WL * (b + WL * c);
+          warpX[q] = 1.4 * warp * noise.noise3(u, w, e);
+          warpY[q] = 1.4 * warp * noise.noise3(w + 31.7, e - 11.3, u + 5.1);
+          warpZ[q] = 1.4 * warp * noise.noise3(e - 7.9, u + 19.3, w - 23.1);
+        }
+  };
+  const lerp3 = (f: Float64Array, q: number, tx: number, ty: number, tz: number) => {
+    const a0 = f[q]! + (f[q + 1]! - f[q]!) * tx, a1 = f[q + WL]! + (f[q + WL + 1]! - f[q + WL]!) * tx;
+    const q2 = q + WL * WL;
+    const b0 = f[q2]! + (f[q2 + 1]! - f[q2]!) * tx, b1 = f[q2 + WL]! + (f[q2 + WL + 1]! - f[q2 + WL]!) * tx;
+    const c0 = a0 + (a1 - a0) * ty, c1 = b0 + (b1 - b0) * ty;
+    return c0 + (c1 - c0) * tz;
+  };
   // Walk the parent chunk by chunk; piece grids share the layout, so chunk/local indices match.
   for (let C = k0 >> CHUNK_SHIFT; C <= k1 >> CHUNK_SHIFT; C++)
     for (let B = j0 >> CHUNK_SHIFT; B <= j1 >> CHUNK_SHIFT; B++)
@@ -169,11 +193,18 @@ export function splitSelection(parent: VoxelGrid, sel: Selection, seeds: number[
                 }
                 if (db === Infinity) b = -1;
                 if (pass === 1 || ns < 2 || Math.sqrt(db) - Math.sqrt(da) > 2 * warp + 2 * h) break;
-                // Low-frequency, aperiodic warp of the cell boundaries (gradient noise).
-                const u = x * fw + so, w = y * fw, e = z * fw - so;
-                px = x + 1.4 * warp * noise.noise3(u, w, e);
-                py = y + 1.4 * warp * noise.noise3(w + 31.7, e - 11.3, u + 5.1);
-                pz = z + 1.4 * warp * noise.noise3(e - 7.9, u + 19.3, w - 23.1);
+                // Low-frequency, aperiodic warp of the cell boundaries (gradient noise, sampled on
+                // the block lattice of this chunk).
+                if (warpChunk !== ci) {
+                  warpLattice(A, B, C);
+                  warpChunk = ci;
+                }
+                const li4 = i & CHUNK_MASK, lj4 = j & CHUNK_MASK, lk4 = k & CHUNK_MASK;
+                const q = (li4 >> 2) + WL * ((lj4 >> 2) + WL * (lk4 >> 2));
+                const tx = (li4 & 3) / 4, ty = (lj4 & 3) / 4, tz = (lk4 & 3) / 4;
+                px = x + lerp3(warpX, q, tx, ty, tz);
+                py = y + lerp3(warpY, q, tx, ty, tz);
+                pz = z + lerp3(warpZ, q, tx, ty, tz);
               }
               let v = take;
               let nearCut = false;

@@ -1,5 +1,5 @@
 import { BandedSPD } from './banded.ts';
-import { damagedSection, type SectionProps } from './section.ts';
+import { damagedSection, eccentricAxialArea, type SectionProps } from './section.ts';
 import { TAYLOR_QUINNEY, AMBIENT_C, type SteelParams } from './steelMaterial.ts';
 
 /**
@@ -92,6 +92,11 @@ export class BeamSim {
   /** Per node section: plate fractions (n × plates) and derived properties */
   readonly frac: Float32Array;
   readonly A: Float64Array;
+  /**
+   * Axial capacity of the node as an area (N_max / f_y): the remaining area, less where material
+   * lost on one side makes the carried force eccentric (section.ts eccentricAxialArea).
+   */
+  readonly Aax: Float64Array;
   readonly Iu: Float64Array;
   readonly Iv: Float64Array;
   readonly Zu: Float64Array;
@@ -188,6 +193,7 @@ export class BeamSim {
     this.lockPos = new Float64Array(3 * n);
     this.frac = new Float32Array(n * P).fill(1);
     this.A = new Float64Array(n);
+    this.Aax = new Float64Array(n);
     this.Iu = new Float64Array(n);
     this.Iv = new Float64Array(n);
     this.Zu = new Float64Array(n);
@@ -331,23 +337,61 @@ export class BeamSim {
       const otherCond = which === 0 ? this.ends.end : this.ends.start;
       if (isTop && otherCond !== 'free') {
         // Roller: held sideways, free to move along the axis so the imposed load flows down.
-        this.roller = i;
-        this.rollerPos.set(this.x.subarray(3 * i, 3 * i + 3));
-        this.rollerAxis.set(ax);
-        const e1 = Math.abs(ax[0]) < 0.9 ? [1, 0, 0] : [0, 0, 1];
-        const d = e1[0]! * ax[0] + e1[1]! * ax[1] + e1[2]! * ax[2];
-        let a1x = e1[0]! - d * ax[0], a1y = e1[1]! - d * ax[1], a1z = e1[2]! - d * ax[2];
-        const l = Math.hypot(a1x, a1y, a1z);
-        a1x /= l;
-        a1y /= l;
-        a1z /= l;
-        this.rollerE.set([a1x, a1y, a1z, ax[1] * a1z - ax[2] * a1y, ax[2] * a1x - ax[0] * a1z, ax[0] * a1y - ax[1] * a1x]);
+        this.setRoller(i, ax);
         this.rollerLock = cond === 'fixed';
         continue;
       }
       this.lock(i);
       if (cond === 'fixed') this.setGhost(which);
     }
+  }
+
+  /** Make node i a roller: held in the plane ⊥ ax through where it is now, free along ax. */
+  private setRoller(i: number, ax: V3 | Float64Array): void {
+    this.roller = i;
+    this.rollerPos.set(this.x.subarray(3 * i, 3 * i + 3));
+    this.rollerAxis.set(ax);
+    const e1 = Math.abs(ax[0]!) < 0.9 ? [1, 0, 0] : [0, 0, 1];
+    const d = e1[0]! * ax[0]! + e1[1]! * ax[1]! + e1[2]! * ax[2]!;
+    let a1x = e1[0]! - d * ax[0]!, a1y = e1[1]! - d * ax[1]!, a1z = e1[2]! - d * ax[2]!;
+    const l = Math.hypot(a1x, a1y, a1z);
+    a1x /= l;
+    a1y /= l;
+    a1z /= l;
+    this.rollerE.set([a1x, a1y, a1z, ax[1]! * a1z - ax[2]! * a1y, ax[2]! * a1x - ax[0]! * a1z, ax[0]! * a1y - ax[1]! * a1x]);
+  }
+
+  /** The roller was added for a carried load by holdHead (not by the member's own end conditions) */
+  autoRoller = false;
+
+  /**
+   * An upright member standing on a held base that starts to carry a load (an upper-storey column
+   * on its splice): the floor it carries bears on its head and also holds the head sideways (the
+   * floor diaphragm), so the head becomes a pinned roller like a ground-storey column's. Without
+   * it the column would be a free-headed flagpole under its floor (effective length 2L). Returns
+   * whether a roller was added.
+   */
+  holdHead(): boolean {
+    if (this.roller >= 0) return false;
+    const head = this.loadedHead();
+    if (head < 0) return false;
+    const base = head === 0 ? this.n - 1 : 0;
+    const ax = new Float64Array(3);
+    for (let c = 0; c < 3; c++) ax[c] = this.x[3 * head + c]! - this.x[3 * base + c]!;
+    const l = Math.hypot(ax[0]!, ax[1]!, ax[2]!) || 1;
+    for (let c = 0; c < 3; c++) ax[c] = ax[c]! / l;
+    this.setRoller(head, ax);
+    this.rollerLock = false;
+    this.autoRoller = true;
+    return true;
+  }
+
+  /** Is the base of an upright member (the end opposite the roller) still held? */
+  baseHeld(): boolean {
+    const head = this.roller >= 0 ? this.roller : this.loadedHead();
+    if (head < 0) return this.locked.some((l) => l === 1);
+    const base = head === 0 ? this.n - 1 : 0, next = base === 0 ? 1 : this.n - 2;
+    return !!(this.locked[base] || this.locked[next]);
   }
 
   private lock(i: number): void {
@@ -370,6 +414,7 @@ export class BeamSim {
     const s = this.section;
     const d = damagedSection(s, this.frac, i * s.plates.length);
     this.A[i] = Math.max(d.A, 1e-9);
+    this.Aax[i] = Math.max(Math.min(d.A, eccentricAxialArea(s, this.frac, i * s.plates.length)), 1e-9);
     this.Iu[i] = Math.max(d.Iy, 1e-14);
     this.Iv[i] = Math.max(d.Iz, 1e-14);
     this.Zu[i] = d.Zy;
@@ -386,8 +431,23 @@ export class BeamSim {
   private loadMass(i: number): number {
     const g = Math.hypot(...this.gravity);
     if (!(g > 1e-6) || !(this.applied > 0)) return 0;
-    if (this.roller >= 0) return i === this.roller ? this.applied / g : 0;
+    const head = this.loadedHead();
+    if (head >= 0) return i === head ? this.applied / g : 0;
     return this.applied / (this.n * g);
+  }
+
+  /**
+   * Node the carried load bears on: the roller of a column with a loaded head, or the top node of
+   * an upright member standing on its base (an upper-storey column: the floor rides on its head,
+   * not along its shaft); −1 for a member carrying its load along its length (a beam under a slab).
+   */
+  loadedHead(): number {
+    if (this.roller >= 0) return this.roller;
+    const n = this.n, L0 = this.s0[n - 1]! - this.s0[0]!;
+    const dy = this.x[3 * (n - 1) + 1]! - this.x[1]!;
+    if (Math.abs(dy) < 0.7 * L0) return -1;
+    const top = dy > 0 ? n - 1 : 0, base = top === 0 ? n - 1 : 0;
+    return this.locked[base] || this.locked[base === 0 ? 1 : n - 2] ? top : -1;
   }
 
   /** Inverse mass of node i: its steel plus the load it carries (0 when held). */
@@ -496,7 +556,7 @@ export class BeamSim {
 
   private axialCap(seg: number): number {
     const P = this.params;
-    const A = Math.min(this.A[seg]!, this.A[seg + 1]!);
+    const A = Math.min(this.Aax[seg]!, this.Aax[seg + 1]!);
     const eps = Math.abs(this.axRest[seg]! / this.axRest0[seg]! - 1);
     return A * Math.min(P.fy + P.H * eps, P.fu);
   }
@@ -969,6 +1029,7 @@ export class BeamSim {
     for (let i = 0; i < n; i++) this.refreshW(i);
     // Imposed load: at the roller (column head) or spread along a horizontal member.
     const [gx, gy, gz] = this.gravity;
+    const head = this.loadedHead();
     for (let s = 0; s < nsub; s++) {
       const damp = Math.exp(-this.damping * h);
       const f = this.fext;
@@ -981,8 +1042,8 @@ export class BeamSim {
         f[k + 1] = this.loads[k + 1]!;
         f[k + 2] = this.loads[k + 2]!;
         if (this.applied > 0 && !loadAsMass) {
-          if (this.roller >= 0) {
-            if (i === this.roller) f[k + 1] = f[k + 1]! - this.applied;
+          if (head >= 0) {
+            if (i === head) f[k + 1] = f[k + 1]! - this.applied;
           } else f[k + 1] = f[k + 1]! - this.applied / n;
         }
         if (w[i] === 0) continue;

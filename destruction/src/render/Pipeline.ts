@@ -9,13 +9,25 @@ import type { RenderPipelineApi, SceneDef, SimContext } from '../app/contracts.t
 import { getAtmosphere, type Atmosphere } from './atmosphere.ts';
 import { deriveLighting, GOLDEN_HOUR_SKY, sunDirection, type SkyParams, type SunLighting } from './skyModel.ts';
 import { createSkyRig, type SkyRig } from './sky.ts';
-import { CompositePass, FxPass, ScenePass, guardBloomInput, type FrameState } from './passes.ts';
+import { CompositePass, FxPass, ScenePass, guardBloomInput, patchOutputWhiteBalance, type FrameState } from './passes.ts';
+import { whiteBalanceMatrix } from './grade.ts';
 import { hasGroundProvider } from '../fx/ground.ts';
 
 export type Quality = 0 | 1 | 2;
 
 /** Default mood: low warm sun raking across the facades from the south-west. */
 export const DEFAULT_SUN = { elevation: 13, azimuth: 232 };
+
+/**
+ * Default camera white balance, K. The render's own white is D65 (6504 K, midday daylight; see
+ * grade.ts), so a camera set there neutralises nothing: the low sun renders at its physical
+ * ≈ 3000–3500 K colour, but the blue sky fill on every sun-lit surface makes it read as clear
+ * late-afternoon light. Photographers keep golden-hour warmth with the "cloudy" preset, ≈ 25 mired
+ * warmer than "daylight" (6000 vs 5200 K); the same shift from this render's white,
+ * 10⁶ / (10⁶ / 6504 − 25) ≈ 7800 K, warms the sun-lit side while sky-lit shade (≈ 10 000 K and
+ * above) stays bluer than neutral.
+ */
+export const DEFAULT_WHITE_BALANCE = 7800;
 
 interface QualitySettings {
   pixelRatio: number;
@@ -44,11 +56,12 @@ const _grey = new THREE.Color();
 /**
  * The production render pipeline: golden-hour physical sky with matching sun, sky-derived image
  * based lighting, two-cascade sun shadows that follow the camera, depth-based GTAO, aerial
- * perspective, soft-particle effects, bloom for emissive fire / tracers / hot metal, ACES filmic tone
- * mapping and SMAA.
+ * perspective, soft-particle effects (depth-sorted), bloom for emissive fire / tracers / hot metal,
+ * camera white balance, ACES filmic tone mapping and SMAA.
  *
  *   RenderPass-like ScenePass (opaque world, effects hidden) → CompositePass (GTAO + haze)
- *   → FxPass (particles, soft depth) → UnrealBloomPass → OutputPass (ACES, sRGB) → SMAA/FXAA
+ *   → FxPass (particles, soft depth) → UnrealBloomPass → OutputPass (white balance, ACES, sRGB)
+ *   → SMAA/FXAA
  *
  * `setup` is idempotent and runs on every scene load (sun direction may change per scene).
  */
@@ -62,6 +75,11 @@ export class Pipeline implements RenderPipelineApi {
   lastFrameMs = 0;
   /** Tone-mapping exposure multiplier on top of the automatic one */
   exposureBias = 1;
+  /**
+   * Camera white balance, K (daylight locus; 6504 = neutral render white, higher = warmer). Scenes
+   * may set it before load or at any time; it is applied in the output pass every frame.
+   */
+  whiteBalance = DEFAULT_WHITE_BALANCE;
 
   private ctx: SimContext | null = null;
   private atmo: Atmosphere | null = null;
@@ -84,6 +102,8 @@ export class Pipeline implements RenderPipelineApi {
   private clock = 0;
   private kickPitch = 0;
   private kickYaw = 0;
+  private wbUniform = { value: new THREE.Matrix3() };
+  private wbKelvin = NaN;
 
   constructor(opts: { quality?: Quality } = {}) {
     this.quality = opts.quality ?? 2;
@@ -182,6 +202,7 @@ export class Pipeline implements RenderPipelineApi {
     this.bloomPass = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.1, 0.3, 7.0);
     guardBloomInput(this.bloomPass.materialHighPassFilter);
     this.outputPass = new OutputPass();
+    patchOutputWhiteBalance(this.outputPass.material, this.wbUniform);
     this.smaaPass = new SMAAPass();
     this.fxaaPass = new FXAAPass();
     composer.addPass(this.scenePass);
@@ -241,6 +262,7 @@ export class Pipeline implements RenderPipelineApi {
     atmo.cameraNear.value = cam.near;
     atmo.cameraFar.value = cam.far;
     r.getDrawingBufferSize(atmo.resolution.value);
+    this.updateWhiteBalance();
 
     // Render-only view offsets (camera shake, recoil kick): applied around the frame and undone after,
     // so the aim ray and everything simulated keep the true camera.
@@ -265,6 +287,13 @@ export class Pipeline implements RenderPipelineApi {
       cam.updateMatrixWorld();
     }
     this.lastFrameMs = performance.now() - t0;
+  }
+
+  private updateWhiteBalance(): void {
+    const k = Number.isFinite(this.whiteBalance) ? this.whiteBalance : DEFAULT_WHITE_BALANCE;
+    if (k === this.wbKelvin) return;
+    this.wbKelvin = k;
+    this.wbUniform.value.set(...whiteBalanceMatrix(k));
   }
 
   resize(width: number, height: number): void {

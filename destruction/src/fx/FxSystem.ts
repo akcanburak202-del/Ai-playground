@@ -15,7 +15,7 @@ import { ShockFronts } from './ShockFronts.ts';
 import { CameraShake } from './shake.ts';
 import { createFireAtlas, createSmokeAtlas } from './textures.ts';
 import { createFireMaterial, createSmokeMaterial, createSparkMaterial } from './shaders.ts';
-import { landingTime } from './motion.ts';
+import { landingTime, motionAt, type MotionState } from './motion.ts';
 import { groundOf } from './ground.ts';
 
 /** Particle budgets (≈ 20 k total, see DESIGN.md §5). */
@@ -31,6 +31,11 @@ const POOL_LIFE: Record<Pool, number> = { smoke: 5, sparks: 0.5, chips: 10.5 };
  */
 const POOL_SOFT = 0.5;
 const POOL_HARD = 0.75;
+
+/** Exact wall rays per chip / spark emission call, per rendered frame, and their reach, m (see wallHit). */
+const WALL_RAYS_PER_CALL = 12;
+const WALL_RAYS_PER_FRAME = 96;
+const WALL_RAY_RANGE = 8;
 
 /** Exposure time of the virtual camera for motion streaks, s (a 180° shutter at 60 fps). */
 const SHUTTER = 1 / 120;
@@ -76,6 +81,9 @@ const _d = new THREE.Vector3();
 const _u = new THREE.Vector3();
 const _w = new THREE.Vector3();
 const _j = new THREE.Vector3();
+const _o = new THREE.Vector3();
+const _hn = new THREE.Vector3();
+const _ms: MotionState = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
 const _q = new THREE.Quaternion();
 const _e = new THREE.Euler();
 const UP = new THREE.Vector3(0, 1, 0);
@@ -125,6 +133,17 @@ export class FxSystem implements System, FxApi {
   private sceneHemi: THREE.HemisphereLight | null = null;
   /** Wall-clock cost of the last frameUpdate, ms (telemetry) */
   lastFrameMs = 0;
+  /** Wall rays left this frame, and rays cast since creation (telemetry) */
+  private rayBudget = WALL_RAYS_PER_FRAME;
+  raysCast = 0;
+  /** Rays cast by the current emission call (see wallHit) */
+  private fan = {
+    n: 0,
+    dir: new Float32Array(WALL_RAYS_PER_CALL * 3),
+    hit: new Uint8Array(WALL_RAYS_PER_CALL),
+    pt: new Float32Array(WALL_RAYS_PER_CALL * 3),
+    nrm: new Float32Array(WALL_RAYS_PER_CALL * 3),
+  };
 
   constructor(sim: Simulation) {
     const ctx = (this.ctx = sim.ctx);
@@ -133,7 +152,8 @@ export class FxSystem implements System, FxApi {
     const smokeAtlas = createSmokeAtlas();
     const fireAtlas = createFireAtlas();
     this.textures.push(smokeAtlas, fireAtlas);
-    this.smokeLayer = new ParticleLayer('fx-smoke', BUDGET.smoke, createSmokeMaterial(this.atmo, smokeAtlas));
+    // Smoke, dust and the fireball are alpha-blended ('over'), so they are drawn back to front.
+    this.smokeLayer = new ParticleLayer('fx-smoke', BUDGET.smoke, createSmokeMaterial(this.atmo, smokeAtlas), { sorted: true });
     this.fireLayer = new ParticleLayer('fx-fire', BUDGET.fire, createFireMaterial(this.atmo, fireAtlas));
     this.sparkLayer = new ParticleLayer('fx-sparks', BUDGET.sparks, createSparkMaterial(this.atmo, this.shutter));
     this.smokeLayer.mesh.renderOrder = 10;
@@ -149,6 +169,7 @@ export class FxSystem implements System, FxApi {
     this.solidRoot.add(this.chipLayer.mesh, this.lights.group);
     ctx.scene.add(this.root, this.solidRoot);
     this.atmo.fxRoot = this.root;
+    this.atmo.beforeFx = this.sortForView;
 
     const ev = ctx.events;
     this.unsub.push(
@@ -166,7 +187,11 @@ export class FxSystem implements System, FxApi {
     const prevAfter = scene.onAfterRender;
     scene.onBeforeRender = (...args) => {
       prevBefore.apply(scene, args);
-      if (!this.atmo.pipelineHandlesShake && this.atmo.shake.active) this.applyShake();
+      if (this.atmo.pipelineHandlesShake) return;
+      if (this.atmo.shake.active) this.applyShake();
+      // The effects are part of this scene render (no separate effects pass): sort them here.
+      const cam = args[2] as THREE.Camera | undefined;
+      if (cam && this.root.parent === scene) this.sortForView(cam);
     };
     scene.onAfterRender = (...args) => {
       prevAfter.apply(scene, args);
@@ -181,6 +206,12 @@ export class FxSystem implements System, FxApi {
   private get now(): number {
     return this.ctx.time.now;
   }
+
+  /** Depth-sort the alpha-blended particles for the camera about to draw them. */
+  private sortForView = (camera: THREE.Camera): void => {
+    camera.updateMatrixWorld();
+    this.smokeLayer.sort(camera, this.atmo.time.value, this.atmo.wind.value);
+  };
 
   // ─── FxApi ───────────────────────────────────────────────────────────────────────────────
 
@@ -352,6 +383,68 @@ export class FxSystem implements System, FxApi {
     }
   }
 
+  // ─── Walls in the way of chips and sparks ─────────────────────────────────────────────────
+
+  /**
+   * Distance from p along the unit direction `dir` to the first solid surface of a destructible
+   * (not the terrain: the ground is every particle's floor already), or Infinity; its outward normal
+   * goes to `outN`. One emission call casts at most WALL_RAYS_PER_CALL exact rays (the first
+   * particles' own directions); later particles of the call intersect the surface plane found by
+   * the cast ray closest to their direction (within ≈ 25°) — exact for a flat wall — so a 160-chip
+   * burst costs a dozen registry rays. A per-frame budget bounds sustained fire; beyond it particles
+   * fly unchecked, as before.
+   */
+  private wallHit(p: THREE.Vector3, dir: THREE.Vector3, range: number, outN: THREE.Vector3): number {
+    const fan = this.fan;
+    if (fan.n >= WALL_RAYS_PER_CALL || this.rayBudget <= 0 || !this.ctx.registry) {
+      let best = 0.9, bi = -1;
+      for (let i = 0; i < fan.n; i++) {
+        const c = dir.x * fan.dir[i * 3]! + dir.y * fan.dir[i * 3 + 1]! + dir.z * fan.dir[i * 3 + 2]!;
+        if (c > best) {
+          best = c;
+          bi = i;
+        }
+      }
+      if (bi < 0 || !fan.hit[bi]) return Infinity;
+      const nx = fan.nrm[bi * 3]!, ny = fan.nrm[bi * 3 + 1]!, nz = fan.nrm[bi * 3 + 2]!;
+      const dn = dir.x * nx + dir.y * ny + dir.z * nz;
+      if (dn > -0.05) return Infinity;
+      const t = ((fan.pt[bi * 3]! - p.x) * nx + (fan.pt[bi * 3 + 1]! - p.y) * ny + (fan.pt[bi * 3 + 2]! - p.z) * nz) / dn;
+      if (!(t > 0) || t > range) return Infinity;
+      outN.set(nx, ny, nz);
+      return t;
+    }
+    this.rayBudget--;
+    this.raysCast++;
+    const reg = this.ctx.registry;
+    // Start just off the surface the particle leaves; if the origin sits on (or in) its source
+    // element, look past that element.
+    _o.copy(p).addScaledVector(dir, 0.03);
+    let hit = reg.raycast(_o, dir, range);
+    if (hit && hit.distance < 0.05 && hit.target.kind !== 'terrain') hit = reg.raycast(_o, dir, range, hit.target);
+    const i = fan.n++;
+    fan.dir[i * 3] = dir.x; fan.dir[i * 3 + 1] = dir.y; fan.dir[i * 3 + 2] = dir.z;
+    const solid = !!hit && hit.target.kind !== 'terrain';
+    fan.hit[i] = solid ? 1 : 0;
+    if (!hit || !solid) return Infinity;
+    fan.pt[i * 3] = hit.point.x; fan.pt[i * 3 + 1] = hit.point.y; fan.pt[i * 3 + 2] = hit.point.z;
+    fan.nrm[i * 3] = hit.normal.x; fan.nrm[i * 3 + 1] = hit.normal.y; fan.nrm[i * 3 + 2] = hit.normal.z;
+    outN.copy(hit.normal);
+    return hit.distance + 0.03;
+  }
+
+  /**
+   * Time for a particle launched at speed v with linear drag k to cover distance d along its launch
+   * direction (motion.ts: s(t) = v·A(t) = v (1 − e^(−kt)) / k, gravity's share neglected over the
+   * fraction of a second involved), or −1 if drag stops it first (d ≥ v / k).
+   */
+  private static timeToCover(d: number, v: number, k: number): number {
+    if (!Number.isFinite(d) || v <= 1e-6) return -1;
+    const kd = (k * d) / v;
+    if (kd >= 0.98) return -1;
+    return kd < 1e-4 ? d / v : -Math.log(1 - kd) / k;
+  }
+
   /** Solid chips thrown from p within a cone around dir (half-angle `spread` rad). */
   emitChips(p: THREE.Vector3, dir: THREE.Vector3, spread: number, speed: number, count: number, size: number, color: number, kind: ChipKind, t0 = this.now): void {
     const rng = this.rng;
@@ -361,6 +454,8 @@ export class FxSystem implements System, FxApi {
     _w.copy(dir);
     if (_w.lengthSq() < 1e-9) _w.set(0, 1, 0);
     _w.normalize();
+    this.fan.n = 0;
+    const wind = this.atmo.wind.value;
     for (let i = 0; i < n; i++) {
       rng.inCone(_w, Math.min(Math.PI * 0.95, Math.max(0.05, spread)), _d);
       const sp = speed * rng.range(0.35, 1.15);
@@ -375,8 +470,26 @@ export class FxSystem implements System, FxApi {
       const tl = landingTime(p.y, vy, k, 1, 0, floor, 12);
       const life = rng.range(7, 14);
       const shade = rng.range(0.75, 1.15);
-      this.chipLayer.emit(t0, life, p.x, p.y, p.z, vx, vy, vz, k, floor, tl, s, rng.range(4, 25), rng.next(), kind,
-        _c.r * shade, _c.g * shade, _c.b * shade);
+      const spin = rng.range(4, 25), seed = rng.next();
+      const r = _c.r * shade, g = _c.g * shade, b = _c.b * shade;
+      // A wall in the way (reached before the ground): the flight ends there and a ricochet
+      // continues from the wall — restitution ≈ 0.3 normal, 0.6 tangential (rock-fall rebound
+      // tables for hard surfaces, e.g. Chau et al. 2002), then the chip drops at the wall's foot.
+      const tHit = FxSystem.timeToCover(this.wallHit(p, _d, Math.min(WALL_RAY_RANGE, sp / k), _hn), sp, k);
+      if (tHit > 0 && (tl < 0 || tHit < tl) && tHit < life) {
+        const m = motionAt(p.x, p.y, p.z, vx, vy, vz, k, 1, wind.x * 0.3, wind.y * 0.3, wind.z * 0.3, tHit, _ms);
+        const vn = m.vx * _hn.x + m.vy * _hn.y + m.vz * _hn.z;
+        const bx = 0.6 * (m.vx - vn * _hn.x) - 0.3 * vn * _hn.x;
+        const by = 0.6 * (m.vy - vn * _hn.y) - 0.3 * vn * _hn.y;
+        const bz = 0.6 * (m.vz - vn * _hn.z) - 0.3 * vn * _hn.z;
+        const hx = m.x + _hn.x * s * 0.6, hy = m.y + _hn.y * s * 0.6, hz = m.z + _hn.z * s * 0.6;
+        const floor2 = ground.heightAt(hx, hz) + s * 0.3;
+        const tl2 = landingTime(hy, by, k, 1, 0, floor2, 12);
+        this.chipLayer.emit(t0, tHit, p.x, p.y, p.z, vx, vy, vz, k, -1e4, -1, s, spin, seed, kind, r, g, b, false);
+        this.chipLayer.emit(t0 + tHit, life - tHit, hx, hy, hz, bx, by, bz, k, floor2, tl2, s, -spin, seed, kind, r, g, b);
+        continue;
+      }
+      this.chipLayer.emit(t0, life, p.x, p.y, p.z, vx, vy, vz, k, floor, tl, s, spin, seed, kind, r, g, b);
     }
   }
 
@@ -390,6 +503,7 @@ export class FxSystem implements System, FxApi {
     if (_w.lengthSq() < 1e-9) _w.set(0, 1, 0);
     _w.normalize();
     const floor = ground.heightAt(p.x, p.z);
+    this.fan.n = 0;
     for (let i = 0; i < n; i++) {
       rng.inCone(_w, Math.min(Math.PI * 0.95, spread), _d);
       const sp = speed * rng.range(0.3, 1.1);
@@ -402,6 +516,10 @@ export class FxSystem implements System, FxApi {
       P.gravity = 1;
       P.floor = floor;
       P.tLand = landingTime(p.y, P.vy, P.drag, 1, 0, floor, P.life);
+      // A spark that meets a wall first dies there (its droplet splashes and quenches on the cold
+      // surface): the streak ends at the wall instead of passing through it.
+      const tHit = FxSystem.timeToCover(this.wallHit(p, _d, Math.min(WALL_RAY_RANGE, sp / P.drag), _hn), sp, P.drag);
+      if (tHit > 0 && tHit < P.life && (P.tLand < 0 || tHit < P.tLand)) P.life = tHit;
       P.size0 = P.size1 = width * rng.range(0.6, 1.4);
       P.growth = 1;
       P.spin = kind === 1 ? rng.range(8, 30) : 0;
@@ -414,7 +532,7 @@ export class FxSystem implements System, FxApi {
     }
   }
 
-  /** A flame / flash billboard (additive). */
+  /** A flame / flash billboard (premultiplied over: overlapping flames do not add up). */
   private emitFlame(x: number, y: number, z: number, vx: number, vy: number, vz: number, size0: number, size1: number, life: number, T: number, variant: number, t0 = this.now, drag = 6, gravity = -0.2, tint = 1): void {
     const P = this.P;
     P.x = x; P.y = y; P.z = z; P.vx = vx; P.vy = vy; P.vz = vz;
@@ -641,7 +759,10 @@ export class FxSystem implements System, FxApi {
       P.t0 = now + rng.range(0, 0.12 * tFire);
       P.life = tFire * rng.range(2.2, 3.6);
       P.drag = kFire; P.gravity = -0.02; P.floor = -1e4; P.tLand = -1;
-      P.size0 = Rf * rng.range(0.15, 0.3); P.size1 = Rf * rng.range(0.45, 0.7); P.growth = tFire * 0.3;
+      // growth τ = 0.3 t_c: the smoke shader reads the puff's cooling time t_c from it (hot puffs).
+      // Gas at the rim of the ball entrains cold air first and goes dark first (t_c ≈ 0.6 t_F);
+      // the core keeps burning longest (≈ 1.35 t_F): a sooty shell with fire showing through gaps.
+      P.size0 = Rf * rng.range(0.15, 0.3); P.size1 = Rf * rng.range(0.45, 0.7); P.growth = tFire * 0.3 * (1.35 - 0.8 * (reach / Rf));
       P.spin = rng.range(-1.5, 1.5);
       // Cooled detonation products: dark grey TNT smoke (soot mixed with fine dust), not carbon
       // black — a thin puff of albedo 0.04 reads as a hole in the cloud.
@@ -649,25 +770,38 @@ export class FxSystem implements System, FxApi {
       P.r = soot; P.g = soot; P.b = soot * 1.04; P.opacity = 0.85;
       P.seed = rng.next();
       // Turbulent mixing: the fireball is a patchwork of hot and cooler pockets, with tongues of
-      // unburnt soot (≈15 % of the puffs never glow) — mottled, not a uniform glowing ball.
-      const sootTongue = rng.chance(thermo ? 0.08 : 0.15);
+      // unburnt soot (≈ 20 % of the puffs never glow) — mottled, not a uniform glowing ball.
+      const sootTongue = rng.chance(thermo ? 0.1 : 0.22);
       // Soot tongues are torn streamers, not billows: ragged cells, a little thinner.
       P.variant = sootTongue || rng.chance(0.5) ? rng.int(8, 16) : rng.int(0, 8);
       if (sootTongue) P.opacity = 0.65;
-      P.heat = sootTongue ? 0 : (thermo ? 2050 : 2250) * rng.range(0.78, 1.06);
+      P.heat = sootTongue ? 0 : (thermo ? 2050 : 2250) * rng.range(0.8, 1.06);
       // Young soot is darker than the aged plume, but never below ≈ 0.04 albedo (fresh flame soot
       // clouds; darker reads as holes in the frame, not smoke).
       P.extra = sootTongue ? 0.55 : 0.7;
       this.smokeLayer.emit(P);
     }
-    // Additive flame cores for the brightest instants.
+    // Flame cores: the hottest, youngest gas in the middle of the ball. They are puffs of the same
+    // optically thick medium, drawn in depth order with the rest (premultiplied 'over'), so the
+    // emission of a pixel saturates at the temperature of the gas in front instead of summing a
+    // stack of additive billboards to white, and soot in front of a core hides it.
     const nCore = Math.round(Math.min(90, 14 + 24 * w3) * (thermo ? 1.6 : 1));
     for (let i = 0; i < nCore; i++) {
       rng.onSphere(_d);
       if (_d.dot(axis) < 0) _d.addScaledVector(axis, -2 * _d.dot(axis));
-      const v = Rf * rng.range(0.1, 0.65) * kFire;
-      this.emitFlame(c.x + _d.x * 0.1 * Rf, c.y + _d.y * 0.1 * Rf, c.z + _d.z * 0.1 * Rf, _d.x * v, _d.y * v, _d.z * v,
-        Rf * 0.25, Rf * rng.range(0.4, 0.7), tFire * rng.range(0.35, 0.9), thermo ? 2200 : 2450, rng.int(0, 12), now + rng.range(0, 0.08 * tFire), kFire, -0.05, 0.6);
+      const v = Rf * rng.range(0.1, 0.55) * kFire;
+      P.x = c.x + _d.x * 0.1 * Rf; P.y = c.y + _d.y * 0.1 * Rf; P.z = c.z + _d.z * 0.1 * Rf;
+      P.vx = _d.x * v; P.vy = _d.y * v; P.vz = _d.z * v;
+      P.t0 = now + rng.range(0, 0.08 * tFire);
+      P.life = tFire * rng.range(0.9, 1.6);
+      P.drag = kFire; P.gravity = -0.05; P.floor = -1e4; P.tLand = -1;
+      P.size0 = Rf * rng.range(0.18, 0.26); P.size1 = Rf * rng.range(0.35, 0.55); P.growth = tFire * 0.3 * 1.2; // 0.3 t_c (shader)
+      P.spin = rng.range(-1.5, 1.5);
+      P.r = 0.06; P.g = 0.06; P.b = 0.062; P.opacity = 0.9;
+      P.seed = rng.next(); P.variant = rng.int(0, 8);
+      P.heat = (thermo ? 2200 : 2380) * rng.range(0.96, 1.04);
+      P.extra = 0.7;
+      this.smokeLayer.emit(P);
     }
 
     // 2) Sooty roll-up: the hot products rise as a dark toroidal plume that greys as it dilutes.
@@ -809,6 +943,7 @@ export class FxSystem implements System, FxApi {
     this.shutter.value = SHUTTER * Math.max(ctx.time.scale, 0.02);
     if (!atmo.pipelineHandlesShake) this.syncLightsFromScene();
     this.contactsThisFrame = 0;
+    this.rayBudget = WALL_RAYS_PER_FRAME;
     this.decayLoad(_simDt);
     this.updateEmitters(now, _simDt);
     this.updateProjectiles(now);
@@ -1020,5 +1155,6 @@ export class FxSystem implements System, FxApi {
     this.root.removeFromParent();
     this.solidRoot.removeFromParent();
     if (this.atmo.fxRoot === this.root) this.atmo.fxRoot = null;
+    if (this.atmo.beforeFx === this.sortForView) this.atmo.beforeFx = null;
   }
 }
