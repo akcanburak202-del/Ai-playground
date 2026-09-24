@@ -83,6 +83,26 @@ const PANEL_MAX_SPEED = 80;
 const CANTILEVER_FACTOR = 10;
 /** Largest span between two supports, in element thicknesses (RC slab span/depth ≈ 35) */
 const SPAN_FACTOR = 35;
+/**
+ * Specific charge that shatters an unreinforced stone or concrete block with an untamped contact
+ * charge, kg TNT per m³ of block. Boulder breaking by mudcapping (a surface charge under a mud
+ * tamp) takes ≈ 1.5–2.3 kg/m³ (FM 5-250, "Explosives and Demolitions", 1992, boulder-breaking
+ * table: 2 lb for a 3 ft boulder, 6 lb for a 5 ft one); an untamped charge needs about twice
+ * that (its tamping factor). Estimate; below it a block keeps its crater and shrinks its hull.
+ */
+const SHATTER_CHARGE = 3.5;
+/** Fragments thrown by a shattering contact charge are capped at this speed, m/s. */
+const SHATTER_MAX_SPEED = 30;
+/**
+ * Local breach / spall of a wall by a stand-off burst. The contact thresholds of
+ * BlastLoad.contactDamage (T_b, T_s ∝ W^⅓) fall with the scaled stand-off Z = R/W^⅓ and vanish
+ * beyond LOCAL_SPALL_Z (spall) and LOCAL_BREACH_Z (breach), m/kg^⅓: a linear fall, fitted by eye
+ * to the spall and breach threshold curves of McVay (1988, WES TR SL-88-22) as reproduced in
+ * UFC 3-340-02 (2008) §4-15/§4-16 (spall of ~0.3 W^⅓ walls out to Z ≈ 2 ft/lb^⅓, breach only
+ * close in). Estimate. A wall at stand-off Z is treated as a contact wall of thickness t / s(Z).
+ */
+const LOCAL_SPALL_Z = 1.6;
+const LOCAL_BREACH_Z = 0.6;
 
 const REBAR = MATERIALS.rebar_b500;
 const UP = new THREE.Vector3(0, 1, 0);
@@ -1467,6 +1487,13 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       this.realiseContact(load, s, inward, thickness, cd, seed);
       this.lastImpact.copy(s);
       this.blastAxis = inward;
+      // A loose unreinforced block (a column drum, a fallen chunk) under a contact charge above
+      // the shattering specific charge breaks up whole; its fragments leave in the queue's steps.
+      const vol = this.grid.solidVolume();
+      if (this.dynamic && !this.rebar && vol > 0 && W / vol >= SHATTER_CHARGE && this.jobCount === 0) {
+        this.doomed = true;
+        this.queueFracture(this.shatter(load, Math.min(12, Math.max(4, Math.round((3 * W) / (SHATTER_CHARGE * vol))))));
+      }
     } else {
       thickness = this.blastPatches(load, c, seed);
       this.lastImpact.copy(near ? near.point : c);
@@ -1546,7 +1573,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       const sel = this.coneSelection(rear, a.clone().negate(), cd.spallRadius, cd.spallDepth, seed);
       this.throwSelection(sel, (Math.PI * cd.spallRadius * cd.spallRadius * cd.spallDepth) / 3, a, Math.max(3, cd.spallVelocity), s, seed + 1);
     }
-    this.carver.cone(s.x, s.y, s.z, a.x, a.y, a.z, Rc * 1.05, Math.max(h, cd.craterDepth), { lobe: 0.22 * Rc, lobeScale: 0.5 * Rc + h, grain: 0.8 * h, seed });
+    // (A stand-off burst below the crushing strength of the face leaves no front crater.)
+    if (cd.craterDepth > 0) this.carver.cone(s.x, s.y, s.z, a.x, a.y, a.z, Rc * 1.05, Math.max(h, cd.craterDepth), { lobe: 0.22 * Rc, lobeScale: 0.5 * Rc + h, grain: 0.8 * h, seed });
     if (cd.breach && cd.breachRadius > 0) {
       const Rb = cd.breachRadius;
       this.carver.cylinder(s.x - a.x * 0.05, s.y - a.y * 0.05, s.z - a.z * 0.05, a.x, a.y, a.z, t + 0.15, Rb, { lobe: 0.22 * Rb, lobeScale: 0.45 * Rb + h, grain: 0.8 * h, seed: seed + 2 });
@@ -1602,6 +1630,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     // element within tens of metres). The nearest point is taken on the element's own (oriented)
     // material box: the world AABB of a rotated wall reaches metres closer to the charge than
     // the wall does.
+    // Close-in: local breach / rear scab of the nearest face (independent of the flexural number).
+    this.localStandoff(load, c, seed);
     const member = this.memberInfo();
     const near = this.nearestBoxPoint(c, new THREE.Vector3());
     const facing = new THREE.Vector3().copy(load.center).sub(near);
@@ -1756,6 +1786,61 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       this.ctx.fx.dust({ position: cw, radius: 0.6, amount: Math.min(5, st.removed * 30), color: this.material.dustColor });
     }
     return tN ? tSum / tN : this.shape.thickness;
+  }
+
+  /**
+   * Local effects of a stand-off burst on the face nearest to it (brittle members): rear-face
+   * scabbing and, close in, a breach, from the contact thresholds of BlastLoad.contactDamage
+   * reduced with the scaled stand-off (see LOCAL_SPALL_Z). The front face craters only where the
+   * reflected pressure exceeds the dynamic compressive strength, DIF 1.25 (UFC 3-340-02 table 4-1,
+   * concrete in compression, close-in design). Returns true when it carved.
+   */
+  private localStandoff(load: BlastLoad, c: THREE.Vector3, seed: number): boolean {
+    if (this.material.class !== 'brittle') return false;
+    const w3 = Math.cbrt(Math.max(1e-3, load.tntKg));
+    const nearW = this.nearestBoxPoint(c, new THREE.Vector3());
+    const R0 = nearW.distanceTo(load.center);
+    if (R0 < 0.25 || R0 / w3 >= LOCAL_SPALL_Z) return false;
+    const g = this.grid, h = g.h;
+    const dir = this.toLocal(nearW, new THREE.Vector3()).sub(c);
+    const L = dir.length();
+    if (L < 1e-6) return false;
+    dir.divideScalar(L);
+    if (!traceRay(g, this.sampleBox, null, c.x, c.y, c.z, dir.x, dir.y, dir.z, L + 0.5, _hit)) return false;
+    const sp = new THREE.Vector3(_hit.x, _hit.y, _hit.z);
+    const inward = new THREE.Vector3(-_hit.nx, -_hit.ny, -_hit.nz);
+    if (inward.dot(dir) < 0.3) return false;
+    const R = sp.distanceTo(c), Z = R / w3;
+    const sS = 1 - Z / LOCAL_SPALL_Z;
+    if (sS <= 0) return false;
+    _runs.length = 0;
+    probeRun(g, null, sp.x, sp.y, sp.z, inward.x, inward.y, inward.z, 6, _runs);
+    const t = _runs.length ? Math.max(h, _runs[_runs.length - 1]!.end) : this.shape.thickness;
+    const at = load.contactDamage(this.material, t);
+    const cs = load.contactDamage(this.material, t / sS);
+    const sB = 1 - Z / LOCAL_BREACH_Z;
+    const cb = sB > 0 ? load.contactDamage(this.material, t / sB) : null;
+    const breach = cb?.breach ?? false;
+    if (!breach && !(cs.spallRadius > 0)) return false;
+    const ws = this.toWorld(sp.x, sp.y, sp.z, new THREE.Vector3());
+    const wn = this.toWorldDir(-inward.x, -inward.y, -inward.z, new THREE.Vector3());
+    const crush = load.reflectedPressureAt(ws, wn) >= 1.25 * this.material.compressiveStrength;
+    // Depth fraction of the contact scab law, f = 1 − t_eff/T_s, read back from its radius.
+    const f = cs.craterRadius > 0 ? Math.min(1, Math.max(0, (cs.spallRadius / cs.craterRadius - 1.2) / 0.8)) : 0;
+    const cd: ContactDamage = {
+      craterRadius: crush ? at.craterRadius * sS : 0,
+      craterDepth: crush ? at.craterDepth * sS * sS : 0,
+      breach,
+      breachRadius: breach ? cb!.breachRadius * sB : 0,
+      // The scab shrinks with the stand-off as well (it vanishes at the threshold).
+      spallRadius: Math.min(cs.spallRadius * sS, 3 * t),
+      spallDepth: breach ? t : Math.min(0.6 * t, t * (0.2 + 0.4 * f)),
+      spallVelocity: cs.spallVelocity,
+    };
+    const before = this.carver.stats.removed;
+    this.realiseContact(load, sp, inward, t, cd, seed + 0.5);
+    this.lastImpact.copy(sp);
+    return this.carver.stats.removed > before;
   }
 
   /**
@@ -2333,6 +2418,9 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     });
     this.stats.lastCheckMs = performance.now() - t0;
     if (islands.length) this.release(islands);
+    // A loose block that lost a large share of its material without coming apart (a crater in a
+    // column drum) stands on the hull of what is left, not on its design shape.
+    else if (this.dynamic) this.rebuildHull();
     if (!this.disposed && anchored && this.jobCount === 0 && !this.checkCrushing()) this.checkOverturning();
   }
 
@@ -2553,10 +2641,47 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   }
 
   /**
+   * Shatter this whole (dynamic, unreinforced) block under a contact charge: n fragments, the
+   * smaller ones near the charge (seeds biased to lastImpact), each thrown away from the charge at
+   * the rigid-plastic speed of its own mass under the reflected impulse, v = i_r / (ρ a) with a
+   * its size (momentum balance, as for blown-out wall slabs; Baker et al. 1983, ch. 6), capped.
+   */
+  private *shatter(load: BlastLoad, n: number): FractureWork {
+    const g = this.grid, conn = this.conn;
+    this.refreshOccupancy();
+    const cells: number[] = [];
+    let samples = 0;
+    const min: [number, number, number] = [Infinity, Infinity, Infinity], max: [number, number, number] = [-1, -1, -1];
+    for (let c = 0; c < conn.n; c++) {
+      if (!conn.count[c]) continue;
+      cells.push(c);
+      samples += conn.count[c]!;
+      const I = c % conn.nx, J = Math.floor(c / conn.nx) % conn.ny, K = Math.floor(c / (conn.nx * conn.ny));
+      if (I < min[0]) min[0] = I; if (J < min[1]) min[1] = J; if (K < min[2]) min[2] = K;
+      if (I > max[0]) max[0] = I; if (J > max[1]) max[1] = J; if (K > max[2]) max[2] = K;
+    }
+    if (!cells.length) return;
+    const rho = this.material.density;
+    const wp = new THREE.Vector3(), away = new THREE.Vector3();
+    const velocity = (p: Piece, out: THREE.Vector3) => {
+      out.set(0, 0, 0);
+      this.toWorld(p.seed[0], p.seed[1], p.seed[2], wp);
+      away.copy(wp).sub(load.center);
+      const d = away.length();
+      if (d < 1e-6) return;
+      away.divideScalar(d);
+      const a = Math.max(g.h, Math.cbrt(p.volume));
+      const ir = load.reflectedImpulseAt(wp, _s.copy(away).negate());
+      out.copy(away).multiplyScalar(Math.min(SHATTER_MAX_SPEED, ir / (rho * a)));
+    };
+    yield* this.releaseWhole({ cells, samples, min, max }, n, velocity);
+  }
+
+  /**
    * Break this whole (dynamic) piece into n fragments: the split runs over steps on the piece's
    * own grid (its mesh and hull stand in meanwhile), then all fragments replace it at once.
    */
-  private *releaseWhole(island: Island, n: number): FractureWork {
+  private *releaseWhole(island: Island, n: number, velocity: (p: Piece, out: THREE.Vector3) => void = (_p, o) => o.set(0, 0, 0)): FractureWork {
     const g = this.grid, conn = this.conn, F = conn.F;
     const mask = new Uint8Array(conn.n);
     for (const c of island.cells) mask[c] = 1;
@@ -2579,7 +2704,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     yield* splitSteps(g, sel, seeds, 0.5 * g.h, 0.25 * cellLen, this.eventSeed++, out, false);
     if (this.disposed) return;
     const pieces = out.pieces;
-    const made = this.spawnPieces(pieces, (_p, o) => o.set(0, 0, 0), barOwner, 0.8, RUBBLE_MIN_SIZE);
+    const made = this.spawnPieces(pieces, velocity, barOwner, 0.8, RUBBLE_MIN_SIZE);
     // The fragments replace this body in the same step (they start inside its hull).
     this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: this.bounds.getCenter(new THREE.Vector3()), volume: vol, pieces: made, material: this.material });
     this.fail('severed');

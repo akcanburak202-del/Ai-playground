@@ -10,6 +10,19 @@ Ekranda görülen her sayı (krater derinliği, delinme sınırı, kalıntı hı
 mühendislik modellerinden hesaplanır; gösteri için şişirilmez. Modellerin ayrıntısı
 [PHYSICS.md](PHYSICS.md), mimari ve modül sözleşmeleri [DESIGN.md](DESIGN.md) dosyasındadır.
 
+- **Canlı sürüm (tarayıcıda, kurulum gerektirmez):** https://claude.ai/artifact/G3U1EdvY8rtM4rHK8n2Bty
+  (bağlantı sahibine özeldir; paylaşım ayarı sayfanın Paylaş menüsündendir)
+
+| | |
+| --- | --- |
+| ![Işık Kilisesi](docs/chapel.jpg) | ![Barselona Pavyonu](docs/pavilion.jpg) |
+| 100 atım 5,56 mm: krater derinleşir, donatı açığa çıkar | Temas patlaması: gedikte eğilmiş donatı kafesi |
+| ![Tüfek krateri](docs/rifle-crater.jpg) | ![Donatılı gedik](docs/rebar-breach.jpg) |
+| 120 mm HESH, ikinci vuruş: göçük yırtıldı | Tambur kırıldı, sütun basamaklara devrildi |
+| ![Yırtılan HEB 300](docs/steel-hesh.jpg) | ![Devrilen sütun](docs/temple-topple.jpg) |
+
+![Kule yıkımı: zemin kat kolonlarındaki şarjlardan 1,5 s sonra](docs/tower-collapse.jpg)
+
 > Bu klasör, depodaki yapay zekâ karşılaştırma deneylerinin bir parçasıdır ve Claude tarafından
 > yazılmıştır. Üç boyutlu model, doku, ses kaydı ya da hazır varlık kullanılmaz: geometri, dokular
 > ve seslerin tamamı kodla üretilir.
@@ -103,6 +116,8 @@ buildings lose their supports and collapse progressively. Every number comes fro
 engineering model (NDRC/Kennedy, Lambert–Jonas, Recht–Ipson, Lanz–Odermatt, Tate,
 Kingery–Bulmash, Gurney/Mott) — see [PHYSICS.md](PHYSICS.md); architecture and module contracts
 are in [DESIGN.md](DESIGN.md).
+
+Live build (runs in the browser): https://claude.ai/artifact/G3U1EdvY8rtM4rHK8n2Bty
 
 Stack: TypeScript, Three.js r186 (WebGL2 + post-processing), Rapier 3D (WASM rigid bodies), Vite.
 Everything visual and audible is generated procedurally; no asset files.

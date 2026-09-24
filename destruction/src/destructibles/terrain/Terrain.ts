@@ -106,6 +106,22 @@ const SKIRT = 0.3;
 const GRID_VERTS = (TILE + 1) * (TILE + 1);
 const TILE_VERTS = GRID_VERTS + 4 * (TILE + 1);
 
+/**
+ * Safety net under the ground. A Rapier height field is a sheet of triangles with no thickness: a
+ * fast piece without CCD crosses it within one step once its penetration exceeds what the solver
+ * can push back (a 20 m/s drum moves 0.33 m per 1/60 s step) and then falls for ever. A thick fixed
+ * slab under the whole detailed field (its top UNDER_GAP below the deepest crater floor, never
+ * above UNDER_TOP_MAX) catches it, and a periodic scan lifts any dynamic body whose centre of mass
+ * lies more than RESCUE_DEPTH under the surface back onto it, at rest.
+ */
+const UNDER_THICK = 20;
+const UNDER_GAP = 1;
+const UNDER_TOP_MAX = -3;
+const RESCUE_DEPTH = 0.5;
+/** Scan the awake bodies every this many physics steps, and every body (sleeping too) every RESCUE_ALL. */
+const RESCUE_EVERY = 4;
+const RESCUE_ALL = 60;
+
 /** Grid index of the k-th vertex along tile edge e (0: j = 0, 1: j = TILE, 2: i = 0, 3: i = TILE). */
 function edgeVertex(e: number, k: number): number {
   const s = TILE + 1;
@@ -134,6 +150,11 @@ export class Terrain implements Destructible {
   private owner: PhysicsOwner;
   private body: RAPIER.RigidBody | null = null;
   private outer: RAPIER.Collider[] = [];
+  private under: RAPIER.Collider | null = null;
+  private underTop = 0;
+  private steps = 0;
+  /** Bodies lifted back out of the ground so far (telemetry, QA) */
+  rescued = 0;
   private tiles: Tile[] = [];
   private tilesPerSide: number;
   /** One shared index buffer per LOD step (identical tile topology) */
@@ -567,6 +588,46 @@ export class Terrain implements Destructible {
     this.flushTiles();
     // A scene load replaces the Rapier world: rebuild our bodies in the new one.
     if (this.physicsWorld !== this.ctx.physics.world) this.buildPhysics();
+    const k = ++this.steps;
+    if (k % RESCUE_EVERY === 0) this.rescue(k % RESCUE_ALL === 0);
+  }
+
+  /**
+   * Lift dynamic bodies that got under the ground (tunnelled through the height field, or were
+   * spawned overlapping it) back onto the surface with their motion cleared. Bodies are collected
+   * first and moved after the iteration (no Rapier mutation inside its own callbacks).
+   */
+  private rescue(all: boolean): void {
+    const phys = this.ctx.physics;
+    if (phys.failed || !this.body || this.physicsWorld !== phys.world) return;
+    const h = this.size / 2;
+    const sunk: { b: RAPIER.RigidBody; x: number; y: number; z: number; g: number }[] = [];
+    const visit = (b: RAPIER.RigidBody): void => {
+      if (!b.isDynamic()) return;
+      const c = b.worldCom();
+      if (Math.abs(c.x) > h || Math.abs(c.z) > h) return;
+      const g = this.heightAt(c.x, c.z);
+      if (c.y < g - RESCUE_DEPTH) sunk.push({ b, x: c.x, y: c.y, z: c.z, g });
+    };
+    if (all) phys.world.forEachRigidBody(visit);
+    else phys.world.forEachActiveRigidBody(visit);
+    for (const s of sunk) {
+      const t = s.b.translation();
+      // Centre of mass half the piece's height (plus 5 cm) over the surface: it settles from there.
+      const lift = s.g + this.halfHeightOf(s.b) + 0.05 - s.y;
+      s.b.setTranslation({ x: t.x, y: t.y + lift, z: t.z }, true);
+      s.b.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      s.b.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      this.rescued++;
+    }
+  }
+
+  /** Half the vertical extent of a body, from its owner's bounds when it has them (else 0.15 m). */
+  private halfHeightOf(b: RAPIER.RigidBody): number {
+    const d = b.numColliders() > 0 ? this.ctx.physics.ownerOf(b.collider(0))?.destructible : undefined;
+    if (!d || d === this || d.bounds.isEmpty()) return 0.15;
+    const hy = (d.bounds.max.y - d.bounds.min.y) / 2;
+    return Number.isFinite(hy) ? Math.min(Math.max(hy, 0.05), 8) : 0.15;
   }
 
   // ─── Meshes and physics ──────────────────────────────────────────────────────────────────
@@ -589,7 +650,10 @@ export class Terrain implements Destructible {
       t.scarred = true;
       t.err = null;
     }
-    if (any) this.updateBounds();
+    if (!any) return;
+    this.updateBounds();
+    // A crater deeper than the safety slab allows: lower the slab under the new floor.
+    if (this.field.minH - UNDER_GAP < this.underTop - 1e-3) this.buildUnder();
   }
 
   private tileNearPlaza(i0: number, j0: number): boolean {
@@ -706,6 +770,8 @@ export class Terrain implements Destructible {
       t.collider = null;
       this.rebuildCollider(t);
     }
+    this.under = null;
+    this.buildUnder();
     // Flat ground around the detailed square (four slabs, top at y = 0).
     const h = this.size / 2, d = this.detail / 2, th = 2;
     const R = phys.R;
@@ -721,6 +787,18 @@ export class Terrain implements Destructible {
       const cd = R.ColliderDesc.cuboid(hx, th, hz).setTranslation(x, -th, z).setFriction(0.9);
       this.outer.push(phys.attachCollider(this.body, cd.setCollisionGroups(GROUPS_STATIC), this.owner));
     }
+  }
+
+  /** The thick slab under the detailed field (see UNDER_THICK). */
+  private buildUnder(): void {
+    const phys = this.ctx.physics;
+    if (!this.body || this.physicsWorld !== phys.world) return;
+    if (this.under) phys.removeCollider(this.under);
+    const top = Math.min(UNDER_TOP_MAX, this.field.minH - UNDER_GAP);
+    const d = this.detail / 2 + 1, th = UNDER_THICK / 2;
+    const cd = phys.R.ColliderDesc.cuboid(d, th, d).setTranslation(0, top - th, 0).setFriction(0.9).setCollisionGroups(GROUPS_STATIC);
+    this.under = phys.attachCollider(this.body, cd, this.owner);
+    this.underTop = top;
   }
 
   private rebuildCollider(t: Tile): void {

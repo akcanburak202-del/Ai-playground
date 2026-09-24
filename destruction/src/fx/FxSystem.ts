@@ -17,6 +17,7 @@ import { createFireAtlas, createSmokeAtlas } from './textures.ts';
 import { createFireMaterial, createSmokeMaterial, createSparkMaterial } from './shaders.ts';
 import { landingTime, motionAt, type MotionState } from './motion.ts';
 import { groundOf } from './ground.ts';
+import { heightOfBurstFactors } from '../destructibles/terrain/crater.ts';
 
 /** Particle budgets (≈ 20 k total, see DESIGN.md §5). */
 export const BUDGET = { smoke: 9000, fire: 2500, sparks: 5000, chips: 3500, tracers: 384 };
@@ -71,6 +72,30 @@ export function fractureDustRadius(volume: number, pieces: number): number {
   return Math.min(1.6, Math.max(0.15, R / 2.5));
 }
 
+/**
+ * Dust of a structure coming apart (debris landing, members crushing, pieces breaking off): at most
+ * COLLAPSE_DUST_RATE puffs per second of simulated time, in bursts of up to COLLAPSE_DUST_BURST
+ * (a token bucket). A progressive collapse makes thousands of contacts; each raising its own
+ * cloud buried the tower in a 20 m wall of dust within half a second, whereas footage of
+ * building demolitions shows the frame coming down for seconds before the cloud from the
+ * pulverised floors rolls out along the ground and engulfs the base.
+ */
+const COLLAPSE_DUST_RATE = 70;
+const COLLAPSE_DUST_BURST = 90;
+/** Collapse dust within this distance (m) and time (s) of an earlier puff merges into it. */
+const COLLAPSE_MERGE_R = 1.6;
+const COLLAPSE_MERGE_T = 0.35;
+/** Above this height over the ground (m) collapse dust is drawn as thin, short-lived wisps. */
+const COLLAPSE_LOW = 2.5;
+
+/** Shape of an emitDust cloud: opacity scale, launch-speed scales and gravity-scale range. */
+interface DustStyle { opacity: number; horiz: number; vert: number; gLo: number; gHi: number }
+const DUST_BILLOW: DustStyle = { opacity: 1, horiz: 1, vert: 0.6, gLo: -0.02, gHi: 0.01 };
+/** Ground-level collapse dust: rolls outward along the ground, barely rises, thins as it spreads. */
+const DUST_GROUND: DustStyle = { opacity: 0.55, horiz: 1.7, vert: 0.12, gLo: 0.0, gHi: 0.015 };
+/** Dust of members breaking in the air: faint wisps that trail down with the debris. */
+const DUST_WISP: DustStyle = { opacity: 0.4, horiz: 0.7, vert: 0.25, gLo: 0.03, gHi: 0.08 };
+
 interface Emitter { x: number; y: number; z: number; radius: number; until: number; color: number; rise: number; acc: number; rate: number }
 interface Mark { t: number; x: number; y: number; z: number; bits: number }
 const MARK_CHIPS = 1, MARK_DUST = 2, MARK_SPARKS = 4;
@@ -116,6 +141,10 @@ export class FxSystem implements System, FxApi {
   private markHead = 0;
   private trails = new Map<number, { x: number; y: number; z: number; alive: boolean }>();
   private contactsThisFrame = 0;
+  private collapseTokens = COLLAPSE_DUST_BURST;
+  private collapseClock = 0;
+  private recentDust: { x: number; y: number; z: number; t: number }[] = [];
+  private recentHead = 0;
   /**
    * Particles emitted recently per pool, decaying with the pool's particle life: an estimate of
    * how many are alive. A GAU-8 (65 rounds/s of 30 mm) would otherwise cycle the chip ring in under
@@ -223,7 +252,9 @@ export class FxSystem implements System, FxApi {
   dust(o: Parameters<FxApi['dust']>[0]): void {
     this.mark(o.position, MARK_DUST);
     const n = this.thin('smoke', Math.min(24, 2 + o.amount * 3));
-    this.emitDust(o.position, o.velocity ?? null, o.radius, n, o.color, 1);
+    // Puffs spread to ≈ 2.5 r: past r ≈ 2 m one call would stand a 10 m cloud in the air (a
+    // released roof slab asked for r = 6 m); larger sources should call again at other points.
+    this.emitDust(o.position, o.velocity ?? null, Math.min(2, o.radius), n, o.color, 1);
   }
 
   sparks(o: Parameters<FxApi['sparks']>[0]): void {
@@ -315,7 +346,7 @@ export class FxSystem implements System, FxApi {
   // ─── Primitive emitters ──────────────────────────────────────────────────────────────────
 
   /** Billowing dust puffs of a given colour (sRGB hex), rising slightly and drifting. */
-  emitDust(p: THREE.Vector3, vel: THREE.Vector3 | null, radius: number, count: number, color: number, lifeScale: number, t0 = this.now): void {
+  emitDust(p: THREE.Vector3, vel: THREE.Vector3 | null, radius: number, count: number, color: number, lifeScale: number, t0 = this.now, style: DustStyle = DUST_BILLOW): void {
     const P = this.P;
     const rng = this.rng;
     _c.setHex(color);
@@ -329,14 +360,14 @@ export class FxSystem implements System, FxApi {
       P.x = p.x + _u.x + (vel?.x ?? 0) * off; P.y = p.y + _u.y + (vel?.y ?? 0) * off; P.z = p.z + _u.z + (vel?.z ?? 0) * off;
       rng.onSphere(_d);
       const sp = rng.range(0.3, 1.2) * Math.sqrt(r) * 2.2;
-      P.vx = (vel?.x ?? 0) * rng.range(0.4, 1.1) + _d.x * sp;
-      P.vy = (vel?.y ?? 0) * rng.range(0.4, 1.1) + Math.abs(_d.y) * sp * 0.6;
-      P.vz = (vel?.z ?? 0) * rng.range(0.4, 1.1) + _d.z * sp;
+      P.vx = (vel?.x ?? 0) * rng.range(0.4, 1.1) + _d.x * sp * style.horiz;
+      P.vy = (vel?.y ?? 0) * rng.range(0.4, 1.1) + Math.abs(_d.y) * sp * style.vert;
+      P.vz = (vel?.z ?? 0) * rng.range(0.4, 1.1) + _d.z * sp * style.horiz;
       P.t0 = t0 + rng.range(0, 0.04);
       P.life = rng.range(3, 7) * lifeScale * (0.6 + 0.4 * Math.sqrt(r));
       // Dust relaxes to the air quickly (τ ≈ 0.3–0.6 s for a turbulent puff), then barely settles.
       P.drag = rng.range(1.8, 3.2);
-      P.gravity = rng.range(-0.02, 0.01);
+      P.gravity = rng.range(style.gLo, style.gHi);
       P.floor = -1e4; P.tLand = -1;
       P.size0 = r * rng.range(0.4, 0.8);
       P.size1 = r * rng.range(1.6, 2.6);
@@ -344,10 +375,39 @@ export class FxSystem implements System, FxApi {
       P.spin = rng.range(-0.4, 0.4);
       const shade = rng.range(0.85, 1.08);
       P.r = _c.r * shade; P.g = _c.g * shade; P.b = _c.b * shade;
-      P.opacity = rng.range(0.55, 0.85);
+      P.opacity = rng.range(0.55, 0.85) * style.opacity;
       P.seed = rng.next(); P.variant = rng.chance(0.7) ? rng.int(8, 16) : rng.int(0, 8); P.heat = 0; P.extra = 1;
       this.smokeLayer.emit(P);
     }
+  }
+
+  /**
+   * Dust of a structure coming apart, through the collapse budget (see COLLAPSE_DUST_RATE): puffs
+   * near the ground become a low cloud rolling outward, puffs higher up faint wisps (radius
+   * capped at 1 m / 0.5 m), and puffs close to a recent one merge into it.
+   */
+  private collapseDust(p: THREE.Vector3, vel: THREE.Vector3 | null, radius: number, count: number, color: number): void {
+    const now = this.now;
+    const dt = now - this.collapseClock;
+    this.collapseClock = now;
+    if (dt > 0) this.collapseTokens = Math.min(COLLAPSE_DUST_BURST, this.collapseTokens + dt * COLLAPSE_DUST_RATE);
+    for (const d of this.recentDust) {
+      if (Math.abs(now - d.t) > COLLAPSE_MERGE_T) continue;
+      const dx = d.x - p.x, dy = d.y - p.y, dz = d.z - p.z;
+      if (dx * dx + dy * dy + dz * dz < COLLAPSE_MERGE_R * COLLAPSE_MERGE_R) return;
+    }
+    const low = p.y - groundOf(this.ctx.scene).heightAt(p.x, p.z) < COLLAPSE_LOW;
+    const n = Math.min(this.thin('smoke', low ? count : Math.min(3, count)), Math.floor(this.collapseTokens));
+    if (n <= 0) return;
+    this.collapseTokens -= n;
+    if (this.recentDust.length < 24) this.recentDust.push({ x: p.x, y: p.y, z: p.z, t: now });
+    else {
+      const d = this.recentDust[this.recentHead]!;
+      d.x = p.x; d.y = p.y; d.z = p.z; d.t = now;
+      this.recentHead = (this.recentHead + 1) % 24;
+    }
+    if (low) this.emitDust(p, vel, Math.min(1, radius), n, color, 1.1, now, DUST_GROUND);
+    else this.emitDust(p, vel, Math.min(0.5, radius), n, color, 0.45, now, DUST_WISP);
   }
 
   /**
@@ -829,8 +889,11 @@ export class FxSystem implements System, FxApi {
 
     // 3) Near the ground: the dust cloud is what dominates a surface burst after ~0.2 s.
     if (nearGround) {
-      // Crater ejecta dust thrown up in a cone, hanging as a brown-grey cloud.
-      const nCol = Math.round(Math.min(120, 24 + 30 * w3));
+      // Crater ejecta dust thrown up in a cone, hanging as a brown-grey cloud — in proportion to
+      // the crater the burst digs (the terrain's height-of-burst factor: none above ≈ 0.6 m/kg^⅓,
+      // Cooper 1996); a charge on a column 1 m over the paving only sweeps up surface dust.
+      const dig = heightOfBurstFactors(hob, W).radius;
+      const nCol = Math.round(Math.min(120, 24 + 30 * w3) * (0.15 + 0.85 * dig));
       for (let i = 0; i < nCol; i++) {
         rng.inCone(UP, 0.6, _d);
         const v = rng.range(4, 14) * sw;
@@ -892,7 +955,11 @@ export class FxSystem implements System, FxApi {
     const size = Math.cbrt(V);
     if (!(done & MARK_DUST) && e.material.class !== 'ductile') {
       const r = fractureDustRadius(V, Math.max(1, e.pieces));
-      this.emitDust(e.position, e.direction ? _v.copy(e.direction).multiplyScalar(1.5) : null, r, Math.round(Math.min(18, 3 + 6 * r)), e.material.dustColor, 1);
+      const n = Math.round(Math.min(18, 3 + 6 * r));
+      // A piece driven off by a hit or a blast (it has a direction) billows where it broke; pieces
+      // breaking in a collapse raise collapse dust.
+      if (e.direction) this.emitDust(e.position, _v.copy(e.direction).multiplyScalar(1.5), r, n, e.material.dustColor, 1);
+      else this.collapseDust(e.position, null, r, n, e.material.dustColor);
     }
     if (!(done & MARK_CHIPS)) this.emitChips(e.position, e.direction ?? UP, 1.2, 5, Math.min(60, 8 + e.volume * 60), Math.min(0.05, 0.015 + size * 0.02), e.material.color, e.material.class === 'ductile' ? 'metal' : 'stone');
   }
@@ -905,9 +972,18 @@ export class FxSystem implements System, FxApi {
       this.emitSparks(e.position, UP, Math.min(30, 4 + e.impulse * 0.5), 3, 0, 1.2, 0.004, 1, 1.5);
       return;
     }
-    // Dust in proportion to the impact impulse of the landing piece.
-    const amount = Math.min(10, 2 + Math.sqrt(e.impulse) * 0.6);
-    this.emitDust(e.position, null, Math.max(0.1, e.size * 0.8), Math.round(amount), m.dustColor, 0.8);
+    // Dust in proportion to the impact: fines crushed off the contact corners grow with the energy
+    // dissipated there, so the puff radius goes as J^⅓ (J = m·Δv, N·s: 0.2 m at 3 N·s, 0.9 m at
+    // 400 N·s — an engineering fit to footage, not a model). Never larger than the piece itself
+    // (its `size`); a steel member's `size` is its length, and steel raises no dust of its own —
+    // only the ground it lands on does.
+    const r = Math.min(0.9, Math.max(0.12, 0.12 * Math.cbrt(e.impulse)));
+    const amount = Math.round(Math.min(6, 1 + Math.sqrt(e.impulse) * 0.25));
+    if (m.class !== 'ductile') this.collapseDust(e.position, null, Math.min(r, Math.max(0.12, e.size * 0.8)), amount, m.dustColor);
+    else {
+      const g = groundOf(this.ctx.scene);
+      if (e.position.y - g.heightAt(e.position.x, e.position.z) < 0.6) this.collapseDust(e.position, null, r, amount, g.dustColorAt(e.position.x, e.position.z));
+    }
     if (e.impulse > 20) this.emitChips(e.position, UP, 1.2, 3, Math.min(20, e.impulse * 0.2), Math.min(0.03, e.size * 0.08), m.color, m.class === 'ductile' ? 'metal' : 'stone');
     if (m.sparks && m.class === 'ductile' && e.impulse > 50) this.emitSparks(e.position, UP, 6, 12, 1400, 1.3, 0.0006, 0, 0.3);
   }
@@ -915,7 +991,9 @@ export class FxSystem implements System, FxApi {
   private onShatter(e: ShatterEvent): void {
     const n = Math.min(300, 30 + e.area * 60);
     this.emitSparks(e.position, UP, n, 5, 0, Math.PI * 0.9, 0.004, 1, 3);
-    this.emitDust(e.position, null, Math.max(0.2, Math.sqrt(e.area) * 0.5), 5, 0xe9f1f1, 0.7);
+    // Breaking glass makes glitter, not a cloud: a faint wisp of fines (≤ 0.6 m) that falls with the
+    // shards (a 10 m² curtain-wall pane had stood a 4 m white billow at the top of the tower).
+    this.emitDust(e.position, null, Math.min(0.6, Math.max(0.2, Math.sqrt(e.area) * 0.3)), 3, 0xe9f1f1, 0.6, this.now, DUST_WISP);
   }
 
   private onStructuralFailure(e: StructuralFailureEvent): void {
@@ -926,7 +1004,7 @@ export class FxSystem implements System, FxApi {
     if (e.cause !== 'crushing' || (e.material && e.material.class !== 'brittle')) return;
     if (this.marked(e.position) & MARK_DUST) return;
     const r = fractureDustRadius(Math.min(1, e.mass / 2400 / 20), 12);
-    this.emitDust(e.position, null, r, Math.round(Math.min(12, 3 + 6 * r)), e.material?.dustColor ?? 0xbdb7ac, 1);
+    this.collapseDust(e.position, null, r, Math.round(Math.min(12, 3 + 6 * r)), e.material?.dustColor ?? 0xbdb7ac);
   }
 
   // ─── Per frame ───────────────────────────────────────────────────────────────────────────
@@ -1133,6 +1211,10 @@ export class FxSystem implements System, FxApi {
     this.shock.clear();
     this.emitters.length = 0;
     this.marks.length = 0;
+    this.recentDust.length = 0;
+    this.recentHead = 0;
+    this.collapseTokens = COLLAPSE_DUST_BURST;
+    this.collapseClock = this.now;
     this.trails.clear();
     this.shaker.reset();
     this.tracers.begin();

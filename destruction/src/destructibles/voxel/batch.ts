@@ -138,7 +138,10 @@ export class GrowingBatch {
     const m = this.mesh;
     if (m.instanceCount >= m.maxInstanceCount) m.setInstanceCount(m.maxInstanceCount * 2);
     if (m.unusedVertexCount >= rv && m.unusedIndexCount >= ri) return;
-    if (this.freeV > 0 || this.freeI > 0) {
+    // Repack only when it wins back a good share of the batch: optimize() copies every geometry
+    // (O(batch)), and doing it for each new piece whose slot outgrew its proxy made a frame that
+    // swapped 30 wall slabs from proxy to mesh quadratic in the batch size. Growing doubles.
+    if (this.freeV >= this.capV / 4 || this.freeI >= this.capI / 4) {
       m.optimize();
       this.freeV = this.freeI = 0;
       if (m.unusedVertexCount >= rv && m.unusedIndexCount >= ri) return;
