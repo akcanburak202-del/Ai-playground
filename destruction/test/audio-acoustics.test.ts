@@ -5,7 +5,7 @@ import {
   receivedSpl, shockArrivalAfterPassing, splFromPressure, splToGain, blastScale,
 } from '../src/audio/acoustics.ts';
 import { beamFrequencies, buildModes, contactWeight, plateFrequencies, renderModes, t60FromLoss } from '../src/audio/modal.ts';
-import { brownNoise, grainTexture, nWave, outdoorImpulse, pinkNoise, reflectionsFor, rotaryLoop, whiteNoise } from '../src/audio/buffers.ts';
+import { addReflections, brownNoise, diffuseTail, grainTexture, nWave, outdoorImpulse, pinkNoise, reflectionSignature, reflectionsFor, rotaryLoop, stereoEnergy, whiteNoise } from '../src/audio/buffers.ts';
 import { muzzleEnergy, reportProfile } from '../src/audio/profiles.ts';
 import { MATERIALS } from '../src/physics/materials.ts';
 import { Rng } from '../src/core/rng.ts';
@@ -151,4 +151,28 @@ test('noise, textures, N-wave, rotary loop and reverb are finite and well-formed
   for (let i = k; i < k + 200; i++) local += L[i]! ** 2;
   for (let i = k - 400; i < k - 200; i++) before += L[i]! ** 2;
   assert.ok(local > before, 'slap-back arrives at 2d/c');
+});
+
+test('reverb rebuilds as the listener moves: ground bounce from height, cached tail, exact normalisation', () => {
+  // Image source: a listener h metres up hears its own report off the ground after 2h / c.
+  const low = reflectionsFor([{ distance: Infinity, pan: 0 }], 220, 2.2)[0]!;
+  const high = reflectionsFor([{ distance: Infinity, pan: 0 }], 220, 60)[0]!;
+  assert.equal(low.path, 2.2);
+  near(low.gain, 0.55, 1e-9);
+  assert.equal(high.path, 60);
+  assert.ok(high.gain < low.gain / 4, 'a distant ground answers weaker');
+  // The signature ignores small moves and changes with a new street or a climb.
+  assert.equal(reflectionSignature([20, 31, Infinity], 1.6), reflectionSignature([21, 30.5, Infinity], 1.9));
+  assert.notEqual(reflectionSignature([20, 31, Infinity], 1.6), reflectionSignature([20, 31, 12], 1.6));
+  assert.notEqual(reflectionSignature([20, 31, Infinity], 1.6), reflectionSignature([20, 31, Infinity], 30));
+  // Tail + reflections, normalised by the tracked energy, equals a full normalisation pass.
+  const rng = new Rng(3);
+  const [tl, tr] = diffuseTail(48000, rng, { duration: 1, rt60Low: 2, rt60High: 0.8, tail: 0.2 });
+  const L = tl.slice(), R = tr.slice();
+  const E = stereoEnergy(tl, tr) + addReflections(L, R, 48000, rng, reflectionsFor([{ distance: 15, pan: 0.5 }, { distance: 40, pan: -1 }]));
+  near(E, stereoEnergy(L, R), 1e-6 * E);
+  // The tail decays by RT60: −60 dB after rt60Low for the low band (checked on the envelope of 50 ms windows).
+  const win = (from: number) => { let e = 0; for (let i = from; i < from + 2400; i++) e += tl[i]! ** 2; return e; };
+  const drop = 10 * Math.log10(win(2400) / win(2400 + 19200));
+  near(drop, 60 * (0.4 / 2), 6, 'dB lost over 0.4 s at RT60 = 2 s');
 });

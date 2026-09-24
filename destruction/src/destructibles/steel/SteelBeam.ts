@@ -815,11 +815,10 @@ export class SteelBeam implements Destructible, Structural {
       this.detail.boreHeat(pu, v, (1.35 * r) / per, (1.35 * r) / L, Math.min(1450, qWall / (P.rho * P.c * 1e-3)), time, 1e-3, diffusivity(P));
       this.detail.scar(pu, v, (2.2 * r) / per, (2.2 * r) / L, 0.9, seed);
     } else {
-      // Local dent of the struck plate (flange / web / wall) — the crater, and a wider plastic
-      // dent for heavy rounds (plate bending over the damage radius).
+      // Local dent of the struck plate (flange / web / wall): the crater, and for heavy rounds a
+      // dish of the whole panel (below).
       const rc = Math.max(e.craterRadius, 0.6 * d);
       const depth = Math.max(e.craterDepth, e.outcome === 'embed' ? e.depth : 0);
-      const pl = this.section.plates[c.plate]!;
       this.detail.dimple(pu, v, rc / per, rc / L, Math.min(1, depth / Math.max(0.005, this.maxPlateT())));
       this.detail.scar(pu, v, (1.8 * rc) / per, (1.8 * rc) / L, 1, seed);
       // The momentum the round leaves in the plate dishes the panel it struck: Nurick & Martin's
@@ -959,7 +958,8 @@ export class SteelBeam implements Destructible, Structural {
     }
     patch.hits++;
     patch.R = Math.max(patch.R, R);
-    patch.dish = accumulateDish(patch.dish, add);
+    // A dish deeper than its own radius is no longer a dish but a hole (tearing takes over).
+    patch.dish = Math.min(patch.R, accumulateDish(patch.dish, add));
     const eps = dishStrain(patch.dish, patch.R);
     const dEps = Math.max(0, eps - patch.strain);
     patch.strain = Math.max(patch.strain, eps);

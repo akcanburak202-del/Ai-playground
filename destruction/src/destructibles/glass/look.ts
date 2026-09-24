@@ -316,6 +316,46 @@ mat4 shardMatrix() {
 #endif
 `;
 
+/**
+ * A local reflection probe as the glass reflection pass sees it (set by probes.ts): a cube capture
+ * of the surroundings with box-filtered mips, used in place of the scene environment when `on`.
+ */
+export interface ProbeUniforms {
+  [k: string]: THREE.IUniform;
+  uProbe: THREE.IUniform<THREE.Texture | null>;
+  uProbeOn: THREE.IUniform<number>;
+  /** Mip level of the 1×1 faces (log2 of the face size) */
+  uProbeMaxLod: THREE.IUniform<number>;
+}
+
+/** The probe uniforms of a glass reflection material, if it is one. */
+export function probeUniforms(m: THREE.Material): ProbeUniforms | null {
+  return (m.userData.glassProbe as ProbeUniforms | undefined) ?? null;
+}
+
+/**
+ * Image-based light from the probe instead of three's (PMREM) environment. A mirror reads the base
+ * level; rough spots (frost, cracks) read the mip whose texel spans the GGX lobe: the reflected lobe
+ * is ≈ 2α wide (α = r², Walter et al. 2007) and a texel of mip m of a face of N px spans
+ * (π/2)·2^m/N rad, so m = log2(2α N / (π/2)) — box-filtered mips instead of three's 256-sample GGX
+ * prefilter, which cost more than the capture itself. Irradiance (frosted glass scatters it) from
+ * the 1×1 face averages: E = π L̄.
+ */
+const PROBE_IBL = /* glsl */ `
+#if defined( RE_IndirectSpecular )
+if ( uProbeOn > 0.5 ) {
+  vec3 gR = reflect( - geometryViewDir, geometryNormal );
+  gR = normalize( mix( gR, geometryNormal, pow4( material.roughness ) ) );
+  gR = transformDirectionByInverseViewMatrix( gR, viewMatrix );
+  float gFace = exp2( uProbeMaxLod );
+  float gLod = clamp( log2( max( 2.0 * pow2( material.roughness ) * gFace / 1.5707963, 1e-6 ) ), 0.0, uProbeMaxLod );
+  radiance = textureLod( uProbe, gR, gLod ).rgb;
+  vec3 gN = transformDirectionByInverseViewMatrix( geometryNormal, viewMatrix );
+  iblIrradiance = PI * textureLod( uProbe, gN, uProbeMaxLod ).rgb;
+}
+#endif
+`;
+
 export interface GlassPassOptions {
   shards?: boolean;
   shardTex?: THREE.IUniform<THREE.Texture | null>;
@@ -349,8 +389,10 @@ export function createReflectionMaterial(u: GlassUniforms, o: GlassPassOptions =
   m.name = o.shards ? 'glass-shard-reflection' : 'glass-reflection';
   if (o.shards) m.defines = { GLASS_SHARDS: '' };
   const shardU = o.shardTex ?? { value: null };
+  const probe: ProbeUniforms = { uProbe: { value: null }, uProbeOn: { value: 0 }, uProbeMaxLod: { value: 8 } };
+  m.userData.glassProbe = probe;
   m.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, u);
+    Object.assign(shader.uniforms, u, probe);
     shader.uniforms.uShardTex = shardU;
     shader.uniforms.uShardMode = { value: o.shards ? 1 : 0 };
     shader.vertexShader = shader.vertexShader
@@ -372,7 +414,8 @@ export function createReflectionMaterial(u: GlassUniforms, o: GlassPassOptions =
         vObjView = transpose(gRot) * (cameraPosition - (modelMatrix * vec4(transformed, 1.0)).xyz);`,
       );
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\nvarying vec2 vGlassUv;\nvarying float vRim;\nvarying vec3 vObjView;\nuniform float uShardMode;\n${DICING_GLSL}`)
+      .replace('#include <common>', `#include <common>\nvarying vec2 vGlassUv;\nvarying float vRim;\nvarying vec3 vObjView;\nuniform float uShardMode;\nuniform samplerCube uProbe;\nuniform float uProbeOn;\nuniform float uProbeMaxLod;\n${DICING_GLSL}`)
+      .replace('#include <lights_fragment_maps>', `#include <lights_fragment_maps>\n${PROBE_IBL}`)
       .replace(
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>

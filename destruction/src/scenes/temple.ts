@@ -9,9 +9,10 @@ import { COLLAPSE_BUDGET, Site } from './kit.ts';
 
 /**
  * Dor Tapınağı — a Doric marble temple after the Parthenon's proportions, reduced to a 4 × 6
- * peristyle: a three-step crepidoma, fluted columns of stacked drums with entasis and cushion
- * capitals, architrave and frieze-and-cornice blocks spanning column to column, triangular
- * pediments front and back, and a cella of marble ashlar.
+ * peristyle: a three-step crepidoma, fluted columns of stacked drums with entasis, capitals of a
+ * convex echinus under a square abacus, architrave and frieze-and-cornice blocks spanning column to
+ * column, triglyphs, mutules with guttae under the cornice, triangular pediments front and back,
+ * and a cella of marble ashlar.
  *
  * Classical masonry is dry: nothing but weight and friction holds it. So everything above the
  * stylobate is a rigid body at rest (asleep until disturbed) — a hard hit topples drums, a lost
@@ -86,12 +87,11 @@ export const temple: SceneDef = {
         shapes.set(drum, drumShape((rBot + rTop) / 2, dh));
         loose.push(drum);
       }
-      // Capital: the echinus, a straight-profiled cushion flaring from the neck (a tapered
-      // cylinder turned upside down), under the square abacus.
+      // Capital: the echinus, a convex cushion flaring from the neck, under the square abacus.
       const neck = r0 * (1 - taper), rEch = 0.95 * (ABA / 2);
       const ech = site.voxel({
-        name: `Ekinus ${n + 1}`, ...marble, shape: { type: 'cylinder', radius: rEch, height: ECH_H, taper: 1 - neck / rEch },
-        position: [x, base + shaftH + ECH_H / 2, z], rotation: [Math.PI, 0, 0], voxelSize: 0.03, dynamic: true,
+        name: `Ekinus ${n + 1}`, ...marble, shape: echinusShape(neck, rEch, ECH_H),
+        position: [x, base + shaftH + ECH_H / 2, z], voxelSize: 0.025, dynamic: true,
       }, box(x, base + shaftH, z, rEch, base + shaftH + ECH_H));
       shapes.set(ech, drumShape((neck + rEch) / 2, ECH_H));
       const aba = site.box(`Abaküs ${n + 1}`, { ...marble, size: [ABA, ABA_H, ABA], at: [x, base + shaftH + ECH_H + ABA_H / 2, z], voxel: 0.03, dynamic: true });
@@ -127,7 +127,7 @@ export const temple: SceneDef = {
     };
     course('Arşitrav', top, ARCH_H, 0);
     const frieze = course('Friz', top + ARCH_H, FRIEZE_H, 0);
-    course('Korniş', top + ARCH_H + FRIEZE_H, CORNICE_H, CORNICE_OUT);
+    const cornice = course('Korniş', top + ARCH_H + FRIEZE_H, CORNICE_H, CORNICE_OUT);
     // Pediments on the front and back cornices.
     const pedW = 2 * (ax + hd + CORNICE_OUT), pedH = pedW * 0.13;
     for (const z of [-az, az]) {
@@ -143,6 +143,7 @@ export const temple: SceneDef = {
     site.budget(COLLAPSE_BUDGET + loose.length);
     keepStonesLive(site, loose);
     triglyphs(site, frieze, ax, az, top + ARCH_H);
+    mutules(site, cornice, ax, az, top + ARCH_H + FRIEZE_H);
 
     site.time('decor', () => {
       site.decor.trees({ inner: 70, outer: 260, count: 240, seed: 23, mix: [0.55, 0.2, 0.25], groves: 12, groveRadius: 14 });
@@ -284,26 +285,19 @@ function trueBeds(ctx: SimContext, shapes: Map<Destructible, ShapeFn>): void {
  * The standing stones are architecture, not rubble: keep them out of the rigid-body budget. Once a
  * collapse goes over budget the physics world freezes (makes fixed) the oldest sleeping bodies,
  * and the colonnade — built first, asleep — would be first in line: a frozen drum no longer
- * topples when hit, and hangs in the air when the drum under it is shot away. A stone the budget
- * freezes is made dynamic again and put back to sleep; the world has already dropped it from its
- * budget list, so it is never picked again and the next sleeping rubble is frozen instead.
+ * topples when hit, and hangs in the air when the drum under it is shot away. Exempt bodies still
+ * count towards the budget (the scene raises it by the number of stones), they are just never the
+ * ones frozen. A stone that loses enough material rebuilds its hull as a new body and is rubble
+ * from then on.
  */
 function keepStonesLive(site: Site, loose: Destructible[]): void {
   const phys = site.ctx.physics;
   const stones = new Set(loose);
-  const handles = new Set<number>();
   phys.world.forEachRigidBody((b) => {
     if (!b.isDynamic() || b.numColliders() === 0) return;
     const el = phys.ownerOf(b.collider(0))?.destructible;
-    if (el && stones.has(el)) handles.add(b.handle);
+    if (el && stones.has(el)) phys.exemptFromBudget(b);
   });
-  const off = phys.onFrozen((b) => {
-    if (!handles.delete(b.handle)) return;
-    b.setBodyType(phys.R.RigidBodyType.Dynamic, false);
-    b.sleep();
-  });
-  // Unsubscribed with the rest of the scene's dressing when the world is cleared.
-  site.decor.track({ dispose: off });
 }
 
 /**
@@ -336,6 +330,86 @@ function settle(ctx: SimContext, loose: Destructible[], seconds: number): void {
     b.setLinvel({ x: 0, y: 0, z: 0 }, false);
     b.setAngvel({ x: 0, y: 0, z: 0 }, false);
     b.sleep();
+  }
+}
+
+/**
+ * Doric echinus as a solid of revolution: radius r(u) = r_n + (r_e − r_n)·(1 − (1 − u)^p) from the
+ * neck (u = 0) to the abacus (u = 1). The classical profile leaves the annulets at ≈ 45–50° and
+ * curls up to meet the abacus nearly vertically (Parthenon: Penrose, "An Investigation of the
+ * Principles of Athenian Architecture", 1888, pl. on the capitals); p = 1.7 gives that convex
+ * cushion (a straight cone would be p = 1). The radial distance is divided by √(1 + r′²) so the
+ * field stays a distance near the surface.
+ */
+function echinusShape(rn: number, re: number, h: number): { type: 'sdf'; bounds: [number, number, number]; sdf: (x: number, y: number, z: number) => number } {
+  const p = 1.7, dr = re - rn;
+  const sdf = (x: number, y: number, z: number) => {
+    const u = Math.min(1, Math.max(0, y / h + 0.5));
+    const q = Math.pow(1 - u, p - 1);
+    const r = rn + dr * (1 - q * (1 - u));
+    const slope = (dr * p * q) / h;
+    const radial = (Math.hypot(x, z) - r) / Math.sqrt(1 + slope * slope);
+    return Math.max(radial, Math.abs(y) - h / 2);
+  };
+  return { type: 'sdf', bounds: [2 * re + 0.02, h, 2 * re + 0.02], sdf };
+}
+
+/**
+ * Mutules under the cornice soffit: a thin plaque over every triglyph and every metope, each with
+ * three rows of six guttae (the stone "pegs" of the timber prototype), carried by the cornice
+ * block above them. Vitruvius IV.3; proportions after the Parthenon (mutule ≈ triglyph width,
+ * guttae ≈ 1/25 of the module across).
+ */
+function mutules(site: Site, cornice: Destructible[], ax: number, az: number, y0: number): void {
+  // Plaques from just outside the triglyphs to just inside the cornice's drip edge.
+  const hd = ENT_D / 2, W = 0.4, T = 0.035, from = 0.04, depth = CORNICE_OUT - 0.06, gr = 0.016, gh = 0.03;
+  const mat = site.decor.track(new THREE.MeshStandardMaterial({ color: 0xe8dcc4, roughness: 0.62 }));
+  const per = new Map<Destructible, THREE.BufferGeometry[]>();
+  const peg = new THREE.CylinderGeometry(gr, gr * 0.85, gh, 6, 1, false).deleteAttribute('uv');
+  const plaque = new THREE.BoxGeometry(1, 1, 1).deleteAttribute('uv');
+  // (x, z) on the frieze face, outward normal (nx, nz).
+  const put = (x: number, z: number, nx: number, nz: number) => {
+    const ox = x + nx * (from + depth / 2), oz = z + nz * (from + depth / 2);
+    const el = cornice.find((b) => {
+      const bb = site.boxOf(b);
+      return ox >= bb.min.x - 1e-3 && ox <= bb.max.x + 1e-3 && oz >= bb.min.z - 1e-3 && oz <= bb.max.z + 1e-3;
+    });
+    if (!el) return;
+    const list = per.get(el) ?? [];
+    const sx = nx !== 0 ? depth : W, sz = nz !== 0 ? depth : W;
+    list.push(plaque.clone().scale(sx, T, sz).translate(ox, y0 - T / 2, oz));
+    for (let a = 0; a < 3; a++)
+      for (let b = 0; b < 6; b++) {
+        const out = from + (a + 0.5) * (depth / 3), side = -W / 2 + (b + 0.5) * (W / 6);
+        const gx = x + nx * out + (nz !== 0 ? side : 0), gz = z + nz * out + (nx !== 0 ? side : 0);
+        list.push(peg.clone().translate(gx, y0 - T - gh / 2, gz));
+      }
+    per.set(el, list);
+  };
+  // Over every triglyph (column axes, mid-bays, pushed out to the corners) and every metope between.
+  const along = (a: number, n: number) => {
+    const tri: number[] = [];
+    for (let i = 0; i <= 2 * n; i++) tri.push(-a + (i * a) / n);
+    tri[0] = -a - hd + 0.21;
+    tri[tri.length - 1] = a + hd - 0.21;
+    const out = [...tri];
+    for (let i = 0; i + 1 < tri.length; i++) out.push((tri[i]! + tri[i + 1]!) / 2);
+    return out;
+  };
+  for (const x of along(ax, NX - 1)) for (const z of [-1, 1]) put(x, z * (az + hd), 0, z);
+  for (const z of along(az, NZ - 1)) for (const x of [-1, 1]) put(x * (ax + hd), z, x, 0);
+  peg.dispose();
+  plaque.dispose();
+  for (const [el, geos] of per) {
+    const g = mergeGeometries(geos, false);
+    for (const q of geos) q.dispose();
+    if (!g) continue;
+    el.root.updateMatrixWorld(true);
+    g.applyMatrix4(new THREE.Matrix4().copy(el.root.matrixWorld).invert());
+    const m = new THREE.Mesh(site.decor.track(g), mat);
+    m.castShadow = m.receiveShadow = true;
+    m.name = 'mutules';
+    el.root.add(m);
   }
 }
 

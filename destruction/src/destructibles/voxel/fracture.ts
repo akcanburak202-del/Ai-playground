@@ -92,7 +92,10 @@ export function splitSelection(parent: VoxelGrid, sel: Selection, seeds: number[
   for (let q = 0; q < ns; q++) grids.push(new VoxelGrid(parent.layout()));
   const i0 = Math.max(0, sel.box[0]), j0 = Math.max(0, sel.box[1]), k0 = Math.max(0, sel.box[2]);
   const i1 = Math.min(parent.nx - 1, sel.box[3]), j1 = Math.min(parent.ny - 1, sel.box[4]), k1 = Math.min(parent.nz - 1, sel.box[5]);
-  const fw = 1 / 0.18;
+  // Warp feature size grows with its amplitude (≈ 3× the displacement), so a strongly warped cut
+  // meanders instead of zig-zagging: a fixed 0.18 m-scale sine warp of ±0.36 m (a released roof,
+  // warp = 0.25·cell) drew regular saw teeth along every slab edge.
+  const fw = 1 / Math.max(0.18, 3 * warp);
   const fg = 1 / (1.8 * h);
   const so = seedOffset * 13.1;
   const cm = sel.cells ?? null;
@@ -166,11 +169,11 @@ export function splitSelection(parent: VoxelGrid, sel: Selection, seeds: number[
                 }
                 if (db === Infinity) b = -1;
                 if (pass === 1 || ns < 2 || Math.sqrt(db) - Math.sqrt(da) > 2 * warp + 2 * h) break;
-                // Low-frequency warp of the cell boundaries (cheap nested sines, ~0.18 m wavelength).
+                // Low-frequency, aperiodic warp of the cell boundaries (gradient noise).
                 const u = x * fw + so, w = y * fw, e = z * fw - so;
-                px = x + warp * Math.sin(w * 1.3 + Math.sin(e * 1.7 + u * 0.6));
-                py = y + warp * Math.sin(e * 1.1 + Math.sin(u * 1.9 + w * 0.7));
-                pz = z + warp * Math.sin(u * 1.5 + Math.sin(w * 1.2 + e * 0.8));
+                px = x + 1.4 * warp * noise.noise3(u, w, e);
+                py = y + 1.4 * warp * noise.noise3(w + 31.7, e - 11.3, u + 5.1);
+                pz = z + 1.4 * warp * noise.noise3(e - 7.9, u + 19.3, w - 23.1);
               }
               let v = take;
               let nearCut = false;

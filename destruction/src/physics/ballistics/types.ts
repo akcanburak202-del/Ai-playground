@@ -237,7 +237,15 @@ export interface BlastLoad {
    * `thickness` made of `material` (glass panes, walls, slabs): < 1 no damage, 1 onset of cracking
    * / pane failure, ≥ 2 severe damage / breach. Built from P–I diagram asymptotes.
    */
-  damageAt(p: THREE.Vector3, n: THREE.Vector3, material: MaterialProps, thickness: number): number;
+  damageAt(p: THREE.Vector3, n: THREE.Vector3, material: MaterialProps, thickness: number, member?: MemberInfo): number;
+}
+
+/** Optional description of the loaded member for pressure–impulse damage (defaults: 0.3 % steel per face, 3 m span). */
+export interface MemberInfo {
+  /** Reinforcement ratio per face (A_s / (b·d)), e.g. 0.003 */
+  reinforcementRatio?: number;
+  /** Clear span of the member in the direction it bends, m */
+  span?: number;
 }
 
 export interface ContactDamage {

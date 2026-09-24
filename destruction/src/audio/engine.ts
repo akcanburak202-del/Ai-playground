@@ -1,7 +1,7 @@
 import { Rng } from '../core/rng.ts';
 import { MATERIALS, type MaterialProps } from '../physics/materials.ts';
 import {
-  brownNoise, grainTexture, nWave, outdoorImpulse, pinkNoise, reflectionsFor, rotaryLoop, whiteNoise, type Reflection,
+  addReflections, brownNoise, diffuseTail, grainTexture, nWave, pinkNoise, reflectionsFor, rotaryLoop, stereoEnergy, whiteNoise, type Reflection,
 } from './buffers.ts';
 import { beamFrequencies, buildModes, plateFrequencies, renderModes } from './modal.ts';
 
@@ -247,13 +247,23 @@ export class AudioEngine {
   readonly compressor: DynamicsCompressorNode;
   readonly limiter: DynamicsCompressorNode;
   readonly clipper: WaveShaperNode;
-  readonly reverb: ConvolverNode;
   readonly reverbIn: GainNode;
   readonly reverbOut: GainNode;
   readonly buses: Bus[] = [];
   readonly stats = { started: 0, dropped: 0, stolen: 0 };
   private volume = 0.9;
   private muted = false;
+  /**
+   * Two convolvers for the outdoor reverb: a new impulse response goes into the idle one, which
+   * then cross-fades in (a convolver's buffer cannot be swapped under sound without a click).
+   * Only the active one is fed, so the reverb costs one convolution except during a fade.
+   */
+  private readonly convolvers: ConvolverNode[] = [];
+  private readonly wet: GainNode[] = [];
+  private active = 0;
+  private fadeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Cached diffuse reverb tail for the current reverberation times */
+  private tail: { key: string; L: Float32Array; R: Float32Array; energy: number } | null = null;
 
   constructor(ac: BaseAudioContext, o: EngineOptions = {}) {
     this.ac = ac;
@@ -286,11 +296,19 @@ export class AudioEngine {
     this.master.connect(this.slowLp).connect(this.compressor).connect(this.limiter).connect(this.clipper).connect(o.destination ?? ac.destination);
 
     this.reverbIn = ac.createGain();
-    this.reverb = ac.createConvolver();
-    this.reverb.normalize = false;
     this.reverbOut = ac.createGain();
     this.reverbOut.gain.value = 0.55;
-    this.reverbIn.connect(this.reverb).connect(this.reverbOut).connect(this.master);
+    this.reverbOut.connect(this.master);
+    for (let i = 0; i < 2; i++) {
+      const c = ac.createConvolver();
+      c.normalize = false;
+      const g = ac.createGain();
+      g.gain.value = i === 0 ? 1 : 0;
+      c.connect(g).connect(this.reverbOut);
+      this.convolvers.push(c);
+      this.wet.push(g);
+    }
+    this.reverbIn.connect(this.convolvers[0]!);
     this.setReflections(reflectionsFor([{ distance: 40, pan: -0.6 }, { distance: 65, pan: 0.7 }, { distance: Infinity, pan: 0 }]));
 
     const n = o.voices ?? 48;
@@ -308,13 +326,69 @@ export class AudioEngine {
     return n;
   }
 
-  /** Regenerate the reverb impulse response for a new set of façade reflections. */
-  setReflections(reflections: Reflection[], rt60Low = 2.2, rt60High = 0.9): void {
-    const [L, R] = outdoorImpulse(this.ac.sampleRate, this.rng, { duration: 2.8, rt60Low, rt60High, reflections, tail: 0.18 });
-    const b = this.ac.createBuffer(2, L.length, this.ac.sampleRate);
-    b.getChannelData(0).set(L);
-    b.getChannelData(1).set(R);
-    this.reverb.buffer = b;
+  /** The convolver currently carrying the reverb. */
+  get reverb(): ConvolverNode {
+    return this.convolvers[this.active]!;
+  }
+
+  /**
+   * Regenerate the reverb impulse response for a new set of façade reflections. With `fade` > 0
+   * the new response cross-fades in over that many seconds (while sound may be playing).
+   */
+  setReflections(reflections: Reflection[], rt60Low = 2.2, rt60High = 0.9, fade = 0): void {
+    // The diffuse tail depends only on the reverberation times: computed once, then each rebuild
+    // adds the façade reflections to a copy and normalises (unit energy) through the wet gain
+    // (≈ 1 ms instead of ≈ 10 ms for the whole response).
+    const key = `${rt60Low}|${rt60High}`;
+    if (this.tail?.key !== key) {
+      const [tl, tr] = diffuseTail(this.ac.sampleRate, this.rng, { duration: 2.8, rt60Low, rt60High, tail: 0.18 });
+      this.tail = { key, L: tl, R: tr, energy: stereoEnergy(tl, tr) };
+    }
+    const b = this.ac.createBuffer(2, this.tail.L.length, this.ac.sampleRate);
+    const L = b.getChannelData(0), R = b.getChannelData(1);
+    L.set(this.tail.L);
+    R.set(this.tail.R);
+    const energy = this.tail.energy + addReflections(L, R, this.ac.sampleRate, this.rng, reflections);
+    const norm = energy > 0 ? 1 / Math.sqrt(energy / 2) : 1;
+    const cur = this.convolvers[this.active]!;
+    if (!(fade > 0) || !cur.buffer) {
+      cur.buffer = b;
+      const g = this.wet[this.active]!.gain;
+      g.cancelScheduledValues(this.now);
+      g.setValueAtTime(norm, this.now);
+      return;
+    }
+    const nextI = 1 - this.active;
+    const next = this.convolvers[nextI]!;
+    if (this.fadeTimer !== null) {
+      clearTimeout(this.fadeTimer);
+      this.fadeTimer = null;
+    }
+    try {
+      this.reverbIn.disconnect(next);
+    } catch {
+      /* was not connected */
+    }
+    next.buffer = b;
+    this.reverbIn.connect(next);
+    const now = this.now;
+    const gIn = this.wet[nextI]!.gain, gOut = this.wet[this.active]!.gain;
+    gIn.cancelScheduledValues(now);
+    gIn.setValueAtTime(0, now);
+    gIn.linearRampToValueAtTime(norm, now + fade);
+    gOut.cancelScheduledValues(now);
+    gOut.setValueAtTime(gOut.value, now);
+    gOut.linearRampToValueAtTime(0, now + fade);
+    this.active = nextI;
+    // Stop feeding the old one once it is silent (its tail still rings out, at zero gain).
+    this.fadeTimer = setTimeout(() => {
+      this.fadeTimer = null;
+      try {
+        this.reverbIn.disconnect(cur);
+      } catch {
+        /* already disconnected */
+      }
+    }, (fade + 0.1) * 1000);
   }
 
   setMuted(m: boolean): void {
@@ -393,7 +467,10 @@ export class AudioEngine {
   }
 
   dispose(): void {
+    if (this.fadeTimer !== null) clearTimeout(this.fadeTimer);
+    this.fadeTimer = null;
     for (const b of this.buses) b.clear(this.now, false);
+    this.reverbIn.disconnect();
     this.master.disconnect();
     this.reverbOut.disconnect();
   }

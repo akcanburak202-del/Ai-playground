@@ -26,7 +26,7 @@ const SLIT = 0.18, CROSS_Y = 4.05;
 const SLICE_DEG = 15, SLICE_X0 = -4.5, SLICE_FROM = -11, SLICE_TO = 3, SLICE_H = 5.6;
 
 /** Golden-hour photography settings (see look.ts). */
-export const chapelLook: SceneLook = { sky: { turbidity: 3.4, rayleigh: 1.7 }, exposure: 0.9, ambient: 0.55, fov: 55, visibility: 7000, glassProbes: true };
+export const chapelLook: SceneLook = { sky: { turbidity: 3.4, rayleigh: 1.7 }, exposure: 0.9, fov: 55, visibility: 7000, glassProbes: true };
 
 export const chapel: SceneDef = {
   id: 'chapel',

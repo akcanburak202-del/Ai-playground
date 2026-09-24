@@ -42,7 +42,6 @@ export class WeaponController implements WeaponControllerApi, System {
   current: WeaponData;
   currentAmmo: AmmoSpec;
   roundsFired = 0;
-  cooldown = 0;
   aimPoint: THREE.Vector3 | null = null;
   /** Surface normal and target under the crosshair (charge placement) */
   aimNormal = new THREE.Vector3(0, 1, 0);
@@ -52,6 +51,17 @@ export class WeaponController implements WeaponControllerApi, System {
   private readonly rng: Rng;
   private trigger = false;
   private wasDown = false;
+  /**
+   * A press that has not fired yet: a single-shot weapon fires as soon as it is ready while the
+   * trigger stays held (a click during the last moments of a reload is not lost), and needs a new
+   * press for the next round.
+   */
+  private armed = false;
+  /**
+   * Reload / cycling time left per weapon, s. Each weapon keeps its own: switching from the tank
+   * gun to the RPG does not carry the gun's reload over, and a weapon reloads while holstered.
+   */
+  private readonly cooldowns = new Map<string, number>();
   /** Time until the next automatic round may fire, s (may go negative inside a step) */
   private nextShot = 0;
   private spin = 0;
@@ -82,6 +92,20 @@ export class WeaponController implements WeaponControllerApi, System {
     return this.chargeEvents;
   }
 
+  /** Seconds until the current weapon can fire again (its own reload / cycling). */
+  get cooldown(): number {
+    return this.cooldowns.get(this.current.id) ?? 0;
+  }
+
+  /** Trigger currently held (rotary guns spin while it is). */
+  get triggerDown(): boolean {
+    return this.trigger;
+  }
+
+  private setCooldown(seconds: number): void {
+    this.cooldowns.set(this.current.id, Math.max(0, seconds));
+  }
+
   select(weaponId: string): void {
     const w = getWeapon(weaponId);
     if (w === this.current) return;
@@ -89,7 +113,9 @@ export class WeaponController implements WeaponControllerApi, System {
     this.currentAmmo = this.ctx.ammo(w.ammo[0]!);
     this.nextShot = 0;
     this.spin = 0;
-    this.cooldown = Math.max(this.cooldown, 0.3);
+    // A press made with the previous weapon does not fire the new one.
+    this.armed = false;
+    this.wasDown = this.trigger;
   }
 
   setAmmo(ammoId: string): void {
@@ -105,6 +131,7 @@ export class WeaponController implements WeaponControllerApi, System {
 
   setTrigger(down: boolean): void {
     this.trigger = down;
+    if (!down) this.armed = false;
   }
 
   detonate(sequenceDelay = 0): void {
@@ -118,11 +145,12 @@ export class WeaponController implements WeaponControllerApi, System {
     this.chargeEvents = [];
     this.fuses = [];
     this.roundsFired = 0;
-    this.cooldown = 0;
+    this.cooldowns.clear();
     this.nextShot = 0;
     this.spin = 0;
     this.trigger = false;
     this.wasDown = false;
+    this.armed = false;
     this.aimPoint = null;
   }
 
@@ -137,20 +165,26 @@ export class WeaponController implements WeaponControllerApi, System {
     _right.normalize();
     _up.crossVectors(_right, _fwd);
     this.updateAim();
-    this.cooldown = Math.max(0, this.cooldown - dt);
+    // Every weapon's reload runs, held or holstered.
+    for (const [id, c] of this.cooldowns) if (c > 0) this.cooldowns.set(id, Math.max(0, c - dt));
     this.runFuses();
 
     const w = this.current;
-    const pressed = this.trigger && !this.wasDown;
+    if (this.trigger && !this.wasDown) this.armed = true;
     this.wasDown = this.trigger;
+    const ready = this.armed && this.cooldown <= 0;
     if (w.delivery === 'placed') {
-      if (pressed && this.cooldown <= 0) this.placeCharge();
+      if (ready) {
+        this.armed = false;
+        this.placeCharge();
+      }
       return;
     }
     if (w.delivery === 'indirect') {
-      if (pressed && this.cooldown <= 0 && this.aimPoint) {
+      if (ready && this.aimPoint) {
+        this.armed = false;
         this.callFire();
-        this.cooldown = (w.reloadTime ?? 10) * PLAY_RELOAD_SCALE;
+        this.setCooldown((w.reloadTime ?? 10) * PLAY_RELOAD_SCALE);
       }
       return;
     }
@@ -178,9 +212,10 @@ export class WeaponController implements WeaponControllerApi, System {
       this.nextShot -= dt;
       return;
     }
-    if (pressed && this.cooldown <= 0) {
+    if (ready) {
+      this.armed = false;
       this.fireRound(0);
-      this.cooldown = w.fireMode === 'semi' ? 60 / w.rpm : (w.reloadTime ?? 60 / w.rpm) * PLAY_RELOAD_SCALE;
+      this.setCooldown(w.fireMode === 'semi' ? 60 / w.rpm : (w.reloadTime ?? 60 / w.rpm) * PLAY_RELOAD_SCALE);
     }
   }
 
@@ -290,7 +325,7 @@ export class WeaponController implements WeaponControllerApi, System {
     };
     this.placed.push({ event, ammo, target: this.aimTarget, along });
     this.chargeEvents = [...this.chargeEvents, event];
-    this.cooldown = (w.reloadTime ?? 1) * PLAY_RELOAD_SCALE;
+    this.setCooldown((w.reloadTime ?? 1) * PLAY_RELOAD_SCALE);
     this.ctx.events.emit('chargePlaced', event);
   }
 

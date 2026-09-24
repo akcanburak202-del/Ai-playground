@@ -13,7 +13,9 @@ import {
   airAbsorptionCutoff, ballisticShock, closestApproach, dopplerFactor, impactLevelAt1m, propagationDelay, receivedSpl,
   shockArrivalAfterPassing, splFromPressure, splToGain,
 } from './acoustics.ts';
-import { reflectionsFor } from './buffers.ts';
+import { reflectionSignature, reflectionsFor } from './buffers.ts';
+import { groundOf } from '../fx/ground.ts';
+import { bridgeOf } from '../ui/bridge.ts';
 import { AudioEngine, type Spatial, type Voice } from './engine.ts';
 import { reportProfile, type ReportProfile } from './profiles.ts';
 import * as S from './synth.ts';
@@ -27,6 +29,12 @@ const FRAGMENT_SPACING = 0.035;
 const DEBRIS_SPACING = 0.018;
 const CRACK_SPACING = 0.02;
 const MAX_LOOPS = 6;
+/** Rebuild the reverb when the listener has moved this far from where it was last built, m */
+const REFLECT_MOVE = 18;
+/** …but not more often than this, s (a rebuild costs a few ms of main-thread time) */
+const REFLECT_MIN_INTERVAL = 2;
+/** Façade rays cast per frame while surveying the surroundings (8 in all) */
+const REFLECT_RAYS_PER_FRAME = 2;
 
 interface Track {
   id: number;
@@ -109,6 +117,17 @@ export class AudioSystem implements AudioApi, System {
   private frame = 0;
   /** Rebuild the reverb from the scene's façades on the next frame (scene load, unlock) */
   private reflectPending = true;
+  /** Where the reverb was last surveyed from, and when (performance.now, s) */
+  private readonly reflectAt = new THREE.Vector3(NaN, NaN, NaN);
+  private reflectTime = -Infinity;
+  private reflectSig = '';
+  /** A survey in progress: rays cast so far (spread over a few frames) */
+  private survey: { origin: THREE.Vector3; right: THREE.Vector3; walls: { distance: number; pan: number }[]; height: number; fade: number } | null = null;
+  /** Rotary gun: trigger state last frame, and the spin-up voice while the barrels come up to speed */
+  private triggerWas = false;
+  private spin: { weaponId: string; voice: Voice; heavy: boolean } | null = null;
+  /** Rebuilds of the reverb since start (for tests / stats) */
+  reverbBuilds = 0;
   private readonly onVisibility = () => this.syncRunning();
   private lastSmallBlast = -1;
   private suspended = false;
@@ -158,6 +177,7 @@ export class AudioSystem implements AudioApi, System {
         this.engine = new AudioEngine(this.ac, { seed: 20260924 });
         this.engine.setMuted(this.muted);
         this.reflectPending = true;
+        this.reflectSig = '';
       } catch (err) {
         console.warn('audio: Web Audio unavailable', err);
         this.ac = null;
@@ -194,6 +214,7 @@ export class AudioSystem implements AudioApi, System {
       loops: this.loops.size + (this.rotary ? 1 : 0),
       tracked: this.tracks.size,
       frameMs: this.frameMs,
+      reverbBuilds: this.reverbBuilds,
     };
   }
 
@@ -216,11 +237,9 @@ export class AudioSystem implements AudioApi, System {
     this.rate = Math.pow(scale, 0.3);
     if (this.ready) {
       this.followProjectiles();
+      this.updateTrigger();
       this.updateRotary();
-      if (this.reflectPending) {
-        this.reflectPending = false;
-        this.updateReflections();
-      }
+      this.updateReflections();
       if ((this.frame & 15) === 0) this.engine!.sweep();
     }
     this.simRef = this.ctx.time.now;
@@ -330,6 +349,11 @@ export class AudioSystem implements AudioApi, System {
       return;
     }
     if (this.rotary) this.endRotary();
+    // The barrels are up to speed: the firing loop takes over from the spin-up whine.
+    if (this.spin) {
+      engine.release(this.spin.voice, 0.06);
+      this.spin = null;
+    }
     const r = this.place(e.origin, 0.5);
     // A continuous stream of reports sums louder than one round: +3 dB.
     const gain = splToGain(receivedSpl(p.levelAt1m + 3, r));
@@ -340,6 +364,57 @@ export class AudioSystem implements AudioApi, System {
     const buffer = engine.bank.rotaryLoop(rot.rpm, rot.bodyTau);
     const handle = S.rotaryLoopVoice(v, { buffer, rpm: rot.rpm, lowpass: rot.lowpass, rate: this.scale });
     this.rotary = { weaponId: e.weapon.id, voice: v, handle, profile: p, lastShot: t, interval: 60 / rot.rpm, gau8: e.weapon.sound === 'gau8', scale: this.scale };
+  }
+
+  /**
+   * Rotary guns follow the trigger (WeaponControllerApi.triggerDown): pressing it spools the
+   * barrels up (a rising motor whine for the spin-up time before the first round), releasing it
+   * stops the burst at once and lets the drive spool down. Without a reported trigger state the
+   * loop ends when the rounds stop coming (updateRotary).
+   */
+  private updateTrigger(): void {
+    const wc = bridgeOf(this.sim).weapons;
+    const down = wc?.triggerDown;
+    if (!wc || down === undefined) return;
+    // A weapon change with the trigger held: the old gun's drive is not heard any more.
+    if (this.spin && this.spin.weaponId !== wc.current.id) {
+      this.engine!.release(this.spin.voice, 0.06);
+      this.spin = null;
+    }
+    const was = this.triggerWas;
+    this.triggerWas = down;
+    if (down === was) return;
+    const w = wc.current;
+    if (down) {
+      const p = reportProfile(w, wc.currentAmmo);
+      if (!p.rotary || this.rotary || this.spin) return;
+      const spinUp = (w as { spinUp?: number }).spinUp ?? 0.4;
+      const heavy = w.sound === 'gau8';
+      this.spatial.pan = 0;
+      this.spatial.cutoff = 12000;
+      this.spatial.dry = 1;
+      this.spatial.wet = 0.2;
+      const t = this.engine!.now + LOOKAHEAD;
+      // Durations in voice time (recipes divide by the slow-motion rate): real length spinUp / scale.
+      const d = Math.min(6, spinUp / this.scale) * this.rate;
+      const v = this.engine!.voice(PRIORITY.loop, t, d / this.rate + 1.5, this.spatial, 0.9, this.rate);
+      if (!v) return;
+      v.hold(t + S.spinUp(v, { duration: d, heavy }));
+      this.spin = { weaponId: w.id, voice: v, heavy };
+      return;
+    }
+    if (this.rotary) this.endRotary();
+    else if (this.spin) {
+      // Released before the first round: the whine stops and the drive spools down.
+      const s = this.spin;
+      this.spin = null;
+      this.engine!.release(s.voice, 0.08);
+      if (!s.heavy) {
+        const t = this.engine!.now + 0.02;
+        const v = this.engine!.voice(PRIORITY.shot, t, 1.5, this.spatial, 0.8, this.rate);
+        if (v) v.hold(t + S.spinDown(v));
+      }
+    }
   }
 
   private updateRotary(): void {
@@ -519,7 +594,8 @@ export class AudioSystem implements AudioApi, System {
     const t = this.timeFor(e.time, propagationDelay(r));
     const v = this.engine!.voice(PRIORITY.structure, t, 6, this.spatial, gain, this.rate);
     if (!v) return;
-    const steel = e.cause === 'buckling' || /steel|beam|girder|çelik|kiriş|truss/i.test(e.label);
+    // Steel members groan and shriek as they yield; masonry and concrete crack and rumble.
+    const steel = e.material ? e.material.class === 'ductile' : e.cause === 'buckling' || /steel|beam|girder|çelik|kiriş|kolon|truss/i.test(e.label);
     const fallTime = Math.sqrt((2 * Math.max(0.5, e.position.y)) / G);
     v.hold(v.t + S.structuralFailure(v, { mass: e.mass, steel, fallTime }));
   }
@@ -536,6 +612,8 @@ export class AudioSystem implements AudioApi, System {
     this.stopLoops();
     this.recycleTracks(true);
     this.reflectPending = true;
+    this.reflectSig = '';
+    this.survey = null;
   }
 
   // ─── Projectiles in flight ─────────────────────────────────────────────────────────────────
@@ -654,28 +732,53 @@ export class AudioSystem implements AudioApi, System {
     }
     this.loops.clear();
     this.rotary = null;
+    if (this.spin && this.engine) this.engine.release(this.spin.voice, 0.05);
+    this.spin = null;
   }
 
   // ─── Reverb from the surroundings ──────────────────────────────────────────────────────────
 
   /**
-   * Cast eight horizontal rays from the viewer's spawn point; façades that answer become discrete
-   * slap-back reflections in the impulse response. Once per scene: rebuilding the convolution
-   * buffer costs tens of milliseconds, too much to repeat while flying around.
+   * The outdoor reverb is built from the façades around the listener: eight horizontal rays, each
+   * façade that answers becomes a discrete slap-back reflection, plus the ground bounce from the
+   * listener's height. It is surveyed when the scene loads and again when the listener has moved
+   * far (REFLECT_MOVE), no more often than REFLECT_MIN_INTERVAL; the rays are spread over a few
+   * frames, and the impulse response is rebuilt (and cross-faded in) only when the coarse
+   * signature of distances and height changed.
    */
   private updateReflections(): void {
     const engine = this.engine;
     if (!engine) return;
-    const walls: { distance: number; pan: number }[] = [];
-    const o = _p.copy(this.listener);
-    o.y = Math.max(o.y, 1.2);
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2;
-      _d.set(Math.sin(a), 0, Math.cos(a));
-      const hit = this.ctx.registry.raycast(o, _d, 200);
-      walls.push({ distance: hit ? hit.distance : Infinity, pan: clamp(_d.dot(_right), -1, 1) });
+    const L = this.listener;
+    if (!this.survey) {
+      const nowS = performance.now() / 1000;
+      const dx = L.x - this.reflectAt.x, dz = L.z - this.reflectAt.z;
+      const moved = !(dx * dx + dz * dz < REFLECT_MOVE * REFLECT_MOVE);
+      if (!this.reflectPending && !(moved && nowS - this.reflectTime > REFLECT_MIN_INTERVAL)) return;
+      const ground = groundOf(this.ctx.scene).heightAt(L.x, L.z);
+      const height = Math.max(0.5, L.y - (Number.isFinite(ground) ? ground : 0));
+      // Façade rays from ear height, but never below 1.2 m (kerbs and pool edges are not façades).
+      const origin = L.clone();
+      origin.y = Math.max(L.y, (Number.isFinite(ground) ? ground : 0) + 1.2);
+      this.survey = { origin, right: _right.clone(), walls: [], height, fade: this.reflectPending ? 0 : 0.5 };
+      this.reflectPending = false;
+      this.reflectAt.copy(L);
+      this.reflectTime = nowS;
     }
-    engine.setReflections(reflectionsFor(walls));
+    const sv = this.survey;
+    for (let k = 0; k < REFLECT_RAYS_PER_FRAME && sv.walls.length < 8; k++) {
+      const a = (sv.walls.length / 8) * Math.PI * 2;
+      _d.set(Math.sin(a), 0, Math.cos(a));
+      const hit = this.ctx.registry.raycast(sv.origin, _d, 200);
+      sv.walls.push({ distance: hit ? hit.distance : Infinity, pan: clamp(_d.dot(sv.right), -1, 1) });
+    }
+    if (sv.walls.length < 8) return;
+    this.survey = null;
+    const sig = reflectionSignature(sv.walls.map((w) => w.distance), sv.height);
+    if (sig === this.reflectSig) return;
+    this.reflectSig = sig;
+    engine.setReflections(reflectionsFor(sv.walls, 220, 2 * sv.height), undefined, undefined, sv.fade);
+    this.reverbBuilds++;
   }
 }
 

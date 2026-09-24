@@ -62,8 +62,12 @@ export interface Destructible {
   /** Present when this element participates in the structural graph */
   readonly structural?: Structural;
 
-  /** Detailed ray test in world space. `dir` is normalised. Return the nearest entry within maxDist. */
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): RayHit | null;
+  /**
+   * Detailed ray test in world space. `dir` is normalised. Return the nearest entry within maxDist.
+   * `radius` is the projectile's radius (0 / omitted for a thin ray): a hole or gap narrower than
+   * it counts as solid, so a round cannot slip through a hole smaller than itself.
+   */
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, radius?: number): RayHit | null;
 
   /**
    * Walk the shot line from the entry point and report the first contiguous run of solid material

@@ -337,7 +337,21 @@ interface Penetrator {
   hard: number;
 }
 
+/**
+ * A thin-walled HE shell with a hardened nose cap (M908 HE-OR): against steel only the cap acts as
+ * a penetrator — the body behind it is a light case full of explosive that collapses on the face
+ * (it is designed to dig into concrete, where NDRC sees the whole round).
+ */
+function isCappedShell(a: AmmoData): boolean {
+  return (a.kind === 'he' || a.kind === 'hesh' || a.kind === 'thermobaric') && !!a.explosiveTNT && !!a.coreMass && !a.coreDiameter;
+}
+
 function penetrator(a: AmmoData, mass: number, length: number, onSteel: boolean): Penetrator {
+  if (onSteel && isCappedShell(a)) {
+    // The cap as a short cylinder of the calibre: L = m / (ρ π d²/4).
+    const m = Math.min(a.coreMass!, mass);
+    return { d: a.diameter, len: m / (a.coreDensity * Math.PI * 0.25 * a.diameter * a.diameter), mass: m, nose: a.noseFactor, hard: 1 };
+  }
   const hard = a.deformable ? clamp((a.coreMass ?? 0) / a.mass, 0, 1) : 1;
   // AP jackets strip on steel and the hard core does the work; ball rounds mushroom instead, so
   // they present at least their full calibre.
@@ -586,6 +600,8 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   // Lead-core ball that fails to perforate steel splashes (shatters) on the face.
   if (!st.perforated && a.kind === 'ball' && st.stoppedIn?.material.class === 'ductile' && st.stoppedIn === seg0) outcome = 'shatter';
   if (!st.perforated && a.kind === 'fragment' && mat.class === 'ductile' && speed > 600) outcome = 'shatter';
+  // A capped HE shell stopped by steel breaks up on the face and hands the plate all its momentum.
+  if (!st.perforated && isCappedShell(a) && st.stoppedIn?.material.class === 'ductile' && st.stoppedIn === seg0) outcome = 'shatter';
   ev.outcome = outcome;
 
   if (st.perforated) {
@@ -602,6 +618,12 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   ev.momentum.copy(dir).multiplyScalar(p.mass * speed);
   if (ev.residualDirection) ev.momentum.addScaledVector(ev.residualDirection, -ev.residualMass * ev.residualSpeed);
   if (outcome === 'shatter') ev.energyAbsorbed *= 0.4; // most of the energy leaves in the radial splash
+  if (mat.class === 'ductile' && isCappedShell(a)) {
+    // The plate works against the cap; the light body's energy goes into its own break-up (and
+    // its momentum, above, still reaches the plate).
+    const mc = Math.min(a.coreMass!, p.mass);
+    ev.energyAbsorbed = 0.5 * mc * (speed * speed - ev.residualSpeed * ev.residualSpeed);
+  }
 
   sizeCrater(ev, a, pen, mat, probe, st, speed, obliq);
   ev.summary = summaryFor(ev, name, st, runLen, probe);

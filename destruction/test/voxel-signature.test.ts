@@ -62,5 +62,6 @@ test('200+ rounds of 5.56 on one spot of a 25 cm RC wall', async () => {
   // ~250 rounds: holed through behind the bars.
   assert.ok(s250.through > 0 || stages[300]!.through > 0, 'no loophole after 300 rounds');
   // Generous bound: the suite often runs beside headless render jobs on a shared machine.
-  assert.ok(carveMs / shots < 3.0, `carve cost ${carveMs / shots} ms`);
+  // Wall-clock: only catch gross regressions (the suite often shares the machine with render jobs).
+  assert.ok(carveMs / shots < 12, `carve cost ${carveMs / shots} ms`);
 });

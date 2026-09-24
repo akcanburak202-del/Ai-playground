@@ -33,15 +33,18 @@ export class DestructibleRegistry {
     return this.items.length;
   }
 
-  /** Nearest hit along a ray (dir must be normalised). `ignore` skips one object (e.g. the one just exited). */
-  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, ignore?: Destructible): RayHit | null {
+  /**
+   * Nearest hit along a ray (dir must be normalised). `ignore` skips one object (e.g. the one just
+   * exited); `radius` is the projectile radius passed on to each destructible (see Destructible.raycast).
+   */
+  raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, ignore?: Destructible, radius?: number): RayHit | null {
     let best: RayHit | null = null;
     let bestDist = maxDist;
     for (const d of this.items) {
       if (d.disposed || d === ignore) continue;
       const entry = rayBoxEntry(d.bounds, origin, dir, bestDist);
       if (entry === Infinity || entry > bestDist) continue;
-      const hit = d.raycast(origin, dir, bestDist);
+      const hit = d.raycast(origin, dir, bestDist, radius);
       if (hit && hit.distance <= bestDist) {
         best = hit;
         bestDist = hit.distance;

@@ -10,8 +10,8 @@ import { COLLAPSE_BUDGET, PROFILES, REBAR, Site, region } from './kit.ts';
  * Çelik Kule — a six-storey steel moment frame: HEB 200 columns on a 6 m grid (two bays by one),
  * IPE 360 edge beams continuous over the columns, IPE 300 cross beams, CHS
  * X-bracing in the east end frame, 200 mm RC floor slabs, and a stick-system curtain wall of
- * tempered glass on the south and east faces from the first floor up: dark anodised mullions on
- * every joint, a transom at each floor line and a back-painted spandrel hiding the slab edge.
+ * tempered glass on all four faces from the first floor up: dark anodised mullions on every
+ * joint, a transom at each floor line and a back-painted spandrel hiding the slab edge.
  *
  * Loads are realistic for an office floor: slab self-weight 4.7 kPa plus 1.5 kPa of finishes,
  * services and the quasi-permanent share of the imposed load, so a middle ground-floor column
@@ -34,15 +34,18 @@ const GLASS_OUT = 0.12;
 /** Curtain-wall frame: mullion face width and depth, transom height, m */
 const MULL_W = 0.06, MULL_D = 0.16, TRANSOM_H = 0.09;
 
-/** Golden-hour photography settings (see look.ts). Many panes: no reflection probes. */
-export const towerLook: SceneLook = { sky: { turbidity: 3, rayleigh: 1.7, mieCoefficient: 0.003 }, exposure: 0.9, ambient: 0.6, fov: 55, visibility: 7000, glassProbes: false };
+/**
+ * Golden-hour photography settings (see look.ts). The panes share reflection probes (one per
+ * ≈ 7 m, recaptured a face per frame once a collapse has settled; glass/probes.ts).
+ */
+export const towerLook: SceneLook = { sky: { turbidity: 3, rayleigh: 1.7, mieCoefficient: 0.003 }, exposure: 0.9, fov: 55, visibility: 7000, glassProbes: true };
 
 export const tower: SceneDef = {
   id: 'tower',
   name: 'Steel Tower',
   nameTr: 'Çelik Kule',
-  blurb: 'A six-storey steel moment frame: HEB columns, IPE beams, X-bracing in one bay, RC floor slabs, a tempered-glass curtain wall with slim mullions on two faces over an open ground storey. Demolition-ready.',
-  blurbTr: 'Altı katlı çelik moment çerçeve: HEB kolonlar, IPE kirişler, tek açıklıkta X çaprazlar, betonarme döşemeler; açık zemin katın üstünde iki cephede ince kayıtlı temperli cam giydirme. Yıkıma hazır.',
+  blurb: 'A six-storey steel moment frame: HEB columns, IPE beams, X-bracing in one bay, RC floor slabs, a tempered-glass curtain wall with slim mullions on all four faces over an open ground storey. Demolition-ready.',
+  blurbTr: 'Altı katlı çelik moment çerçeve: HEB kolonlar, IPE kirişler, tek açıklıkta X çaprazlar, betonarme döşemeler; açık zemin katın üstünde dört cephede ince kayıtlı temperli cam giydirme. Yıkıma hazır.',
   spawn: { position: [19, 1.6, -21], lookAt: [0, 8.5, 0] },
   sun: { elevation: 10, azimuth: 250 },
   build(ctx, make) {
@@ -131,23 +134,32 @@ export const tower: SceneDef = {
 };
 
 /**
- * Stick-system curtain wall on the south (−z) and east (+x) faces, storeys 1–5: framed tempered
- * units hung from the slab edge above and restrained at the slab edge below, dark anodised
- * mullions on every joint, a transom at each floor line and a spandrel of back-painted glass
- * hiding the slab edge and the beams. The frame and spandrel of a storey are carried by the slab
- * above it and go with it.
+ * Stick-system curtain wall on all four faces, storeys 1–5 (a glass prism over the open ground
+ * storey, as in Mies's Lake Shore Drive towers): framed tempered units hung from the slab edge
+ * above and restrained at the slab edge below, dark anodised mullions on every joint, a transom
+ * at each floor line and a spandrel of back-painted glass hiding the slab edge and the beams. The
+ * frame and spandrel of a storey are carried by the slab above it and go with it.
  */
 function curtainWall(site: Site, slabs: Map<number, Destructible>, level: (k: number) => number): void {
-  const zS = ZS[0]! - EDGE - 0.1 - GLASS_OUT, xE = XS[2]! + EDGE + GLASS_OUT;
-  const south = { along: 'x' as const, at: zS, out: -1, from: XS[0]! - EDGE, to: XS[2]! + EDGE + GLASS_OUT, panes: 6 };
-  const east = { along: 'z' as const, at: xE, out: 1, from: ZS[0]! - EDGE - 0.1 - GLASS_OUT, to: ZS[1]! + EDGE + 0.1, panes: 3 };
+  // The glass box: each face runs corner to corner in the planes GLASS_OUT outside the slab edges
+  // (faces tagged Güney, Doğu, Kuzey, Batı).
+  const xW = XS[0]! - EDGE - GLASS_OUT, xE = XS[2]! + EDGE + GLASS_OUT;
+  const zS = ZS[0]! - EDGE - 0.1 - GLASS_OUT, zN = ZS[1]! + EDGE + 0.1 + GLASS_OUT;
+  const faces = [
+    { tag: 'G', along: 'x' as const, at: zS, out: -1, from: xW, to: xE, panes: 6 },
+    { tag: 'D', along: 'z' as const, at: xE, out: 1, from: zS, to: zN, panes: 3 },
+    { tag: 'K', along: 'x' as const, at: zN, out: 1, from: xW, to: xE, panes: 6 },
+    { tag: 'B', along: 'z' as const, at: xW, out: -1, from: zS, to: zN, panes: 3 },
+  ];
+  // Slab extent along each axis (the edge supports are clipped to it).
+  const slabX = [XS[0]! - EDGE, XS[2]! + EDGE] as const, slabZ = [ZS[0]! - EDGE - 0.1, ZS[1]! + EDGE + 0.1] as const;
   const frameMat = new THREE.MeshStandardMaterial({ color: 0x24272a, roughness: 0.38, metalness: 0.75 });
   const spandrelMat = new THREE.MeshStandardMaterial({ color: 0x15191a, roughness: 0.12, metalness: 0.1 });
   for (let k = 1; k < N; k++) {
     const y0 = level(k), y1 = level(k + 1);
     const frame: THREE.BufferGeometry[] = [];
     const spandrel: THREE.BufferGeometry[] = [];
-    for (const face of [south, east]) {
+    for (const face of faces) {
       const w = (face.to - face.from) / face.panes;
       // Box in face coordinates: s along the face, y up, d outwards from the glass plane.
       const put = (list: THREE.BufferGeometry[], s: number, y: number, d: number, ls: number, ly: number, ld: number) => {
@@ -160,13 +172,17 @@ function curtainWall(site: Site, slabs: Map<number, Destructible>, level: (k: nu
         const s = face.from + (i + 0.5) * w;
         const [x, z] = face.along === 'x' ? [s, face.at] : [face.at, s];
         const pane = site.glass({
-          name: `Cam ${face.along}${k}-${i}`, type: 'tempered', width: w - MULL_W, height: STOREY - TRANSOM_H, thickness: 0.012,
+          name: `Cam ${face.tag}${k}-${i + 1}`, type: 'tempered', width: w - MULL_W, height: STOREY - TRANSOM_H, thickness: 0.012,
           position: [x, (y0 + y1) / 2 + TRANSOM_H / 2, z], rotation: [0, face.along === 'x' ? 0 : Math.PI / 2, 0], tint: 0x9fb4b0, framed: true,
         });
-        // Each unit hangs from the slab edge above and is restrained at the slab edge below.
+        // Each unit hangs from the slab edge above and is restrained at the slab edge below: a
+        // band 0.18 m into the slab behind the unit (clipped to the slab at the corners).
+        const lim = face.along === 'x' ? slabX : slabZ;
+        const s0 = Math.max(lim[0], s - w / 2 + 0.05), s1 = Math.min(lim[1], s + w / 2 - 0.05);
+        const e0 = face.at - face.out * GLASS_OUT, e1 = e0 - face.out * 0.18;
         const edge = (y: number) => face.along === 'x'
-          ? new THREE.Box3(new THREE.Vector3(s - w / 2 + 0.05, y - SLAB_T, face.at + GLASS_OUT), new THREE.Vector3(s + w / 2 - 0.05, y, face.at + GLASS_OUT + 0.18))
-          : new THREE.Box3(new THREE.Vector3(face.at - GLASS_OUT - 0.18, y - SLAB_T, s - w / 2 + 0.05), new THREE.Vector3(face.at - GLASS_OUT, y, s + w / 2 - 0.05));
+          ? new THREE.Box3(new THREE.Vector3(s0, y - SLAB_T, Math.min(e0, e1)), new THREE.Vector3(s1, y, Math.max(e0, e1)))
+          : new THREE.Box3(new THREE.Vector3(Math.min(e0, e1), y - SLAB_T, s0), new THREE.Vector3(Math.max(e0, e1), y, s1));
         site.at(slabs.get(k)!, pane, edge(y0));
         site.at(slabs.get(k + 1)!, pane, edge(y1));
       }

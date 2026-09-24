@@ -2,8 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import { fmtDeg, fmtDistance, fmtEnergy, fmtLength, fmtMass, fmtPressure, fmtScale, fmtSpeed, fmtTime, num } from '../src/ui/format.ts';
-import { caliberTr, upperTr, NAME_TR, ROLE_TR } from '../src/ui/i18n.ts';
-import { blastRow, describeImpact, groupLine, HitGroups, impactRow, PROFILE_POINTS, weaponSpecs } from '../src/ui/telemetry.ts';
+import { caliberTr, keyHints, upperTr, HELP_DESKTOP, NAME_TR, ROLE_TR } from '../src/ui/i18n.ts';
+import { blastRow, describeImpact, followThrough, groupLine, HitGroups, impactRow, PROFILE_POINTS, weaponSpecs, weaponSummary } from '../src/ui/telemetry.ts';
+import { sceneReference } from '../src/ui/menu.ts';
+import { SCENES } from '../src/scenes/index.ts';
 import { buildSlots, stepWeapon, weaponForKey, slotOf } from '../src/player/slots.ts';
 import { artKindFor } from '../src/ui/sceneArt.ts';
 import { reticleFor, scopeFor } from '../src/ui/crosshair.ts';
@@ -234,4 +236,63 @@ test('hit group: a burst on one spot reads as a cavity that keeps deepening', ()
   for (let i = 0; i < 20; i++) shoot(gs, hit(2001 + i, { point: new THREE.Vector3(i, 0, 0) }));
   assert.ok(gs.list.length <= 6);
   assert.ok(gs.list.every((x) => x.profile.every(Number.isFinite) && Number.isFinite(x.deepest)));
+});
+
+test('follow-through hits: priorPerforations from the resolver marks the second target of a round', () => {
+  const primary = impactRow(impact({ priorPerforations: 0 }));
+  assert.equal(primary.secondary, false);
+  assert.equal(primary.follow, '');
+  const behind = impactRow(impact({ priorPerforations: 1, material: MATERIALS.soil ?? MATERIALS.concrete, targetKind: 'terrain' }));
+  assert.equal(behind.secondary, true);
+  assert.equal(behind.follow, '2. hedef');
+  // Same round and result on the same target, but one of them came through a wall: two rows.
+  assert.notEqual(impactRow(impact({ priorPerforations: 0 })).key, impactRow(impact({ priorPerforations: 1 })).key);
+  assert.equal(followThrough(impact({})), undefined, 'unknown without the field: the HUD falls back to its own test');
+  assert.equal(followThrough(impact({ priorPerforations: 2 })), true);
+  assert.equal(followThrough(impact({ agent: 'fragment', priorPerforations: 1 })), false);
+});
+
+test('collapsed weapon card: at most three defining numbers, typed indirect / placed data', () => {
+  const find = (id: string) => WEAPONS.find((w) => w.id === id)!;
+  const m4 = weaponSummary(find('m4a1'), getAmmo('m855'));
+  assert.equal(m4, '905 m/s · 1,65 kJ · 800 atım/dk'.replace('905', String(Math.round(getAmmo('m855').muzzleVelocity))).replace('1,65 kJ', m4.split(' · ')[1]!));
+  assert.ok(m4.split(' · ').length === 3 && m4.includes('atım/dk'));
+  const rpg = weaponSummary(find('rpg7'), getAmmo('pg7vl'));
+  assert.match(rpg, /^500 mm RHA · \d+ m\/s$/);
+  const arty = find('m777');
+  assert.match(weaponSummary(arty, getAmmo('m795')), /TNT-e · 340 m\/s/);
+  const specs = weaponSpecs(arty, getAmmo('m795'));
+  assert.equal(specs.find((x) => x.label === 'Dalış açısı')!.value, '60°');
+  assert.equal(specs.find((x) => x.label === 'İsabet sapması')!.value, '≈ 3,0 m');
+  const demo = find('demo');
+  assert.equal(weaponSpecs(demo, getAmmo('c4')).find((x) => x.label === 'Erişim')!.value, '80 m');
+  assert.match(weaponSummary(demo, getAmmo('c4')), /TNT-e · erişim 80 m$/);
+  for (const w of WEAPONS) for (const a of w.ammo) {
+    const line = weaponSummary(w, getAmmo(a));
+    assert.ok(line.length > 0 && line.split(' · ').length <= 3 && !line.includes('NaN') && !line.includes('—'), `${w.id}/${a}: ${line}`);
+  }
+});
+
+test('key hints and help cover weapons, ammunition, slow motion, bullet camera and charges', () => {
+  const direct = keyHints('direct', 2, 0).map((h) => h.keys.join('+'));
+  for (const k of ['1–8', 'T', 'F', 'C', 'G', 'I', 'H']) assert.ok(direct.includes(k), `direct hint ${k}`);
+  assert.ok(!keyHints('direct', 1, 0).some((h) => h.keys[0] === 'T'), 'no ammo key with one round type');
+  const placed = keyHints('placed', 2, 0).map((h) => h.keys[0]);
+  assert.equal(placed[0], 'Sol tık');
+  assert.ok(!placed.includes('X'), 'nothing to detonate yet');
+  assert.ok(keyHints('placed', 2, 3).some((h) => h.keys[0] === 'X') && keyHints('placed', 2, 3).some((h) => h.keys[0] === 'B'));
+  const helpKeys = HELP_DESKTOP.flatMap((g) => g.entries.flatMap((e) => e.keys));
+  for (const k of ['1–8', 'T', 'I', 'G', 'X', 'B', 'F', 'C', 'V', 'H', 'Esc']) assert.ok(helpKeys.includes(k), `help lists ${k}`);
+});
+
+test('scene plates carry their architectural reference', () => {
+  assert.deepEqual(sceneReference('x', 'Tadao Ando’dan (İbaraki, 1989): kalıp izli betonarme kutu.'), { reference: 'Tadao Ando · İbaraki, 1989', note: 'Kalıp izli betonarme kutu.' });
+  assert.deepEqual(sceneReference('y', 'Mies van der Rohe’dan (Barselona, 1929): traverten podyum.'), { reference: 'Mies van der Rohe · Barselona, 1929', note: 'Traverten podyum.' });
+  assert.equal(sceneReference('z', 'Beton şeritte hedefler.').reference, '');
+  for (const s of SCENES) {
+    const r = sceneReference(s.id, s.blurbTr);
+    assert.ok(r.reference.length > 0, `reference for ${s.id}`);
+    assert.ok(r.note.length > 20 && !/^[a-zçğıöşü]/.test(r.note), `note for ${s.id}: ${r.note}`);
+  }
+  assert.equal(sceneReference('chapel', SCENES.find((s) => s.id === 'chapel')!.blurbTr).reference, 'Tadao Ando · İbaraki, 1989');
 });

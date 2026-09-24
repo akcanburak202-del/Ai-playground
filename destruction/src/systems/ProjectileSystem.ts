@@ -147,6 +147,8 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
   /** Last fixed-step cost, ms, and the number of segment ray casts it made (telemetry) */
   lastStepMs = 0;
   lastRaycasts = 0;
+  /** Projectile whose shaped-charge jet is being resolved (undefined for placed cutting charges) */
+  private jetOwner: number | undefined = undefined;
   /** Everything emitted as 'impact' is also passed here (sandbox/debug hooks) */
   onImpact: ((e: ImpactEvent) => void) | null = null;
 
@@ -396,6 +398,7 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     }
     _vel.copy(dir).multiplyScalar(speed);
     const ev = resolveImpact({ ammo: a, position: hit.point, velocity: _vel, mass: p.mass, length: p.length, perforations: p.perforations }, hit, probe, this.rng);
+    tagEvent(ev, p.id, p.perforations, probe, hit.normal, dir);
     this.emitImpact(ev, target);
 
     p.loft = null;
@@ -519,8 +522,10 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     const cone = a.heatConeDiameter ?? a.diameter * 0.8;
     const origin = hit.point.clone().addScaledVector(hit.normal, 0.01);
     const d = dir.clone();
+    this.jetOwner = p.id;
     if (a.tandem && a.precursorRHA) this.jetFrom(a, a.precursorRHA, cone * 0.4, origin, d, 'precursor jet');
     this.jetFrom(a, a.heatPenetrationRHA ?? 0, cone, origin, d, 'jet');
+    this.jetOwner = undefined;
     if (a.followThrough) this.spawnFollowThrough(a, hit, d, p.velocity.length());
     if (a.explosiveTNT) {
       _tmp.copy(hit.point).addScaledVector(hit.normal, 0.05);
@@ -549,6 +554,7 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     let reach = maxDist + JET_BACKOFF;
     let free = JET_BACKOFF;
     let skip: Destructible | undefined;
+    let perforated = 0;
     for (let k = 0; k < MAX_INTERACTIONS && c > 1e-4; k++) {
       let hit = this.ctx.registry.raycast(from, dir, reach, skip);
       const inert = this.castInert(from, dir, hit ? hit.distance : reach);
@@ -568,8 +574,10 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
       free = 0;
       skip = undefined;
       const ev = resolveJet(a, c, cone, hit, dir, probe, this.rng, label);
+      tagEvent(ev, this.jetOwner, perforated, probe, hit.normal, dir);
       this.emitImpact(ev, hit.target);
       if (ev.outcome !== 'perforate' || !ev.exitPoint) return;
+      perforated++;
       this.spawnBehindArmourDebris(a, ev);
       c = ev.residualCapacity ?? 0;
       from.copy(ev.exitPoint).addScaledVector(dir, 1e-3);
@@ -639,6 +647,18 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     };
     this.ctx.blasts.detonate(req);
   }
+}
+
+/**
+ * Fill the event's bookkeeping fields: which round, how many targets it had already gone through,
+ * and the struck member's thickness along its normal (line-of-sight run × cos obliquity; only when
+ * the probe found the rear face — a run clipped by the probe depth is not a thickness).
+ */
+function tagEvent(ev: ImpactEvent, projectileId: number | undefined, prior: number, probe: ThicknessProbe, normal: THREE.Vector3, dir: THREE.Vector3): void {
+  ev.projectileId = projectileId;
+  ev.priorPerforations = prior;
+  const segs = probe.segments;
+  if (probe.exits && segs.length) ev.targetThickness = segs[segs.length - 1]!.end * Math.max(0.05, Math.abs(dir.dot(normal)));
 }
 
 function clamp01(x: number): number {

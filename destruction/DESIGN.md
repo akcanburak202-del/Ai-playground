@@ -205,7 +205,10 @@ riddle glass). Pressure–impulse damage numbers for panes, walls and slabs.
 - **Rendering.** Undamaged chunks render through the analytic base mesh (box/cylinder/SDF surface
   mesh at modest resolution) whose fragment shader discards fragments inside chunks that have
   been damaged (a small chunk-state DataTexture, also used by the depth/shadow material).
-  Damaged chunks render with Surface Nets meshes (smooth gradient normals). Make the two meet
+  Damaged chunks render with Surface Nets meshes (smooth gradient normals), drawn through one
+  `THREE.BatchedMesh` per element; untouched box-face quads are merged into rim-preserving fans.
+  Debris pieces draw through per-family BatchedMeshes (concrete ≥ 0.3 m with shadows, smaller
+  pieces without, baked exposed rebar) and show their convex hull until meshed. Make the two meet
   without cracks: a chunk owns the Surface Nets quads whose minimum cell lies in it, so it covers
   cell centres [c0, c0+N]; the discard region is offset by half a voxel to match. Remesh at most
   a few ms per frame (priority queue by distance to camera).

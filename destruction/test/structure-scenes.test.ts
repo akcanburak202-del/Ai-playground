@@ -108,13 +108,14 @@ test('temple: the body budget freezes rubble, never the standing stones', async 
   const { ctx, step } = await build('temple');
   const phys = ctx.physics;
   const stones = new Set(ctx.registry.all().filter((d) => d.kind === 'voxel' && !d.structural));
-  // Sleeping rubble well past the budget, born after the stones (the world freezes oldest first).
+  // Rubble well past the budget, born after the stones (the world freezes the oldest sleeping
+  // bodies first, and the stones are the oldest and asleep). Let it come to rest and fall asleep.
   const extra = phys.maxDynamicBodies - phys.dynamicCount + 40;
   for (let i = 0; i < extra; i++) {
     const b = phys.createDynamic({ position: new THREE.Vector3(40 + (i % 20) * 0.5, 0.1, 40 + Math.floor(i / 20) * 0.5), colliders: [phys.R.ColliderDesc.cuboid(0.1, 0.1, 0.1)] });
     b.sleep();
   }
-  for (let i = 0; i < 10; i++) step(1 / 60);
+  for (let i = 0; i < 240; i++) step(1 / 60);
   let frozenStones = 0, live = 0;
   phys.world.forEachRigidBody((b) => {
     const el = b.numColliders() ? phys.ownerOf(b.collider(0))?.destructible : undefined;

@@ -586,6 +586,17 @@ export function rotaryLoopVoice(v: Voice, o: { buffer: AudioBuffer; rpm: number;
   return { tune: lp, baseFreq: o.lowpass, sources: [src, sub, roar] };
 }
 
+/**
+ * The drive spooling the barrels up to firing speed once the trigger is pressed (M134: electric
+ * motor, ≈ 0.35 s; GAU-8: hydraulic drive, ≈ 0.5 s): a motor whine rising over `duration`
+ * (voice time: divided by the slow-motion rate like every recipe duration).
+ */
+export function spinUp(v: Voice, o: { duration: number; heavy: boolean }): number {
+  const d = Math.max(0.05, o.duration);
+  const f0 = o.heavy ? 55 : 85, f1 = o.heavy ? 240 : 430;
+  return tone(v, { type: 'sawtooth', f0, f1, glide: d / 3, attack: d * 0.7, hold: d * 0.4, tau: 0.12, gain: o.heavy ? 0.07 : 0.05 }) - v.t;
+}
+
 /** The electric drive spooling down after the trigger is released (M134). */
 export function spinDown(v: Voice): number {
   return tone(v, { type: 'sawtooth', f0: 430, f1: 85, glide: 0.5, attack: 0.01, hold: 0.15, tau: 0.35, gain: 0.05 }) - v.t;

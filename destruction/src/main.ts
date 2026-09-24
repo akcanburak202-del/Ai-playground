@@ -11,6 +11,7 @@ import { installHud } from './ui/index.ts';
 import { installStructure } from './structure/index.ts';
 import { SCENES, SCENE_LOOKS, sceneById } from './scenes/index.ts';
 import { applyLookAfterLoad, applyLookBeforeLoad } from './scenes/look.ts';
+import { warmVoxelLooks } from './destructibles/voxel/index.ts';
 
 /**
  * App entry: builds the simulation with every subsystem, shows the scene menu over a live scene,
@@ -106,6 +107,8 @@ async function start(): Promise<void> {
 
   sim.manual = params.has('manual');
   sim.start();
+  // Generate the remaining stone/concrete finishes in idle slices so later scenes load faster.
+  void warmVoxelLooks(undefined, { renderer: sim.ctx.renderer });
   boot.classList.add('done');
   (window as unknown as { __ready: boolean }).__ready = true;
 }

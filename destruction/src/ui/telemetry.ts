@@ -28,11 +28,25 @@ export interface ImpactRow {
   description: string;
   /** The resolver's own one-line model summary */
   model: string;
+  /** The round had already gone through something (it hit what lies behind a holed target) */
+  secondary: boolean;
+  /** '' for a primary hit, else e.g. "2. hedef" (the round's second target) */
+  follow: string;
 }
 
-export function impactRow(e: ImpactEvent): ImpactRow {
+/**
+ * Did this impact come from a round that had already perforated something? Uses the resolver's
+ * `priorPerforations` when it reports one; `undefined` when it does not (the caller may guess).
+ */
+export function followThrough(e: ImpactEvent): boolean | undefined {
+  if (e.agent !== 'projectile') return e.agent === 'fragment' ? false : undefined;
+  return e.priorPerforations === undefined ? undefined : e.priorPerforations > 0;
+}
+
+export function impactRow(e: ImpactEvent, secondary = followThrough(e) ?? false): ImpactRow {
+  const n = e.priorPerforations ?? 0;
   return {
-    key: `${e.ammo.id}|${e.agent}|${e.targetKind}|${e.targetName ?? ''}|${e.material.id}|${e.outcome}`,
+    key: `${e.ammo.id}|${e.agent}|${e.targetKind}|${e.targetName ?? ''}|${e.material.id}|${e.outcome}|${secondary ? 'b' : 'a'}`,
     count: 1,
     ammo: e.agent === 'jet' ? `${e.ammo.name} · jet` : e.ammo.name,
     material: e.material.nameTr,
@@ -45,6 +59,8 @@ export function impactRow(e: ImpactEvent): ImpactRow {
     energy: fmtEnergy(e.energyAbsorbed),
     description: describeImpact(e),
     model: e.summary,
+    secondary,
+    follow: secondary ? (n > 0 ? `${n + 1}. hedef` : 'Arkadaki hedef') : '',
   };
 }
 
@@ -389,19 +405,13 @@ export interface SpecItem {
   hi?: boolean;
 }
 
-interface IndirectData {
-  indirect?: { impactSpeed: number };
-  placeRange?: number;
-}
-
 /** Real specifications of the selected weapon and round, for the weapon card. */
 export function weaponSpecs(w: WeaponSpec, a: AmmoSpec): SpecItem[] {
-  const x = w as WeaponSpec & IndirectData;
   const out: SpecItem[] = [];
   const massLabel = a.kind === 'apfsds' ? 'Delici kütlesi' : w.delivery === 'placed' ? 'Şarj kütlesi' : a.rocket || a.guidance ? 'Roket kütlesi' : w.category === 'airstrike' ? 'Bomba kütlesi' : 'Mermi kütlesi';
   out.push({ label: massLabel, value: fmtMass(a.mass) });
-  if (w.delivery === 'indirect' && x.indirect) {
-    const v = x.indirect.impactSpeed;
+  if (w.delivery === 'indirect' && w.indirect) {
+    const v = w.indirect.impactSpeed;
     out.push({ label: 'Çarpma hızı', value: fmtSpeed(v) });
     out.push({ label: 'Kinetik enerji', value: fmtEnergy(0.5 * a.mass * v * v) });
   } else if (w.delivery !== 'placed') {
@@ -413,8 +423,33 @@ export function weaponSpecs(w: WeaponSpec, a: AmmoSpec): SpecItem[] {
   if ((a.explosiveTNT ?? 0) > 0) out.push({ label: 'TNT eşdeğeri', value: fmtMass(a.explosiveTNT!), hi: a.kind !== 'heat' });
   if (w.delivery === 'direct') out.push({ label: 'Atış hızı', value: fmtRpm(w.rpm) });
   if (w.delivery === 'direct' && w.dispersionMOA > 0) out.push({ label: 'Dağılım', value: `${num(w.dispersionMOA, 1)} MOA 1σ` });
-  if (w.delivery === 'placed' && x.placeRange) out.push({ label: 'Erişim', value: `${num(x.placeRange, 0)} m` });
+  if (w.delivery === 'indirect' && w.indirect) {
+    out.push({ label: 'Dalış açısı', value: `${num(w.indirect.descentDeg, 0)}°` });
+    if (w.indirect.errorM > 0) out.push({ label: 'İsabet sapması', value: `≈ ${num(w.indirect.errorM, 1)} m` });
+  }
+  if (w.delivery === 'placed' && w.placeRange) out.push({ label: 'Erişim', value: `${num(w.placeRange, 0)} m` });
   return out;
+}
+
+/**
+ * The numbers that define this weapon and round, on one line for the collapsed weapon card:
+ * what it delivers (penetration, explosive, energy) and how (speed, rate). At most three.
+ */
+export function weaponSummary(w: WeaponSpec, a: AmmoSpec): string {
+  const parts: string[] = [];
+  const tnt = a.explosiveTNT ?? 0;
+  if (w.delivery === 'placed') {
+    parts.push(`${fmtMass(tnt > 0 ? tnt : a.mass)} TNT-e`);
+    if (w.placeRange) parts.push(`erişim ${num(w.placeRange, 0)} m`);
+    return parts.join(' · ');
+  }
+  if (a.kind === 'heat' && a.heatPenetrationRHA) parts.push(`${num(a.heatPenetrationRHA * 1000, 0)} mm RHA`);
+  const v = w.delivery === 'indirect' && w.indirect ? w.indirect.impactSpeed : a.muzzleVelocity;
+  if (tnt > 0 && a.kind !== 'heat') parts.push(`${fmtMass(tnt)} TNT-e`);
+  parts.push(fmtSpeed(v));
+  if (a.kind === 'ball' || a.kind === 'ap' || a.kind === 'apfsds' || tnt === 0) parts.push(fmtEnergy(0.5 * a.mass * v * v));
+  if (w.delivery === 'direct' && w.fireMode === 'auto') parts.push(fmtRpm(w.rpm));
+  return parts.slice(0, 3).join(' · ');
 }
 
 export function ammoLine(a: AmmoSpec): string {

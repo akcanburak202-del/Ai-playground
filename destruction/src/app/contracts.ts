@@ -26,6 +26,8 @@ export interface BlastEvent extends BlastRequest {
   time: number;
   /** Fireball radius used for visuals, m */
   fireballRadius: number;
+  /** Quasi-static gas pressure of a confined detonation, Pa (0/undefined in the open) */
+  gasPressure?: number;
 }
 
 export interface FractureEvent {
@@ -123,6 +125,8 @@ export interface WeaponSpec {
   zoom: number;
   /** Launch offset from the viewer (right, up, forward) in metres for visuals; y < 0 is below the eye */
   muzzleOffset: [number, number, number];
+  /** Rotary guns: time for the barrel cluster to reach its cyclic rate, s */
+  spinUp?: number;
   /** Placed charges: how far from the viewer a charge can be attached, m */
   placeRange?: number;
   /** Indirect fire: arrival conditions shown in the HUD */

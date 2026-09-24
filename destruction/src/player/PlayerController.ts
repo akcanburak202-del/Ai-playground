@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { Simulation } from '../app/Simulation.ts';
-import type { Projectile, ShotEvent, SimContext, System, WeaponControllerApi } from '../app/contracts.ts';
+import type { Projectile, RenderPipelineApi, ShotEvent, SimContext, System, WeaponControllerApi } from '../app/contracts.ts';
 import type { AmmoSpec } from '../physics/ballistics/types.ts';
 import { groundOf } from '../fx/ground.ts';
 import { bridgeOf, type Bridge, type BulletCamView, type PlayerView } from '../ui/bridge.ts';
@@ -73,7 +73,10 @@ export class PlayerController implements System, PlayerView {
   lockUnavailable = false;
   slowMo = false;
   bulletCamArmed = false;
+  /** Render-only recoil currently shown (see PlayerView.kick) */
+  readonly kick = { pitch: 0, yaw: 0 };
   private readonly ctx: SimContext;
+  private readonly pipeline: RenderPipelineApi;
   private readonly weapons: WeaponControllerApi;
   private readonly canvas: HTMLCanvasElement;
   private readonly bridge: Bridge;
@@ -126,6 +129,7 @@ export class PlayerController implements System, PlayerView {
 
   constructor(sim: Simulation, weapons: WeaponControllerApi, opts: PlayerOptions = {}) {
     this.ctx = sim.ctx;
+    this.pipeline = sim.pipeline;
     this.weapons = weapons;
     this.opts = opts;
     this.canvas = opts.canvas ?? sim.ctx.renderer.domElement;
@@ -141,6 +145,7 @@ export class PlayerController implements System, PlayerView {
       }),
     );
     this.bridge.player = this;
+    this.bridge.weapons = weapons;
     if (opts.touch || matchMedia('(pointer: coarse)').matches) this.enableTouch();
   }
 
@@ -333,8 +338,9 @@ export class PlayerController implements System, PlayerView {
         this.toggleBulletCam();
         break;
       case 'KeyR':
-        if (this.opts.onReload) this.opts.onReload();
-        else hud?.reload();
+        // Through the HUD when there is one: it shows the build in progress.
+        if (hud) hud.reload();
+        else this.opts.onReload?.();
         break;
       case 'KeyH':
         hud?.toggleHelp();
@@ -454,10 +460,11 @@ export class PlayerController implements System, PlayerView {
     if (this.cam || e.weapon.delivery !== 'direct') return;
     // Per-round kick; at very high rates the kicks blur into vibration, so scale by 600 / rpm.
     const rate = Math.min(1, 600 / Math.max(1, e.weapon.rpm));
-    // The camera is the aim. For automatic fire the arsenal's dispersion already contains the
-    // scatter of a burst from its mount, bipod or shoulder, so the kick that moves the aim stays
-    // small (the effects' render-time shake carries each round's punch). Semi / single shots kick
-    // in full: the view has settled again before the next round.
+    // The camera is the aim; the kick is drawn by the pipeline (viewKick) and moves only the
+    // picture, or, without it, the camera. For automatic fire the arsenal's dispersion already
+    // contains the scatter of a burst from its mount, bipod or shoulder, so the kick stays small
+    // (the effects' render-time shake carries each round's punch). Semi / single shots kick in
+    // full: the view has settled again before the next round.
     const auto = e.weapon.fireMode === 'auto';
     const v = 2.4 * e.weapon.recoil * rate * (auto ? 0.3 : 1);
     this.recoilPitch.kick(v);
@@ -535,6 +542,7 @@ export class PlayerController implements System, PlayerView {
       this.touchUi.refresh();
     }
     if (this.cam) {
+      this.viewKick(0, 0);
       this.updateBulletCam(dt);
       this.updateFov(dt, 0);
       return;
@@ -589,8 +597,24 @@ export class PlayerController implements System, PlayerView {
     const kp = this.aimHold.update(this.recoilPitch, dt, performance.now() - this.lastAutoShot < 200);
     const ky = this.recoilYaw.update(dt);
     cam.position.copy(this.pos);
-    cam.rotation.set(THREE.MathUtils.clamp(this.pitch + kp, -PITCH_LIMIT, PITCH_LIMIT), this.yaw + ky, 0, 'YXZ');
+    // Recoil is a render-only view kick when the pipeline offers one: the muzzle climbs on screen
+    // while the aim ray (the camera) stays where the viewer put it. Otherwise the camera kicks.
+    if (this.viewKick(kp, ky)) cam.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
+    else cam.rotation.set(THREE.MathUtils.clamp(this.pitch + kp, -PITCH_LIMIT, PITCH_LIMIT), this.yaw + ky, 0, 'YXZ');
     this.commit();
+  }
+
+  /** Hand the recoil to the pipeline's render-only kick; false when the pipeline has none. */
+  private viewKick(pitch: number, yaw: number): boolean {
+    const p = this.pipeline;
+    if (typeof p.viewKick !== 'function') {
+      this.kick.pitch = this.kick.yaw = 0;
+      return false;
+    }
+    p.viewKick(pitch, yaw);
+    this.kick.pitch = pitch;
+    this.kick.yaw = yaw;
+    return true;
   }
 
   private commit(): void {
@@ -784,11 +808,16 @@ export class PlayerController implements System, PlayerView {
 
   reset(): void {
     this.endBulletCam(true);
+    this.recoilPitch.reset();
+    this.recoilYaw.reset();
+    this.viewKick(0, 0);
   }
 
   dispose(): void {
     this.disposed = true;
     this.releaseAll();
+    this.viewKick(0, 0);
+    if (this.bridge.weapons === this.weapons) this.bridge.weapons = null;
     for (const [t, type, h, o] of this.listeners) t.removeEventListener(type, h, o);
     this.listeners = [];
     for (const u of this.unsub) u();

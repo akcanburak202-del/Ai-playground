@@ -316,6 +316,40 @@ interface PIParams { P0: number; I0: number; P0b: number; I0b: number }
 export const PI_WALL_SPAN = 3;
 
 /**
+ * Reinforcement assumed for concrete members (the damage query does not know the element's bars):
+ * tension steel per face as a fraction of the effective depth — Ø12 @ 150–200 mm in a 200–300 mm
+ * wall is 0.22–0.35 %; EC2 §9.6 asks for ≥ 0.1 % per face in walls.
+ */
+export const RC_STEEL_RATIO = 0.003;
+/** Reinforcing-bar yield strength (B500), Pa */
+const REBAR_FY = 500e6;
+
+/**
+ * Response limits as support rotations of a one-way member (PDC-TR 06-08, "Single degree of
+ * freedom structural response limits for antiterrorism design", 2008, tables 3-1/3-3):
+ * reinforced concrete slabs/walls in flexure B2 (moderate) θ = 2°, B4 (hazardous, blow-out) θ = 10°;
+ * unreinforced masonry with arching B2 θ = 1.5°, B4 θ = 8°. Damage number 1 = B2 (visible
+ * cracking, some permanent deflection), 2 = B4 (failure: breach / blow-out). B1 (μ = 1, no
+ * visible damage) lies below 1.
+ */
+const RC_THETA = [2, 10] as const;
+const URM_THETA = [1.5, 8] as const;
+
+/**
+ * Elastic–perfectly-plastic SDOF (Biggs 1964, "Introduction to Structural Dynamics", ch. 5;
+ * UFC 3-340-02 §3-19) asymptotes of the iso-damage curve for a peak deflection x_m:
+ *   impulsive      I = √(2 K_LM m R_u (x_m − x_y/2))      (kinetic energy = strain energy)
+ *   quasi-static   P = R_u (1 − x_y / (2 x_m))            (work of a step load = strain energy)
+ * with x_y = R_u / k and K_LM = 0.66 (simply supported one-way member, uniform load, plastic range;
+ * Biggs table 5.1).
+ */
+function sdofAsymptotes(Ru: number, k: number, mass: number, xm: number): [number, number] {
+  const xy = Ru / k;
+  const x = Math.max(xm, xy);
+  return [Ru * (1 - xy / (2 * x)), Math.sqrt(2 * 0.66 * mass * Ru * (x - xy / 2))];
+}
+
+/**
  * P–I asymptotes for a member of `thickness` made of `material`: [onset of damage] and [severe /
  * breach].
  *
@@ -323,16 +357,24 @@ export const PI_WALL_SPAN = 3;
  * dynamic, ∝ t², ×4 tempered (glass-type factor), impulse asymptote I0 = 2 P0/ω with ω = 2π·21 Hz
  * (first mode of that simply supported pane).
  *
- * Brittle walls and slabs (concrete, stone, brick): a one-way strip of span L = 3 m as an elastic
- * single-degree-of-freedom system (Biggs 1964, "Introduction to Structural Dynamics"; the SDOF
- * basis of PDC-TR 06-08). Cracking resistance R_cr = 8 M_cr / L² with M_cr = f_t h²/6, stiffness
- * k = 384 E I / (5 L⁴), I = h³/12, mass m = ρ h, load–mass factor K_LM = 0.78. Onset of cracking is
- * the elastic response reaching R_cr: quasi-static asymptote P0 = R_cr / 2 (dynamic load factor
- * 2), impulsive asymptote I0 = x_cr √(K_LM m k), x_cr = R_cr / k. (For a 0.25 m C40 wall:
- * 16 kPa, 107 Pa·s.) Severe damage / local breach is placed at P0b = 20 P0, I0b = 48 I0 for
- * reinforced concrete (≈ 320 kPa and ≈ 5 kPa·s for 0.25 m — heavier than the global-flexure
- * "heavy damage" limit of PDC-TR 06-08 because the element realises it as a local breach) and at
- * half those ratios for unreinforced masonry and stone, whose post-cracking capacity is small.
+ * Reinforced concrete walls and slabs: a one-way strip of span L = 3 m, simply supported, as an
+ * elastic–perfectly-plastic SDOF (UFC 3-340-02 ch. 4; PDC-TR 06-08). Ultimate resistance
+ * R_u = 8 M_p / L² with M_p = A_s f_dy (d − a/2), a = A_s f_dy / (0.85 f'_dc) (UFC 3-340-02
+ * eq. 4-1/4-2), d = 0.85 h, A_s = ρ d (ρ = RC_STEEL_RATIO per face), dynamic strengths
+ * f_dy = 1.1 · 1.17 f_y (strength increase and dynamic increase factors, UFC 3-340-02 tables 4-1,
+ * 4-2), f'_dc = 1.19 f_c; never below the cracking capacity f_t h²/6. Stiffness
+ * k = 384 E I_a / (5 L⁴) with the average of gross and cracked moments of inertia
+ * I_a = (I_g + I_cr)/2 (UFC 3-340-02 §4-11), I_cr = (kd)³/3 + n A_s (d − kd)². Deflection limits
+ * from the PDC-TR 06-08 support rotations (2° / 10°): for 0.25 m C40 this gives onset at
+ * I ≈ 1.7 kPa·s / P ≈ 73 kPa and blow-out at I ≈ 4.0 kPa·s / P ≈ 75 kPa — so a 4 kg charge must be
+ * within ≈ 1.2 m to crack it and within ≈ 0.7 m (or in contact, `contactDamage`) to breach it.
+ *
+ * Unreinforced masonry and stone (brick, marble, travertine, granite, onyx): rigid arching between
+ * the supporting slabs (McDowell, McKee & Sevin 1956, "Arching action theory of masonry walls",
+ * J. Struct. Div. ASCE 82): the two halves rotate about crushed hinges of depth ≈ 0.1 h, thrust
+ * C = 0.85 f_m · 0.1 h with lever arm 0.9 h, so R_u = 8 · 0.0765 f_m h² / L² — never below the
+ * flexural cracking capacity. Uncracked stiffness, PDC-TR 06-08 arching limits (1.5° / 8°), and the
+ * deflection capped at 0.5 h (the arch snaps through as the deflection approaches the thickness).
  *
  * Steel plates: yield-line capacity 6 σ_y t² / a² (a ≈ 1 m) and the Nurick–Martin damage number
  * φ = I R / (t² √(ρ σ_y)) ≈ 1.5 (onset of permanent deflection) / 25 (tearing).
@@ -357,17 +399,43 @@ function piParams(m: MaterialProps, t: number): PIParams {
       return { P0: 2e6, I0: 5e3, P0b: 1e7, I0b: 5e4 };
     default: {
       const L = PI_WALL_SPAN;
-      const Rcr = (8 * (m.tensileStrength * th * th) / 6) / (L * L);
-      const k = (384 * m.youngModulus * (th * th * th) / 12) / (5 * L ** 4);
       const mass = m.density * th;
-      const xcr = Rcr / k;
-      const P0 = Rcr / 2;
-      const I0 = xcr * Math.sqrt(0.78 * mass * k);
+      const Ig = (th * th * th) / 12;
+      const Mcr = (m.tensileStrength * th * th) / 6;
       const reinforced = m.id === 'concrete' || m.id === 'concrete_hs';
-      const aP = reinforced ? 20 : 10, aI = reinforced ? 48 : 24;
-      return { P0, I0, P0b: P0 * aP, I0b: I0 * aI };
+      let Ru: number, k: number, theta: readonly [number, number], xCap = Infinity;
+      if (reinforced) {
+        const d = 0.85 * th;
+        const As = RC_STEEL_RATIO * d;
+        const fdy = 1.1 * 1.17 * REBAR_FY;
+        const fdc = 1.19 * m.compressiveStrength;
+        const a = (As * fdy) / (0.85 * fdc);
+        const Mp = As * fdy * (d - a / 2);
+        Ru = (8 * Math.max(Mp, Mcr)) / (L * L);
+        const n = 200e9 / m.youngModulus;
+        const np = n * RC_STEEL_RATIO;
+        const kd = d * (Math.sqrt(2 * np + np * np) - np);
+        const Icr = (kd * kd * kd) / 3 + n * As * (d - kd) ** 2;
+        k = (384 * m.youngModulus * 0.5 * (Ig + Icr)) / (5 * L ** 4);
+        theta = RC_THETA;
+      } else {
+        const March = 0.0765 * m.compressiveStrength * th * th;
+        Ru = (8 * Math.max(March, Mcr)) / (L * L);
+        k = (384 * m.youngModulus * Ig) / (5 * L ** 4);
+        theta = URM_THETA;
+        xCap = 0.5 * th;
+      }
+      const xm = (deg: number) => Math.min(xCap, (L / 2) * Math.tan((deg * Math.PI) / 180));
+      const [P0, I0] = sdofAsymptotes(Ru, k, mass, xm(theta[0]));
+      const [P0b, I0b] = sdofAsymptotes(Ru, k, mass, xm(theta[1]));
+      return { P0, I0, P0b, I0b };
     }
   }
+}
+
+/** P–I asymptotes (onset, severe) of a member, for tests, tables and the HUD. */
+export function piAsymptotes(m: MaterialProps, thickness: number): Readonly<PIParams> {
+  return piParams(m, thickness);
 }
 
 /**
@@ -387,6 +455,135 @@ export function piDamage(P: number, I: number, m: MaterialProps, thickness: numb
   return 1 + Math.log(s1) / Math.log(Math.max(ratio, 1.0001));
 }
 
+// ─── Confined detonations: quasi-static gas pressure ───────────────────────────────────────
+
+/**
+ * Quasi-static gas overpressure after a detonation inside a closed volume, Pa:
+ * Δp_QS = 2.25 MPa · (W/V)^0.72, W kg TNT, V m³ (Weibull 1968 fit to closed-chamber data, the
+ * curve of UFC 3-340-02 fig. 2-152 and NATO AASTP-1). 12 kg in 616 m³ (W/V = 0.019) → 132 kPa.
+ * Capped at W/V = 5 kg/m³ (the upper end of the data).
+ */
+export function quasiStaticPressure(W: number, V: number): number {
+  if (!(W > 0) || !(V > 0)) return 0;
+  return 2.25e6 * Math.pow(Math.min(W / V, 5), 0.72);
+}
+
+/**
+ * Blow-down time constant of the gas pressure through a vent of area A, s: choked outflow,
+ * dm/dt = −C_d A ρ c · 0.578 (γ = 1.4) → τ = V / (0.578 C_d A c), C_d = 0.6 (sharp-edged openings),
+ * c = 20.05 √T of the heated gas with T ≈ 293 K · p_abs/p_0 (isochoric heating). Kinney & Graham
+ * 1985, "Explosive Shocks in Air", ch. 13 (vented internal explosions).
+ */
+export function ventTimeConstant(V: number, A: number, P: number): number {
+  const T = 293 * (1 + P / 101_325);
+  const c = 20.05 * Math.sqrt(T);
+  return V / (0.578 * 0.6 * Math.max(A, 1e-3) * c);
+}
+
+/**
+ * Longest gas-pressure duration counted, s. Walls that fail open the enclosure (frangible venting,
+ * UFC 3-340-02 §2-15), and by then the load is well into the quasi-static regime of the
+ * storey-height members here (natural periods ≈ 20–30 ms). Game-level choice, see PHYSICS.md.
+ */
+export const GAS_DURATION_CAP = 0.05;
+/** Afterburning of a fuel-rich thermobaric fill in the room air: TNT-equivalent × this for the gas pressure (estimate). */
+export const THERMOBARIC_GAS_FACTOR = 1.75;
+
+/** A charge's surroundings as measured by rays from it (BlastSystem.measureEnclosure). */
+export interface Enclosure {
+  /** Volume bounded by the surfaces the rays met, m³ */
+  volume: number;
+  /** Area of openings (rays that escaped) and of glazing (fails first and vents), m² */
+  ventArea: number;
+  /** Fraction of directions that met a solid (non-glass) surface within the probe range */
+  closed: number;
+  /** Farthest enclosure surface met, m */
+  radius: number;
+}
+
+/** Quasi-static gas load on the inner faces of an enclosure. */
+export interface GasLoad {
+  /** Peak quasi-static overpressure, Pa */
+  pressure: number;
+  /** Its impulse on the enclosure faces, Pa·s (exponential blow-down, duration capped) */
+  impulse: number;
+  /** Blow-down time constant, s */
+  tau: number;
+  /** Faces within this distance of the charge are loaded (if they face it), m */
+  radius: number;
+  enclosure: Enclosure;
+}
+
+/**
+ * Gas pressure for a charge of `tntKg` in `enc`, or null when it vents too freely to matter.
+ * Venting: full quasi-static pressure for a scaled vent area A/V^⅔ ≤ 0.15, none from 0.6 up
+ * (smooth in between; game-level reading of UFC 3-340-02 §2-15, where rooms with large openings
+ * are treated as fully vented).
+ */
+export function gasLoad(tntKg: number, thermobaric: boolean, enc: Enclosure): GasLoad | null {
+  if (!(enc.volume > 0.1)) return null;
+  const aScaled = enc.ventArea / Math.pow(enc.volume, 2 / 3);
+  const g = 1 - smooth01((aScaled - 0.15) / 0.45);
+  if (g <= 0.01) return null;
+  const P = g * quasiStaticPressure(tntKg * (thermobaric ? THERMOBARIC_GAS_FACTOR : 1), enc.volume);
+  if (P < 1000) return null;
+  const tau = ventTimeConstant(enc.volume, enc.ventArea, P);
+  // ∫ P e^(−t/τ) dt over [0, cap]
+  const impulse = P * tau * (1 - Math.exp(-GAS_DURATION_CAP / tau));
+  return { pressure: P, impulse, tau, radius: enc.radius * 1.1 + 0.5, enclosure: enc };
+}
+
+function smooth01(x: number): number {
+  const t = clamp(x, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+// ─── Loose bodies ────────────────────────────────────────────────────────────────────────────
+
+/** Radius of a bare TNT sphere (ρ ≈ 1 600 kg/m³), m: 0.053 W^⅓. */
+export function chargeRadius(tntKg: number): number {
+  return 0.053 * Math.cbrt(Math.max(tntKg, 0));
+}
+
+/**
+ * Impulse on a compact loose body (debris, a fallen slab) of sphere-equivalent radius rEq whose
+ * centre is `dist` from the charge, N·s.
+ *
+ * 1. Load: the reflected impulse integrated over the presented disc (π rEq², four equal-area rings)
+ *    at the body's own standoff s = dist − rEq, with oblique reflection per ring — not the value
+ *    at one point, which for a large body next to the charge sits almost on the charge.
+ * 2. Clearing: a finite body only feels the reflected pressure until the rarefaction from its edges
+ *    clears it, t_c ≈ 4S / ((1 + S/G) U) ≈ 2 rEq / U, U ≈ 400 m/s (UFC 3-340-02 §2-15.3); after
+ *    that roughly the incident pressure: i = i_s + (i_r − i_s) min(1, t_c / t_d).
+ * 3. Momentum bound inside the fireball (products-dominated near field): a Gurney sphere with a
+ *    linear velocity profile carries W·(3/4)·√(5/3)·√(2E) ≈ W √(2E) of outward momentum (Gurney
+ *    1943), at most doubled by reflection, so a body subtending the half-angle α gets at most
+ *    W √(2E) (1 − cos α). Relaxed smoothly between 0.5 and 1.5 fireball radii, where the air
+ *    shock takes over.
+ */
+export function bodyBlastImpulse(o: { tntKg: number; W: number; thermobaric: boolean; dist: number; rEq: number; gurney?: number }): number {
+  const { tntKg, W, thermobaric, rEq } = o;
+  if (!(tntKg > 0) || !(rEq > 0)) return 0;
+  const s = Math.max(o.dist - rEq, chargeRadius(tntKg));
+  const K = 4;
+  const area = (Math.PI * rEq * rEq) / K;
+  const tc = (2 * rEq) / 400;
+  const b: Partial<BlastPoint> = {};
+  let J = 0;
+  for (let k = 0; k < K; k++) {
+    const rho = rEq * Math.sqrt((k + 0.5) / K);
+    const R = Math.hypot(s, rho);
+    blastAt(W, R, thermobaric, b);
+    const ir = obliqueReflection(b.is!, b.ir!, s / R);
+    J += area * (b.is! + (ir - b.is!) * Math.min(1, tc / Math.max(b.td!, 1e-6)));
+  }
+  const cosA = s / Math.hypot(s, rEq);
+  const avail = tntKg * (o.gurney ?? 2440) * (1 - cosA);
+  const Rf = fireballRadius(tntKg, thermobaric);
+  const relax = smooth01((s - 0.5 * Rf) / Rf);
+  return Math.min(J, avail + J * relax);
+}
+
 // ─── BlastLoad ──────────────────────────────────────────────────────────────────────────────
 
 export interface BlastLoadOptions {
@@ -396,18 +593,35 @@ export interface BlastLoadOptions {
   groundY?: number;
   /** Charge buried inside the target (delay-fuzed penetrators): tamping factor ≥ 1 for contactDamage */
   tamping?: number;
+  /** Quasi-static gas pressure of a confined detonation, for targets that bound the enclosure */
+  gas?: GasLoad | null;
+}
+
+/** BlastLoad with the confinement it was built with (for telemetry and tests). */
+export interface ExtendedBlastLoad extends BlastLoad {
+  gas: GasLoad | null;
 }
 
 const _d = new THREE.Vector3();
 
-/** Build the blast as seen by targets: all queries are closed-form and allocation-free. */
-export function createBlastLoad(req: BlastRequest, time: number, opts: BlastLoadOptions = {}): BlastLoad {
+/**
+ * Build the blast as seen by targets: all queries are closed-form and allocation-free.
+ *
+ * With `opts.gas` (a confined detonation, for a target that bounds the enclosure) faces inside the
+ * enclosure that are turned towards the charge also carry the quasi-static gas pressure: it adds
+ * to the reflected impulse, bounds the peak pressure from below, and the P–I damage number is the
+ * larger of the shock alone and (P_QS, i_r + i_gas) — the long-duration load read on the same
+ * iso-damage curve (its quasi-static asymptote governs).
+ */
+export function createBlastLoad(req: BlastRequest, time: number, opts: BlastLoadOptions = {}): ExtendedBlastLoad {
   const center = req.center.clone();
   const onSurface = !!req.normal || req.kind === 'contact' || req.kind === 'hesh';
   const W = hemisphericalCharge(req.tntKg, center.y - (opts.groundY ?? 0), onSurface);
   const thermo = req.kind === 'thermobaric';
   const att = opts.attenuation ?? 1;
   const tamping = opts.tamping ?? 1;
+  const gas = opts.gas ?? null;
+  const gasR2 = gas ? gas.radius * gas.radius : 0;
   const pt: Partial<BlastPoint> = {};
   const at = (p: THREE.Vector3) => blastAt(W, _d.copy(p).sub(center).length(), thermo, pt);
   const cosInc = (p: THREE.Vector3, n: THREE.Vector3) => {
@@ -415,26 +629,31 @@ export function createBlastLoad(req: BlastRequest, time: number, opts: BlastLoad
     const l = _d.length();
     return l > 1e-6 ? _d.dot(n) / l : 1;
   };
-  const load: BlastLoad = {
-    center, tntKg: req.tntKg, kind: req.kind, normal: req.normal?.clone(), contactTargetId: req.contactTargetId, time,
-    overpressureAt: (p) => at(p).ps * att,
-    impulseAt: (p) => at(p).is * att,
+  const inside = (p: THREE.Vector3) => !!gas && p.distanceToSquared(center) <= gasR2;
+  const load: ExtendedBlastLoad = {
+    center, tntKg: req.tntKg, kind: req.kind, normal: req.normal?.clone(), contactTargetId: req.contactTargetId, time, gas,
+    overpressureAt: (p) => Math.max(at(p).ps * att, inside(p) ? gas!.pressure : 0),
+    impulseAt: (p) => at(p).is * att + (inside(p) ? gas!.impulse : 0),
     reflectedPressureAt(p, n) {
       const c = cosInc(p, n);
       const b = at(p);
-      return obliqueReflection(b.ps, b.pr, c) * att;
+      const pr = obliqueReflection(b.ps, b.pr, c) * att;
+      return c > 0 && inside(p) ? Math.max(pr, gas!.pressure) : pr;
     },
     reflectedImpulseAt(p, n) {
       const c = cosInc(p, n);
       const b = at(p);
-      return obliqueReflection(b.is, b.ir, c) * att;
+      const ir = obliqueReflection(b.is, b.ir, c) * att;
+      return c > 0 && inside(p) ? ir + gas!.impulse : ir;
     },
     arrivalTime: (p) => at(p).ta,
     contactDamage: (m, t) => contactDamage(req.tntKg, req.kind, m, t, tamping),
     damageAt(p, n, m, t) {
       const c = cosInc(p, n);
       const b = at(p);
-      return piDamage(obliqueReflection(b.ps, b.pr, c) * att, obliqueReflection(b.is, b.ir, c) * att, m, t);
+      const pr = obliqueReflection(b.ps, b.pr, c) * att, ir = obliqueReflection(b.is, b.ir, c) * att;
+      const d = piDamage(pr, ir, m, t);
+      return c > 0 && inside(p) ? Math.max(d, piDamage(gas!.pressure, ir + gas!.impulse, m, t)) : d;
     },
   };
   return load;

@@ -32,13 +32,10 @@ const MULLION: BeamProfile = { type: 'box', h: 0.1, b: 0.05, t: 0.004 };
 const TINOS = 0x6f9a80;
 
 /**
- * Golden-hour photography settings (see look.ts). More sky light than the other scenes: the
- * white soffit of the roof sees only what bounces off the travertine, which the environment map
- * (a dark ground hemisphere) does not carry; at the default 0.55 it went nearly black. No glass
- * reflection probes: during a roof collapse the glass module recaptured every probe on every
- * frame (19.6 s of glass frame time over 4 s of collapse, measured; see look.ts).
+ * Golden-hour photography settings (see look.ts): the pipeline's own sky balance, and local
+ * reflection probes for the glass (budgeted by the glass module to one cube face per frame).
  */
-export const pavilionLook: SceneLook = { sky: { turbidity: 3.2, rayleigh: 1.8 }, exposure: 1.0, ambient: 0.8, fov: 55, visibility: 7000, glassProbes: false };
+export const pavilionLook: SceneLook = { sky: { turbidity: 3.2, rayleigh: 1.8 }, exposure: 1.0, fov: 55, visibility: 7000, glassProbes: true };
 
 export const pavilion: SceneDef = {
   id: 'pavilion',

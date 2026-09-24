@@ -9,6 +9,12 @@ import { cellMatchesShape, type ShapeSdf } from './shape.ts';
  * centres [c0 + ½, c0 + N + ½] (in sample units) and meets its neighbours without gaps or overlaps.
  * Normals come from the density gradient (central differences, trilinearly interpolated), except
  * on untouched cells which snap onto the analytic shape.
+ *
+ * Untouched faces of a box are flat and carry no damage, so the quads on them are merged: each
+ * maximal rectangle of such quads in a chunk becomes a fan around its centre through every vertex
+ * of its rim (so the rim still meets the neighbouring quads vertex for vertex — no T-junctions,
+ * watertight), and the vertices inside it are dropped. A 16 × 16 patch of face costs 64
+ * triangles instead of 512; a pristine slab piece a few percent of its Surface Nets count.
  */
 export interface MeshData {
   positions: Float32Array;
@@ -38,7 +44,14 @@ const sNrm = new Float32Array(MAXV * 3);
 const sDmg = new Float32Array(MAXV);
 const sDep = new Float32Array(MAXV);
 const sSoot = new Float32Array(MAXV);
+/** Per vertex: untouched box-face vertex, 1 + axis·2 + (outward sign > 0), else 0 */
+const sFace = new Uint8Array(MAXV);
 const sIdx = new Uint32Array(MAXV * 18);
+/** Quads marked for merging, per (axis, cell layer): value 1 + (starts inside) at [a + CELLS·b] */
+const faceMasks = new Map<number, Uint8Array>();
+const usedV = new Int32Array(MAXV);
+/** Fewest quads a merged rectangle must replace (smaller ones stay as they are) */
+const MERGE_MIN = 6;
 const OFF = new Int32Array(8);
 for (let c = 0; c < 8; c++) OFF[c] = (c & 1) + P * ((c >> 1) & 1) + P2 * ((c >> 2) & 1);
 // 12 cube edges as corner pairs (corner bit 0 = x, bit 1 = y, bit 2 = z)
@@ -108,6 +121,7 @@ export function meshChunk(g: VoxelGrid, shape: ShapeSdf | null, a: number, b: nu
   if (!gather(g, a, b, c)) return null;
   const h = g.h;
   const depthAttr = !!shape && shape.type === 'sdf';
+  const flatFaces = !!shape && shape.type === 'box';
   const i0 = a * N, j0 = b * N, k0 = c * N;
   let nv = 0;
   // Pass 1: one vertex per surface-crossing cell.
@@ -154,9 +168,17 @@ export function meshChunk(g: VoxelGrid, shape: ShapeSdf | null, a: number, b: nu
           snapped = shape.snap(g, cx, cy, cz, snapPos, snapNrm);
         }
         let px: number, py: number, pz: number;
+        sFace[nv] = 0;
         if (snapped) {
           px = snapPos[0]!; py = snapPos[1]!; pz = snapPos[2]!;
           sNrm[vo] = snapNrm[0]!; sNrm[vo + 1] = snapNrm[1]!; sNrm[vo + 2] = snapNrm[2]!;
+          // A face (not edge or corner) vertex of a box, without soot: mergeable.
+          if (flatFaces && ssum === 0) {
+            const nx = snapNrm[0]!, ny = snapNrm[1]!, nz = snapNrm[2]!;
+            if (ny === 0 && nz === 0) sFace[nv] = 1 + (nx > 0 ? 1 : 0);
+            else if (nx === 0 && nz === 0) sFace[nv] = 3 + (ny > 0 ? 1 : 0);
+            else if (nx === 0 && ny === 0) sFace[nv] = 5 + (nz > 0 ? 1 : 0);
+          }
         } else {
           px = g.ox + (cx + fx) * h;
           py = g.oy + (cy + fy) * h;
@@ -188,6 +210,19 @@ export function meshChunk(g: VoxelGrid, shape: ShapeSdf | null, a: number, b: nu
   if (nv === 0) return null;
   // Pass 2: one quad per sign-changing edge whose minimum cell lies in this chunk.
   let ni = 0;
+  for (const m of faceMasks.values()) m.fill(0);
+  let marked = 0;
+  /** Mark a quad on an untouched box face for merging instead of emitting it. */
+  const mark = (axis: number, layer: number, qa: number, qb: number, c0: number, c1: number, c2: number, c3: number, inside: boolean): boolean => {
+    const f = sFace[cellVert[c0]!]!;
+    if (f === 0 || (f - 1) >> 1 !== axis || sFace[cellVert[c1]!] !== f || sFace[cellVert[c2]!] !== f || sFace[cellVert[c3]!] !== f) return false;
+    const key = axis * 64 + layer;
+    let m = faceMasks.get(key);
+    if (!m) faceMasks.set(key, (m = new Uint8Array(CELLS * CELLS)));
+    m[qa + CELLS * qb] = inside ? 2 : 1;
+    marked++;
+    return true;
+  };
   for (let k = 0; k < CELLS; k++)
     for (let j = 0; j < CELLS; j++)
       for (let i = 0; i < CELLS; i++) {
@@ -197,17 +232,25 @@ export function meshChunk(g: VoxelGrid, shape: ShapeSdf | null, a: number, b: nu
         const inside = blockD[base]! >= ISO;
         // +X edge: cells (i, j−1..j, k−1..k)
         if (i < N && j > 0 && k > 0 && (blockD[base + 1]! >= ISO) !== inside) {
-          ni = emitQuad(ni, cidx - CELLS - CELLS * CELLS, cidx - CELLS * CELLS, cidx, cidx - CELLS, inside);
+          const q0 = cidx - CELLS - CELLS * CELLS, q1 = cidx - CELLS * CELLS, q3 = cidx - CELLS;
+          if (!flatFaces || !mark(0, i, j, k, q0, q1, cidx, q3, inside)) ni = emitQuad(ni, q0, q1, cidx, q3, inside);
         }
         // +Y edge: cells (i−1..i, j, k−1..k); ordered in the (z, x) plane
         if (j < N && i > 0 && k > 0 && (blockD[base + P]! >= ISO) !== inside) {
-          ni = emitQuad(ni, cidx - 1 - CELLS * CELLS, cidx - 1, cidx, cidx - CELLS * CELLS, inside);
+          const q0 = cidx - 1 - CELLS * CELLS, q1 = cidx - 1, q3 = cidx - CELLS * CELLS;
+          if (!flatFaces || !mark(1, j, i, k, q0, q1, cidx, q3, inside)) ni = emitQuad(ni, q0, q1, cidx, q3, inside);
         }
         // +Z edge: cells (i−1..i, j−1..j, k); ordered in the (x, y) plane
         if (k < N && i > 0 && j > 0 && (blockD[base + P2]! >= ISO) !== inside) {
-          ni = emitQuad(ni, cidx - 1 - CELLS, cidx - CELLS, cidx, cidx - 1, inside);
+          const q0 = cidx - 1 - CELLS, q1 = cidx - CELLS, q3 = cidx - 1;
+          if (!flatFaces || !mark(2, k, i, j, q0, q1, cidx, q3, inside)) ni = emitQuad(ni, q0, q1, cidx, q3, inside);
         }
       }
+  if (marked > 0) {
+    const r = mergeFaces(nv, ni);
+    nv = r.nv;
+    ni = r.ni;
+  }
   if (ni === 0) return null;
   const indices = nv < 65536 ? new Uint16Array(ni) : new Uint32Array(ni);
   for (let q = 0; q < ni; q++) indices[q] = sIdx[q]!;
@@ -221,6 +264,96 @@ export function meshChunk(g: VoxelGrid, shape: ShapeSdf | null, a: number, b: nu
     vertexCount: nv,
     indexCount: ni,
   };
+}
+
+/** Cell index of in-plane quad corner (u, v) on `layer` of a face normal to `axis`. */
+function cellOf(axis: number, layer: number, u: number, v: number): number {
+  // In-plane axes: X faces (j, k), Y faces (i, k), Z faces (i, j).
+  return axis === 0 ? layer + CELLS * (u + CELLS * v) : axis === 1 ? u + CELLS * (layer + CELLS * v) : u + CELLS * (v + CELLS * layer);
+}
+
+/**
+ * Replace the marked quads by merged rectangles (fans around a new centre vertex through every
+ * rim vertex), emit leftovers as plain quads, then drop vertices no triangle uses. A quad at edge
+ * (qa, qb) spans cells qa−1..qa × qb−1..qb, so a rectangle of quads qa0..qa1 × qb0..qb1 has its
+ * rim on the ring of cells qa0−1..qa1 × qb0−1..qb1.
+ */
+function mergeFaces(nv0: number, ni0: number): { nv: number; ni: number } {
+  let nv = nv0, ni = ni0;
+  for (const [key, m] of faceMasks) {
+    const axis = key >> 6, layer = key & 63;
+    for (let qb = 1; qb < CELLS; qb++)
+      for (let qa = 1; qa < CELLS; qa++) {
+        const val = m[qa + CELLS * qb]!;
+        if (!val) continue;
+        // Greedy maximal rectangle: widen along a, then grow along b while whole rows match.
+        let a1 = qa;
+        while (a1 + 1 < CELLS && m[a1 + 1 + CELLS * qb] === val) a1++;
+        let b1 = qb;
+        grow: while (b1 + 1 < CELLS) {
+          for (let x = qa; x <= a1; x++) if (m[x + CELLS * (b1 + 1)] !== val) break grow;
+          b1++;
+        }
+        for (let y = qb; y <= b1; y++) for (let x = qa; x <= a1; x++) m[x + CELLS * y] = 0;
+        const inside = val === 2;
+        const wa = a1 - qa + 1, wb = b1 - qb + 1;
+        if (wa * wb < MERGE_MIN || wa < 2 || wb < 2 || nv >= MAXV) {
+          for (let y = qb; y <= b1; y++)
+            for (let x = qa; x <= a1; x++) {
+              const c00 = cellOf(axis, layer, x - 1, y - 1), c10 = cellOf(axis, layer, x, y - 1);
+              const c11 = cellOf(axis, layer, x, y), c01 = cellOf(axis, layer, x - 1, y);
+              // Same corner order as pass 2 for this axis (X: (j,k); Y: (z,x)-ordered; Z: (x,y)).
+              if (axis === 1) ni = emitQuad(ni, c00, c01, c11, c10, inside);
+              else ni = emitQuad(ni, c00, c10, c11, c01, inside);
+            }
+          continue;
+        }
+        // Rim cells, counter-clockwise in (u, v): u0..u1 × v0..v1.
+        const u0 = qa - 1, u1 = a1, v0 = qb - 1, v1 = b1;
+        const rim: number[] = [];
+        for (let u = u0; u < u1; u++) rim.push(cellVert[cellOf(axis, layer, u, v0)]!);
+        for (let v = v0; v < v1; v++) rim.push(cellVert[cellOf(axis, layer, u1, v)]!);
+        for (let u = u1; u > u0; u--) rim.push(cellVert[cellOf(axis, layer, u, v1)]!);
+        for (let v = v1; v > v0; v--) rim.push(cellVert[cellOf(axis, layer, u0, v)]!);
+        const ca = rim[0]!, cb = cellVert[cellOf(axis, layer, u1, v1)]!;
+        const cv = nv++;
+        for (let q = 0; q < 3; q++) {
+          sPos[cv * 3 + q] = 0.5 * (sPos[ca * 3 + q]! + sPos[cb * 3 + q]!);
+          sNrm[cv * 3 + q] = sNrm[ca * 3 + q]!;
+        }
+        sDmg[cv] = 0; sDep[cv] = 0; sSoot[cv] = 0; sFace[cv] = sFace[ca]!;
+        // (u, v) counter-clockwise faces +X for X faces (y × z = x), −Y for Y faces (x × z = −y),
+        // +Z for Z faces; flip to the outward normal.
+        const f = sFace[ca]!;
+        const outward = (f & 1) === 0 ? 1 : -1; // f = 1 + 2·axis + (sign > 0)
+        const ccwNormal = axis === 1 ? -1 : 1;
+        const flip = outward * ccwNormal < 0;
+        for (let q = 0; q < rim.length; q++) {
+          const p0 = rim[q]!, p1 = rim[(q + 1) % rim.length]!;
+          sIdx[ni++] = cv;
+          if (flip) { sIdx[ni++] = p1; sIdx[ni++] = p0; } else { sIdx[ni++] = p0; sIdx[ni++] = p1; }
+        }
+      }
+  }
+  // Compact: vertices inside merged rectangles are no longer referenced.
+  usedV.fill(-1, 0, nv);
+  let n = 0;
+  for (let q = 0; q < ni; q++) {
+    const v = sIdx[q]!;
+    if (usedV[v] === -1) usedV[v] = -2;
+  }
+  for (let v = 0; v < nv; v++) {
+    if (usedV[v] !== -2) continue;
+    usedV[v] = n;
+    if (v !== n) {
+      sPos[n * 3] = sPos[v * 3]!; sPos[n * 3 + 1] = sPos[v * 3 + 1]!; sPos[n * 3 + 2] = sPos[v * 3 + 2]!;
+      sNrm[n * 3] = sNrm[v * 3]!; sNrm[n * 3 + 1] = sNrm[v * 3 + 1]!; sNrm[n * 3 + 2] = sNrm[v * 3 + 2]!;
+      sDmg[n] = sDmg[v]!; sDep[n] = sDep[v]!; sSoot[n] = sSoot[v]!;
+    }
+    n++;
+  }
+  for (let q = 0; q < ni; q++) sIdx[q] = usedV[sIdx[q]!]!;
+  return { nv: n, ni };
 }
 
 /**

@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { ConvexGeometry } from 'three/addons/geometries/ConvexGeometry.js';
 import type RAPIER from '@dimforge/rapier3d-compat';
 import type { SimContext, VoxelElementSpec } from '../../app/contracts.ts';
 import { AIR_DENSITY, G } from '../../core/units.ts';
@@ -162,6 +163,15 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   private solidDirty = false;
   private barsDirty = false;
   private matrixDirty = false;
+  /**
+   * A new piece draws its collision hull until the chunks queued at its birth are meshed (they
+   * are spread over frames by the remesh budget; a released slab is ~1 000 chunks).
+   */
+  private proxy: { attrs: Record<string, THREE.BufferAttribute>; index: THREE.BufferAttribute } | null = null;
+  private proxyShown = false;
+  private birthChunks: Uint8Array | null = null;
+  private birthPending = 0;
+  private hullPts: Float32Array | null = null;
   private rebarMesh: THREE.InstancedMesh | null = null;
   private rebarLen: THREE.InstancedBufferAttribute | null = null;
   private rebarSeen = -1;
@@ -267,6 +277,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     this.buildRebarMesh();
     if (this.dynamic) this.makeDynamicBody(piece?.linvel, piece?.angvel, !piece);
     else this.makeStaticBody();
+    if (piece && this.birthPending > 0) this.buildProxy();
     if (!this.dynamic) this.structural = this;
     this.updateBounds();
   }
@@ -344,6 +355,14 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     g.dirty[ci] = 0;
     const a = ci % g.cx, b = Math.floor(ci / g.cx) % g.cy, c = Math.floor(ci / (g.cx * g.cy));
     const m = chunkMayHaveSurface(g, a, b, c) ? meshChunk(g, this.shape, a, b, c) : null;
+    if (this.birthChunks?.[ci]) {
+      this.birthChunks[ci] = 0;
+      if (--this.birthPending <= 0) {
+        // Every chunk of the new piece is meshed: the real surface replaces the hull proxy.
+        this.birthChunks = null;
+        this.proxy = null;
+      }
+    }
     this.setChunkMesh(ci, m);
     if (!this.meshed[ci]) {
       this.meshed[ci] = 1;
@@ -358,11 +377,14 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   /** Queue every chunk that can own surface for meshing with priority `prio`. */
   private queueAllChunks(prio: number): void {
     const g = this.grid;
+    this.birthChunks = new Uint8Array(g.chunkCount);
     for (let ci = 0; ci < g.chunkCount; ci++) {
       const a = ci % g.cx, b = Math.floor(ci / g.cx) % g.cy, c = Math.floor(ci / (g.cx * g.cy));
       if (chunkMayHaveSurface(g, a, b, c)) {
         g.dirty[ci] = 1;
         this.scheduler.request(this, ci, prio);
+        this.birthChunks[ci] = 1;
+        this.birthPending++;
       }
       if (!this.meshed[ci]) {
         this.meshed[ci] = 1;
@@ -448,7 +470,58 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     }
   }
 
+  /**
+   * The proxy drawn until a new piece is meshed: the convex hull of its collider points, with
+   * vertices within ~a voxel of an original box face put back on that face (the hull points sit
+   * ~0.65 voxel inside the surface), so the shader shades those faces as the original finish.
+   */
+  private buildProxy(): void {
+    const pts = this.hullPts;
+    this.hullPts = null;
+    if (!pts || pts.length < 12) return;
+    const v: THREE.Vector3[] = [];
+    for (let i = 0; i < pts.length; i += 3) v.push(new THREE.Vector3(pts[i], pts[i + 1], pts[i + 2]));
+    let geo: THREE.BufferGeometry;
+    try {
+      geo = new ConvexGeometry(v);
+    } catch {
+      return;
+    }
+    const pos = geo.getAttribute('position').array as Float32Array;
+    geo.dispose();
+    const n = pos.length / 3;
+    if (n < 3) return;
+    if (this.shape instanceof BoxShape) {
+      const half = this.shape.half, reach = 0.8 * this.grid.h;
+      for (let i = 0; i < pos.length; i++) {
+        const hh = half[i % 3]!;
+        if (Math.abs(pos[i]!) >= hh - reach) pos[i] = Math.sign(pos[i]!) * hh;
+      }
+    }
+    const nrm = new Float32Array(pos.length);
+    for (let t = 0; t < pos.length; t += 9) {
+      _v.set(pos[t + 3]! - pos[t]!, pos[t + 4]! - pos[t + 1]!, pos[t + 5]! - pos[t + 2]!);
+      _v2.set(pos[t + 6]! - pos[t]!, pos[t + 7]! - pos[t + 1]!, pos[t + 8]! - pos[t + 2]!);
+      _v.cross(_v2).normalize();
+      for (let k = 0; k < 3; k++) { nrm[t + k * 3] = _v.x; nrm[t + k * 3 + 1] = _v.y; nrm[t + k * 3 + 2] = _v.z; }
+    }
+    const idx = n > 65535 ? new Uint32Array(n) : new Uint16Array(n);
+    for (let i = 0; i < n; i++) idx[i] = i;
+    this.proxy = { attrs: solidAttributes(pos, nrm, new Float32Array(n), new Float32Array(n), new Float32Array(n)), index: new THREE.BufferAttribute(idx, 1) };
+    this.solidDirty = true;
+    this.requestBatchFlush();
+  }
+
   private pushSolid(parent: THREE.Object3D, matrix: THREE.Matrix4): void {
+    if (this.proxy) {
+      // Chunks meshed meanwhile wait until the whole piece is done (a partial surface has holes).
+      if (this.proxyShown) return;
+      const batch = this.solidBatch ?? this.look.batches.solid(this.castsShadow(), parent);
+      this.solidSlot = this.solidSlot ? batch.update(this.solidSlot, this.proxy.attrs, this.proxy.index, matrix) : batch.add(this.proxy.attrs, this.proxy.index, matrix);
+      this.solidBatch = batch;
+      this.proxyShown = true;
+      return;
+    }
     const parts = this.pieceParts ?? [];
     let nv = 0, ni = 0;
     for (const q of parts) if (q) { nv += q.vertexCount; ni += q.indexCount; }
@@ -545,11 +618,12 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
           nv++;
         }
       }
+      // Counter-clockwise seen from outside: (a1 − a0) × (b0 − a0) ∝ w × t = u, outward.
       for (let k = 0; k < SIDES; k++) {
         const k1 = (k + 1) % SIDES;
         const a0 = base + k, a1 = base + k1, b0 = base + SIDES + k, b1 = base + SIDES + k1;
-        idx[ni++] = a0; idx[ni++] = b0; idx[ni++] = a1;
-        idx[ni++] = a1; idx[ni++] = b0; idx[ni++] = b1;
+        idx[ni++] = a0; idx[ni++] = a1; idx[ni++] = b0;
+        idx[ni++] = a1; idx[ni++] = b1; idx[ni++] = b0;
       }
     }
     const batch = this.look.batches.rebar(parent);
@@ -823,6 +897,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const p = this.ctx.physics;
     if (!this.dynamic) return;
     const pts = this.hullPoints();
+    if (this.birthPending > 0) this.hullPts = pts;
     this.mass = this.grid.solidVolume() * this.material.density + (this.rebar?.mass() ?? 0);
     const size = Math.cbrt(this.grid.solidVolume());
     let desc = p.R.ColliderDesc.convexHull(pts);
@@ -1157,7 +1232,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     // hazards and evaluation"); only surfaces facing the charge.
     const Rs = (contact ? 0.7 : 1.0) * Math.cbrt(W);
     this.carver.sootSplat(c.x, c.y, c.z, Rs, 0.95, seed);
-    const barsMoved = this.rebar ? this.bendBars(load, c) : false;
+    const barsMoved = this.rebar && this.barsMayBend(load) ? this.bendBars(load, c) : false;
     this.blastAxis = null;
     this.pendingBlast = { load, thickness, until: this.ctx.time.now + 0.5 };
     this.stats.lastCarveMs = performance.now() - t0;
@@ -1556,6 +1631,29 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       rb.register(g);
     }
     return changed;
+  }
+
+  /**
+   * Cheap bound before walking every bar: the most a blast can turn an exposed free bar end,
+   * from the same energy balance as bendRun (KE = I'²L/(2m'), θ = KE/M_p, Jones 1989), for the
+   * thinnest bar, a free length as long as the element and the reflected impulse at the
+   * element's nearest point: θ = 12 i_r² L / (π ρ f_y d³). Clamped spans deflect less than a
+   * free end turns, so below 0.01 rad nothing can move.
+   */
+  private barsMayBend(load: BlastLoad): boolean {
+    const rb = this.rebar!;
+    let r = Infinity;
+    for (let s = 0; s < rb.segCount; s++) if (rb.alive(s)) r = Math.min(r, rb.radius(s));
+    if (!Number.isFinite(r)) return false;
+    this.bounds.clampPoint(load.center, _v);
+    const n = _v2.copy(load.center).sub(_v);
+    if (n.lengthSq() < 1e-8) return true;
+    n.normalize();
+    const ir = load.reflectedImpulseAt(_v, n);
+    const L = 2 * Math.max(...this.shape.half);
+    const d = 2 * r;
+    const theta = (12 * ir * ir * L) / (Math.PI * REBAR.density * (REBAR.yieldStrength ?? 500e6) * d * d * d);
+    return theta >= 0.01;
   }
 
   private bendRun(load: BlastLoad, c: THREE.Vector3, rb: RebarSet, run: number[], la: number, ra: number, firstSeg: number, fy: number, eps: number): boolean {

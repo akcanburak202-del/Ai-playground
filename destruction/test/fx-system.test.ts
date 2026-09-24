@@ -250,6 +250,8 @@ test('fx: a 1 kg detonation flash is brief and local', () => {
   assert.ok(lit.distance > 0 && lit.distance <= 6 * 1.75 + 4 + 1e-9, `reach ${lit.distance}`);
   fx.lights.update(1.06);
   assert.ok(Math.max(...lights.map((l) => l.intensity)) < 0.01 * peak, 'down to 1 % within 60 ms');
+  fx.lights.update(1.02);
+  assert.ok(Math.max(...lights.map((l) => l.intensity)) < 0.05 * peak, 'down to 5 % within 20 ms');
   // No dotted shock-front puffs: every ground-dust puff of the blast starts within the fireball's reach.
   for (const p of smokeParticles(fx, 1)) assert.ok(Math.hypot(p.x, p.z) < 3 * 1.75, `puff at r = ${Math.hypot(p.x, p.z).toFixed(2)}`);
   fx.dispose();

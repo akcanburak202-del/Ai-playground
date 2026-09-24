@@ -17,7 +17,8 @@ import {
   rechtIpson, resolveImpact, resolveJet, tatePenetration, youngDepth, type ResolvedImpact,
 } from '../src/physics/ballistics/penetration.ts';
 import {
-  KB, SHAPED_CONTACT_COUPLING, blastAt, contactDamage, createBlastLoad, hemisphericalCharge, obliqueReflection, piDamage, rangeForOverpressure,
+  KB, SHAPED_CONTACT_COUPLING, blastAt, bodyBlastImpulse, contactDamage, createBlastLoad, gasLoad, hemisphericalCharge, obliqueReflection, piAsymptotes,
+  piDamage, quasiStaticPressure, rangeForOverpressure, ventTimeConstant,
 } from '../src/physics/ballistics/blast.ts';
 import { fragmentAmmo, fragmentBudget, gurneyCylinder, mottScaleMass, sampleFragments } from '../src/physics/ballistics/fragments.ts';
 import type { Destructible, RayHit } from '../src/destructibles/Destructible.ts';
@@ -463,13 +464,87 @@ test('damageAt (P–I): glass, RC/masonry and steel respond at the right distanc
       prev = d;
     }
   }
-  // A 25 cm RC wall is severely damaged right next to 10 kg, cracked at 10 m, intact at 30 m; brick is weaker than RC.
+  // A 25 cm RC wall is breached right next to 10 kg, cracked within ≈ 1.5 m, intact at 10 m; brick is weaker than RC.
   assert.ok(at(0.5, C40, 0.25) >= 2);
-  assert.ok(at(10, C40, 0.25) >= 1);
-  assert.ok(at(30, C40, 0.25) < 1);
+  assert.ok(at(1.2, C40, 0.25) >= 1);
+  assert.ok(at(10, C40, 0.25) < 1);
   assert.ok(at(6, MATERIALS.brick, 0.24) > at(6, C40, 0.24));
   // Long pulses break glass at lower peak pressure than short ones (the P–I curve's two asymptotes).
   assert.ok(piDamage(5000, 500, MATERIALS.glass_annealed, 0.006) > piDamage(5000, 5, MATERIALS.glass_annealed, 0.006));
+});
+
+test('P–I asymptotes of RC walls (SDOF, PDC-TR 06-08 limits): onset ≈ 1–3 kPa·s, reinforcement and thickness matter', () => {
+  const q = piAsymptotes(C40, 0.25);
+  within(q.I0, 1000, 3000, '25 cm RC onset impulse Pa·s');
+  within(q.I0b, 2.5e3, 8e3, '25 cm RC blow-out impulse Pa·s');
+  within(q.P0, 40e3, 150e3, '25 cm RC quasi-static onset Pa (R_u of a 3 m strip)');
+  // A short pulse (triangular, 10 ms) needs hundreds of kPa to crack it.
+  let lo = 1e3, hi = 1e8;
+  for (let i = 0; i < 60; i++) {
+    const mid = Math.sqrt(lo * hi);
+    if (piDamage(mid, mid * 0.005, C40, 0.25) >= 1) hi = mid;
+    else lo = mid;
+  }
+  within(hi, 200e3, 900e3, 'onset peak of a 10 ms pulse Pa');
+  // Thicker is stronger; bars make concrete stronger than the same thickness of brick.
+  assert.ok(piAsymptotes(C40, 0.4).I0 > q.I0 && piAsymptotes(C40, 0.2).I0 < q.I0);
+  assert.ok(piAsymptotes(MATERIALS.brick, 0.25).I0 < q.I0);
+});
+
+test('P–I distances: 4 kg HE vs 25 cm RC and brick — cracks close in, nothing at 10–12 m, contact breaches', () => {
+  // 4 kg in free air 1.2 m above the ground, wall face-on.
+  const load = createBlastLoad({ center: new THREE.Vector3(0, 1.2, 0), tntKg: 4, kind: 'he' }, 0, { groundY: 0 });
+  const at = (x: number, m: MaterialProps, t: number) => load.damageAt(new THREE.Vector3(x, 1.2, 0), new THREE.Vector3(-1, 0, 0), m, t);
+  assert.ok(at(5, C40, 0.25) < 1.3, `5 m: light cracking at most (${at(5, C40, 0.25).toFixed(2)})`);
+  assert.ok(at(5, C40, 0.25) < 1, 'in fact no damage at 5 m');
+  assert.ok(at(10, C40, 0.25) < 0.5 && at(12, C40, 0.25) < 0.5, 'nothing at 10–12 m');
+  assert.ok(at(1, C40, 0.25) >= 1, 'cracked at 1 m');
+  assert.ok(at(0.5, C40, 0.25) >= 2, 'breached at 0.5 m stand-off');
+  // Masonry: the 0.6 m brick block is untouched 7–9 m away; a 23 cm brick wall at 5 m too.
+  for (const x of [7, 8, 9]) assert.ok(at(x, MATERIALS.brick, 0.6) < 0.5, `0.6 m brick at ${x} m`);
+  assert.ok(at(5, MATERIALS.brick, 0.23) < 1);
+  // Contact: 4 kg breaches 25 cm C40 (T* = 0.16 < 0.18), 1 kg only craters and spalls it.
+  assert.ok(contactDamage(4, 'contact', C40, 0.25).breach);
+  const one = contactDamage(1, 'contact', C40, 0.25);
+  assert.ok(!one.breach && one.spallRadius > 0);
+});
+
+test('confined detonation: quasi-static gas pressure loads the room walls (Weibull / UFC 3-340-02 fig. 2-152)', () => {
+  within(quasiStaticPressure(12, 616), 115e3, 150e3, '12 kg in 616 m³, Pa');
+  within(quasiStaticPressure(1, 1), 2.0e6, 2.5e6, '1 kg/m³, Pa');
+  // Blow-down through 10 m² of openings takes a few tenths of a second (≫ wall periods).
+  within(ventTimeConstant(616, 10, 132e3), 0.15, 0.6, 'τ s');
+  const room = { volume: 616, ventArea: 8, closed: 0.9, radius: 9 };
+  const g = gasLoad(12, true, room)!;
+  assert.ok(g && g.pressure > 150e3, 'thermobaric afterburn raises the gas pressure');
+  assert.equal(gasLoad(12, false, { ...room, ventArea: 60 }), null, 'a room open on one side vents freely');
+  // 30 cm RC wall 8 m away inside the chapel: the shock alone does nothing, the gas pressure breaches it.
+  const req = { center: new THREE.Vector3(0, 1.2, 0), tntKg: 12, kind: 'thermobaric' as const };
+  const free = createBlastLoad(req, 0), inside = createBlastLoad(req, 0, { gas: g });
+  const p = new THREE.Vector3(0, 2, 8), nIn = new THREE.Vector3(0, 0, -1), nOut = new THREE.Vector3(0, 0, 1);
+  assert.ok(free.damageAt(p, nIn, C40, 0.3) < 1);
+  assert.ok(inside.damageAt(p, nIn, C40, 0.3) >= 2, `gas-loaded wall ${inside.damageAt(p, nIn, C40, 0.3).toFixed(2)}`);
+  assert.ok(inside.reflectedImpulseAt(p, nIn) > free.reflectedImpulseAt(p, nIn) + 1000);
+  // The outer face and anything beyond the room carry no gas load.
+  assert.equal(inside.damageAt(p, nOut, C40, 0.3), free.damageAt(p, nOut, C40, 0.3));
+  assert.equal(inside.reflectedImpulseAt(new THREE.Vector3(0, 2, 30), nIn), free.reflectedImpulseAt(new THREE.Vector3(0, 2, 30), nIn));
+  // A plain 12 kg HE charge only cracks the 30 cm walls of the same room.
+  const he = createBlastLoad({ ...req, kind: 'he' }, 0, { gas: gasLoad(12, false, room) });
+  within(he.damageAt(p, nIn, C40, 0.3), 1, 2, 'HE gas-loaded wall');
+});
+
+test('blast push on loose bodies: area-integrated, cleared, and bounded by the charge momentum', () => {
+  // A 12 t roof strip (r_eq ≈ 1.05 m) whose centre is 1.5 m from a 2.3 kg column charge: well under 1 m/s.
+  const m = 11500, rEq = Math.cbrt((3 * (m / 2400)) / (4 * Math.PI));
+  const J = bodyBlastImpulse({ tntKg: 2.3, W: 2.3, thermobaric: false, dist: 1.5, rEq });
+  const s = 1.5 - rEq, cosA = s / Math.hypot(s, rEq);
+  assert.ok(J <= 2.3 * 2440 * (1 - cosA) + 1e-6, 'within the products momentum in its solid angle');
+  assert.ok(J / m < 0.3, `roof strip Δv ${(J / m).toFixed(2)} m/s (a 4 m throw needs ≈ 9 m/s)`);
+  // A 150 kg block 3 m from 2 kg on the ground still gets a push of the order of 1 m/s.
+  const rb = Math.cbrt((3 * (150 / 2400)) / (4 * Math.PI));
+  within(bodyBlastImpulse({ tntKg: 2, W: 2, thermobaric: false, dist: 3, rEq: rb }) / 150, 0.1, 2, 'block Δv m/s');
+  // Farther is less.
+  assert.ok(bodyBlastImpulse({ tntKg: 2, W: 2, thermobaric: false, dist: 6, rEq: rb }) < bodyBlastImpulse({ tntKg: 2, W: 2, thermobaric: false, dist: 3, rEq: rb }));
 });
 
 // ─── Fragments ──────────────────────────────────────────────────────────────────────────────

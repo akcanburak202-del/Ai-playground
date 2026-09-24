@@ -41,6 +41,14 @@ const YIELD = 0.015;
 const SLACK_RATE = 5;
 /** Safety cap on particle speed, m/s (blast-driven sheets stay well below it). */
 const MAX_SPEED = 120;
+/**
+ * Sleep test on net motion: a crumpled sheet lying on the floor keeps a few particles jittering by
+ * centimetres about a fixed shape (position-based floor contact against stiff links), so its
+ * largest speed never settles and it simulated for ever (≈ 1–3 ms per sheet per step). The mean
+ * drift of its particles over SLEEP_WINDOW s tells rest (≈ 0.1 mm) from sliding or falling.
+ */
+const SLEEP_WINDOW = 0.5;
+const SLEEP_DRIFT = 0.0005;
 
 export class Membrane {
   readonly nx: number;
@@ -75,6 +83,9 @@ export class Membrane {
   awake = false;
   released = false;
   private still = 0;
+  /** Time since the drift snapshot, s, and the snapshot of x */
+  private window = 0;
+  private readonly snap: Float64Array;
   /** Largest particle speed in the last step, m/s */
   maxSpeed = 0;
   /** Largest floor-contact impulse in the last step (N·s), for debris sounds */
@@ -89,6 +100,7 @@ export class Membrane {
     this.x = new Float64Array(3 * n);
     this.p = new Float64Array(3 * n);
     this.v = new Float64Array(3 * n);
+    this.snap = new Float64Array(3 * n);
     this.rest = new Float64Array(2 * n);
     this.w = new Float64Array(n);
     this.mass = new Float64Array(n);
@@ -250,6 +262,8 @@ export class Membrane {
   wake(): void {
     this.awake = true;
     this.still = 0;
+    this.window = 0;
+    this.snap.set(this.x);
   }
 
   step(dt: number): void {
@@ -349,11 +363,24 @@ export class Membrane {
     this.plastic(dt);
     if (this.maxSpeed < 0.004) {
       this.still += dt;
-      if (this.still > 0.6) {
-        this.awake = false;
-        this.v.fill(0);
-      }
+      if (this.still > 0.6) this.sleep();
     } else this.still = 0;
+    this.window += dt;
+    if (this.awake && this.window >= SLEEP_WINDOW) {
+      let drift = 0;
+      for (let k = 0; k < this.n; k++) {
+        const o = 3 * k;
+        drift += Math.hypot(x[o]! - this.snap[o]!, x[o + 1]! - this.snap[o + 1]!, x[o + 2]! - this.snap[o + 2]!);
+      }
+      this.window = 0;
+      this.snap.set(x);
+      if (drift / this.n < SLEEP_DRIFT) this.sleep();
+    }
+  }
+
+  private sleep(): void {
+    this.awake = false;
+    this.v.fill(0);
   }
 
   /**

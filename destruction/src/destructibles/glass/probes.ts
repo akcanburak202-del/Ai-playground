@@ -1,10 +1,9 @@
 import * as THREE from 'three';
 import type { SimContext } from '../../app/contracts.ts';
+import { probeUniforms } from './look.ts';
 
 /** Probes closer than this are shared, m. */
 const SHARE_RADIUS = 7;
-/** Cube face size of a probe, px. */
-const SIZE = 256;
 /** Far plane of the capture, m. */
 const FAR = 600;
 /**
@@ -14,23 +13,24 @@ const FAR = 600;
  */
 const SETTLE = 1.2;
 const MAX_STALE = 6;
-/** Work units of one capture: the six cube faces, then the PMREM prefilter. */
-const FILTER_UNIT = 6;
+/** Work units of one capture: the six cube faces (the mips are generated with the last one). */
+const FACES = 6;
 
 interface Probe {
   position: THREE.Vector3;
   target: THREE.WebGLCubeRenderTarget;
   camera: THREE.CubeCamera;
-  env: THREE.WebGLRenderTarget | null;
+  /** A complete capture exists (the target is sampled from then on) */
+  ready: boolean;
   /** Wants a (re)capture */
   dirty: boolean;
-  users: Set<THREE.MeshStandardMaterial>;
+  users: Set<THREE.Material>;
 }
 
 /** Cost counters of a scene's probes (read by sandboxes and QA scenarios). */
 export interface ProbeStats {
   probes: number;
-  /** Work units done (one cube face or one prefilter each) and complete captures */
+  /** Work units done (one cube face each) and complete captures */
   units: number;
   captures: number;
   /** CPU time of the last unit, the most expensive one, and all of them, ms */
@@ -49,20 +49,28 @@ const HIDE = (o: THREE.Object3D) => o.name.startsWith('glass') || o.name === 'fx
  * photograph is the reflection of its surroundings (the plaza, the building opposite, its own
  * mullions), which a sky-only environment map cannot give. Each probe is a cube capture of the
  * scene (glass, particles and the sun-disc sky mesh hidden; the sky environment as background, so
- * the sun is not counted twice) prefiltered with PMREM and used as the glass envMap. Panes within
- * SHARE_RADIUS share a probe. Reference-counted per scene like the dice.
+ * the sun is not counted twice) with box-filtered mips, which the glass reflection pass samples in
+ * place of the scene environment (look.ts, PROBE_IBL). Panes within SHARE_RADIUS share a probe.
+ * Reference-counted per scene like the dice.
  *
- * Cost is strictly budgeted: a capture is split into seven units (six faces, one prefilter) and at
- * most ONE unit runs per rendered frame, whoever of the scene's panes asks first. "Rendered frame"
- * is the renderer's frame counter minus the renders the probes issued themselves, so a capture
- * never licenses the next one within the same frame, and nothing is captured while the simulation
- * is stepped without rendering. Captures reuse the frame's sun shadow maps instead of re-rendering
- * them for every face, go to the dirty probe nearest the camera first, and are re-triggered by
- * blasts and collapses only after a debounce in simulation time (never a storm of recaptures).
+ * Cost is strictly budgeted: a capture is split into six units (one cube face each; the mips are
+ * generated with the last) and at most ONE unit runs per rendered frame, whoever of the scene's
+ * panes asks first. "Rendered frame" is the renderer's frame counter minus the renders the probes
+ * issued themselves, so a capture never licenses the next one within the same frame, and nothing
+ * is captured while the simulation is stepped without rendering. Captures reuse the frame's sun
+ * shadow maps instead of re-rendering them for every face, go to the dirty probe nearest the camera
+ * first, and are re-triggered by blasts and collapses only after a debounce in simulation time
+ * (never a storm of recaptures). There is no PMREM pass: three's GGX prefilter (256 samples per
+ * texel of every mip) cost more than the six faces together.
  */
 export class ReflectionProbes {
   /** Global switch (quality setting): without probes the glass reflects the scene environment only. */
   static enabled = true;
+  /**
+   * Cube face size of new probes, px (quality setting): 256 resolves ≈ 0.35° per texel, a sharp
+   * mirror image at 1080p; 128 costs about a quarter of the fill per face, a little softer.
+   */
+  static resolution = 256;
 
   static acquire(ctx: SimContext): ReflectionProbes | null {
     if (!ctx.renderer || !ReflectionProbes.enabled) return null;
@@ -86,13 +94,12 @@ export class ReflectionProbes {
   private refs = 0;
   private readonly ctx: SimContext;
   private readonly probes: Probe[] = [];
-  private pmrem: THREE.PMREMGenerator | null = null;
   private lastEnv: THREE.Texture | null | undefined = undefined;
   /** Renderer frames issued by the probes themselves */
   private own = 0;
   /** Last external frame number a unit was done (or skipped) in */
   private frame = -1;
-  /** Probe being captured and its next unit (0–5 faces, 6 prefilter) */
+  /** Probe being captured and its next face (0–5) */
   private current: Probe | null = null;
   private unit = 0;
   /** Simulation times of the first and the latest scene change not yet recaptured (−1: none) */
@@ -111,26 +118,31 @@ export class ReflectionProbes {
     this.off.push(ctx.events.on('blast', changed), ctx.events.on('structuralFailure', changed));
   }
 
-  /** Use the probe nearest `position` (created if none is close) as the envMap of `material`. */
-  attach(position: THREE.Vector3, material: THREE.MeshStandardMaterial): void {
-    if (this.disposed) return;
+  /**
+   * Feed the probe nearest `position` (created if none is close) to a glass reflection material
+   * (see look.ts probeUniforms; other materials are ignored).
+   */
+  attach(position: THREE.Vector3, material: THREE.Material): void {
+    if (this.disposed || !probeUniforms(material)) return;
     let probe = this.probes.find((p) => p.position.distanceTo(position) < SHARE_RADIUS);
     if (!probe) {
-      const target = new THREE.WebGLCubeRenderTarget(SIZE, { type: THREE.HalfFloatType, generateMipmaps: false });
-      probe = { position: position.clone(), target, camera: new THREE.CubeCamera(0.05, FAR, target), env: null, dirty: true, users: new Set() };
+      const target = new THREE.WebGLCubeRenderTarget(ReflectionProbes.resolution, {
+        type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter,
+      });
+      probe = { position: position.clone(), target, camera: new THREE.CubeCamera(0.05, FAR, target), ready: false, dirty: true, users: new Set() };
       this.probes.push(probe);
       this.stats.probes = this.probes.length;
     }
     probe.users.add(material);
-    if (probe.env) this.assign(material, probe.env.texture);
+    if (probe.ready) this.assign(material, probe);
   }
 
   /** Stop feeding `material`; a probe nobody uses any more is freed. */
-  detach(material: THREE.MeshStandardMaterial): void {
+  detach(material: THREE.Material): void {
     for (let i = this.probes.length - 1; i >= 0; i--) {
       const p = this.probes[i]!;
       if (!p.users.delete(material)) continue;
-      if (material.envMap === p.env?.texture) material.envMap = null;
+      unassign(material);
       if (p.users.size) continue;
       if (this.current === p) this.current = null;
       this.freeProbe(p);
@@ -139,16 +151,17 @@ export class ReflectionProbes {
     this.stats.probes = this.probes.length;
   }
 
-  private assign(m: THREE.MeshStandardMaterial, tex: THREE.Texture): void {
-    if (m.envMap !== tex) {
-      m.envMap = tex;
-      m.needsUpdate = true;
-    }
+  private assign(m: THREE.Material, p: Probe): void {
+    const u = probeUniforms(m);
+    if (!u) return;
+    u.uProbe.value = p.target.texture;
+    u.uProbeMaxLod.value = Math.log2(p.target.width);
+    u.uProbeOn.value = 1;
   }
 
   /**
-   * Called by every pane once per rendered frame: the first call of a frame does at most one unit
-   * of capture work, the others return at once.
+   * Called by every pane once per rendered frame: the first call of a frame renders at most one
+   * cube face, the others return at once.
    */
   update(): void {
     if (this.disposed) return;
@@ -178,14 +191,16 @@ export class ReflectionProbes {
     const t0 = performance.now();
     const f0 = r.info.render.frame;
     try {
-      if (this.unit < FILTER_UNIT) this.renderFace(p, this.unit++);
-      else {
-        this.filter(p);
-        this.current = null;
-        this.stats.captures++;
-      }
+      this.renderFace(p, this.unit++);
     } finally {
       this.own += r.info.render.frame - f0;
+    }
+    if (this.unit >= FACES) {
+      // Complete (the mips were generated with the last face): the glass samples it from now on.
+      this.current = null;
+      p.ready = true;
+      for (const m of p.users) this.assign(m, p);
+      this.stats.captures++;
     }
     const ms = performance.now() - t0;
     const s = this.stats;
@@ -211,7 +226,10 @@ export class ReflectionProbes {
     return best;
   }
 
-  /** Render one cube face of `p` (glass, particles and the sky mesh hidden; no shadow-map pass). */
+  /**
+   * Render one cube face of `p` (glass, particles and the sky mesh hidden; no shadow-map pass). The
+   * glass samples this target while it is being refreshed face by face; it is never drawn into it.
+   */
   private renderFace(p: Probe, face: number): void {
     const { renderer: r, scene } = this.ctx;
     const cam = p.camera;
@@ -240,10 +258,14 @@ export class ReflectionProbes {
     // does so on every render() call by default) would cost more than the face itself.
     shadows.autoUpdate = false;
     shadows.needsUpdate = false;
+    const tex = p.target.texture;
+    // three regenerates the mip chain after a render into a mipmapped target: after the last face only.
+    tex.generateMipmaps = face === FACES - 1;
     try {
       r.setRenderTarget(p.target, face);
       r.render(scene, cam.children[face] as THREE.Camera);
     } finally {
+      tex.generateMipmaps = false;
       r.setRenderTarget(target, cubeFace, mip);
       shadows.autoUpdate = autoUpdate;
       shadows.needsUpdate = needsUpdate;
@@ -254,20 +276,11 @@ export class ReflectionProbes {
     }
   }
 
-  /** Prefilter the captured cube (PMREM) into the probe's environment map and hand it out. */
-  private filter(p: Probe): void {
-    this.pmrem ??= new THREE.PMREMGenerator(this.ctx.renderer);
-    const env = this.pmrem.fromCubemap(p.target.texture, p.env ?? undefined);
-    p.env = env;
-    for (const m of p.users) this.assign(m, env.texture);
-  }
-
   private freeProbe(p: Probe): void {
-    for (const m of p.users) if (m.envMap === p.env?.texture) m.envMap = null;
+    for (const m of p.users) unassign(m);
     p.users.clear();
     p.target.dispose();
-    p.env?.dispose();
-    p.env = null;
+    p.ready = false;
   }
 
   release(): void {
@@ -283,8 +296,14 @@ export class ReflectionProbes {
     this.probes.length = 0;
     this.current = null;
     this.stats.probes = 0;
-    this.pmrem?.dispose();
-    this.pmrem = null;
     if (sets.get(this.ctx) === this) sets.delete(this.ctx);
   }
+}
+
+/** Back to the scene environment. */
+function unassign(m: THREE.Material): void {
+  const u = probeUniforms(m);
+  if (!u) return;
+  u.uProbeOn.value = 0;
+  u.uProbe.value = null;
 }

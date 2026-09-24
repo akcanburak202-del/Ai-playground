@@ -123,34 +123,35 @@ export const HELP_DESKTOP: { title: string; entries: HelpEntry[] }[] = [
   {
     title: 'Hareket',
     entries: [
-      { keys: ['Fare'], label: 'Bakış (tıkla: fare kilidi)' },
+      { keys: ['Fare'], label: 'Bakış (önce tıkla: fare kilitlenir)' },
       { keys: ['W', 'A', 'S', 'D'], label: 'Uçuş' },
       { keys: ['Boşluk', 'E'], label: 'Yüksel' },
       { keys: ['Q', 'Ctrl'], label: 'Alçal' },
-      { keys: ['Shift'], label: 'Hızlı (25 m/s)' },
+      { keys: ['Shift'], label: 'Hızlı uçuş (25 m/s)' },
     ],
   },
   {
-    title: 'Ateş',
+    title: 'Silah',
     entries: [
-      { keys: ['Sol tık'], label: 'Tetik (basılı tut: seri atış)' },
+      { keys: ['Sol tık'], label: 'Ateş (basılı tut: seri atış)' },
       { keys: ['Sağ tık', 'Z'], label: 'Nişan / dürbün' },
-      { keys: ['1–8'], label: 'Silah grubu (tekrar bas: sıradaki)' },
-      { keys: ['Tekerlek'], label: 'Silah değiştir' },
+      { keys: ['1–8'], label: 'Silah grubu (yeniden bas: gruptaki sıradaki)' },
+      { keys: ['Tekerlek'], label: 'Sıradaki / önceki silah' },
       { keys: ['T', 'Orta tık'], label: 'Mühimmat değiştir' },
-      { keys: ['G'], label: 'Yıkım şarjı / şarj yerleştir' },
-      { keys: ['X'], label: 'Şarjları birlikte patlat' },
+      { keys: ['I'], label: 'Silah kartının ayrıntısı (basılı tut)' },
+      { keys: ['G'], label: 'Yıkım şarjını al / yüzeye yerleştir' },
+      { keys: ['X'], label: 'Şarjların hepsini birden patlat' },
       { keys: ['B'], label: 'Şarjları sırayla patlat' },
     ],
   },
   {
-    title: 'Görüntü',
+    title: 'Görüntü ve sahne',
     entries: [
       { keys: ['F', 'Tab'], label: 'Ağır çekim ×0,10' },
       { keys: ['C'], label: 'Mermi kamerası (roket, top mermisi, bomba)' },
+      { keys: ['V'], label: 'Arayüzü gizle (yalnızca mimari)' },
       { keys: ['R'], label: 'Sahneyi yeniden kur' },
-      { keys: ['M'], label: 'Sesi aç / kapat' },
-      { keys: ['V'], label: 'Arayüzü gizle (temiz görüntü)' },
+      { keys: ['M'], label: 'Ses aç / kapat' },
       { keys: ['H'], label: 'Bu yardım' },
       { keys: ['Esc'], label: 'Menü' },
     ],
@@ -158,15 +159,34 @@ export const HELP_DESKTOP: { title: string; entries: HelpEntry[] }[] = [
 ];
 
 export const HELP_TOUCH: HelpEntry[] = [
-  { keys: ['Sol yarı'], label: 'Hareket çubuğu (parmağın değdiği yerde)' },
+  { keys: ['Sol yarı'], label: 'Hareket çubuğu (parmağın değdiği yerde belirir)' },
   { keys: ['Sağ yarı'], label: 'Sürükle: bakış' },
   { keys: ['Ateş'], label: 'Tetik (basılı tut: seri atış)' },
-  { keys: ['Yukarı', 'Aşağı'], label: 'Yüksel / alçal' },
+  { keys: ['▲', '▼'], label: 'Yüksel / alçal' },
   { keys: ['Silah'], label: 'Sıradaki silah' },
+  { keys: ['1–8'], label: 'Karttaki numara: silah grubu (yeniden dokun: gruptaki sıradaki)' },
   { keys: ['Mühimmat'], label: 'Mühimmat değiştir' },
   { keys: ['Nişan'], label: 'Nişan / dürbün' },
   { keys: ['Ağır çekim'], label: 'Ağır çekim ×0,10' },
-  { keys: ['Patlat'], label: 'Şarjları ateşle' },
+  { keys: ['Patlat'], label: 'Yerleştirilen şarjları ateşle' },
   { keys: ['Kamera'], label: 'Mermi kamerası' },
+  { keys: ['Silah kartı'], label: 'Dokun: ayrıntılı özellikler' },
   { keys: ['Menü'], label: 'Sahne menüsü' },
 ];
+
+/**
+ * The key actions of the moment, for the hint line under the reticle: what a newcomer needs to
+ * find the weapons, the ammunition, slow motion, the bullet camera and the charges.
+ */
+export function keyHints(delivery: 'direct' | 'indirect' | 'placed', ammoCount: number, charges: number): HelpEntry[] {
+  if (delivery === 'placed') {
+    const out: HelpEntry[] = [{ keys: ['Sol tık'], label: 'Şarj yerleştir' }];
+    if (charges > 0) out.push({ keys: ['X'], label: 'Patlat' }, { keys: ['B'], label: 'Sırayla' });
+    out.push({ keys: ['1–8'], label: 'Silah' }, { keys: ['F'], label: 'Ağır çekim' }, { keys: ['H'], label: 'Kontroller' });
+    return out;
+  }
+  const out: HelpEntry[] = [{ keys: ['1–8'], label: 'Silah' }];
+  if (ammoCount > 1) out.push({ keys: ['T'], label: 'Mühimmat' });
+  out.push({ keys: ['F'], label: 'Ağır çekim' }, { keys: ['C'], label: 'Mermi kamerası' }, { keys: ['G'], label: 'Şarj' }, { keys: ['I'], label: 'Ayrıntı' }, { keys: ['H'], label: 'Kontroller' });
+  return out;
+}

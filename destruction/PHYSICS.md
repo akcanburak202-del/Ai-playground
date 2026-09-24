@@ -12,12 +12,15 @@ kalıntı hızı; uzun çubuk mermiler için Lanz–Odermatt ve Alekseevskii–T
 jetleri için RHA eşdeğeri yoğunluk ölçeklemesi; patlamalar için Kingery–Bulmash eğrileri (basınç,
 itki, varış zamanı — şok cephesi mesafeyle gecikerek ulaşır, camlar dışa doğru genişleyen bir
 halka halinde kırılır), temas şarjları için McVay/UFC 3-340-02 kavlama ve delinme eşikleri, cam,
-betonarme, tuğla ve çelik levhalar için basınç–itki (P–I) hasar sayıları, parçalar için Gurney
-hızı ve Mott kütle dağılımı. Uçuş oyun seviyesinde tutulmuştur: yerçekimi, hava direnci, roketlerde
+betonarme, tuğla ve çelik levhalar için basınç–itki (P–I) hasar sayıları (betonarme duvarlar için
+donatılı kesitin tek serbestlik dereceli SDOF modeli ve PDC-TR 06-08 hasar sınırları: 25 cm'lik bir
+duvarı 10 m'deki 4 kg TNT çatlatmaz, temas hâlindeki 4 kg deler), kapalı mekânda patlamalar için
+yarı-statik gaz basıncı (UFC 3-340-02, W/V), parçalar için Gurney hızı ve Mott kütle dağılımı. Uçuş oyun seviyesinde tutulmuştur: yerçekimi, hava direnci, roketlerde
 basit motor itkisi; üstten saldırı fırlatıcısının yayı ise hiçbir güdüm algoritması içermeyen,
 tamamen görsel, önceden çizilmiş bir eğridir. Tasarım belgesindeki (DESIGN.md §3) bütün kalibrasyon
-hedefleri birim testleriyle doğrulanır; tek fark, "1 kg TNT, 5 m: ≈70 kPa" değerinin gelen (yan)
-basınç değil, yansıyan basınç olmasıdır — bu aşağıda açıklanmıştır.
+hedefleri birim testleriyle doğrulanır. "1 kg TNT, 5 m: ≈70 kPa" satırı **yansıyan** (duvara dik
+çarpan) basınçtır; aynı noktada serbest havadaki gelen (yan) basınç ≈30 kPa'dır, yere yakın
+patlamada daha yüksektir (≈43 kPa). HUD bu iki değeri `blastAt` üzerinden ayrı ayrı gösterir.
 
 ---
 
@@ -127,6 +130,11 @@ x/d = G + 1           for G > 1
   `shatter`, shallow dent, 40 % of the energy leaves with the splash).
 * Residual velocity: Recht–Ipson with a = m / (m + m_plug) for blunt noses and fragments
   (plug = ρ π d²/4 t cos θ).
+* **Capped HE shells** (M908 HE-OR: a hardened 1.2 kg steel nose cap on a thin HE body): against
+  steel only the cap is the penetrator (Lambert–Jonas with the cap's mass, calibre and length
+  m/(ρ π d²/4)); the light body behind it collapses. The whole round's momentum goes into the
+  member (perforation: m(v − v_r); stopped: outcome `shatter`, all of m v), while the energy the
+  plate absorbs is the cap's. Into concrete NDRC still sees the whole round (it is built to dig).
 * Hole ≈ 1.05–1.4 d (petalling on thin plates), plastic zone from `E_abs = σ_y ε̄ π r² t`, ε̄ ≈ 0.05.
 * Validity: sub-ordnance to ordnance velocities (≈ 300–1 800 m/s), L/D ≲ 10 (bullets, AP cores);
   long rods use §4.
@@ -199,7 +207,18 @@ a target). Impact-fuzed and shaped-charge rounds never ricochet (graze-sensitive
   that moment too (their first flight step catches up with the clock).
 * Occlusion: a target whose line to the charge is blocked by another destructible gets 0.3 × the
   pressure/impulse (diffraction; game-level estimate).
-* Rigid bodies: impulse `J = i_r · π r_eq²` along the outward direction, capped at Δv 400 m/s.
+* **Loose rigid bodies** (`bodyBlastImpulse`): the reflected impulse is integrated over the
+  presented disc π r_eq² (four equal-area rings, oblique reflection per ring) at the body's own
+  standoff s = R − r_eq (never inside the charge radius 0.053 W^⅓); a finite body only feels the
+  reflected pressure until it clears, `t_c ≈ 4S/((1 + S/G)U) ≈ 2 r_eq / 400 m/s` (UFC 3-340-02
+  §2-15.3), so `i = i_s + (i_r − i_s) min(1, t_c/t_d)`; and inside the fireball (products
+  near-field) the push is bounded by the momentum the charge can put into the solid angle the body
+  subtends: a Gurney sphere with a linear velocity profile carries ≈ W √(2E) of outward momentum
+  (Gurney 1943), doubled at most by reflection, so `J ≤ W √(2E) (1 − cos α)`. The bound relaxes
+  between 0.5 and 1.5 fireball radii where the air shock takes over. Δv is also capped at 400 m/s.
+  *Fix:* the earlier `i_r(point) · π r_eq²` evaluated the impulse at a point up to 0.9 R inside a
+  large body next to the charge, i.e. almost on the charge, and applied that over its whole
+  cross-section: a 2.3 kg column charge threw a 12 t roof strip ≈ 4 m up. Now: Δv ≈ 0.1 m/s.
 * Camera shake: `0.3 log10(P_s,camera / 300 Pa)` clamped to [0, 1], delivered at arrival.
 
 ### 7.1 Contact and near-contact charges (`contactDamage`)
@@ -222,13 +241,83 @@ a target). Impact-fuzed and shaped-charge rounds never ricochet (graze-sensitive
 
 `(P/P0 − 1)(I/I0 − 1) = ψ`, ψ = 0.3 (Baker et al. 1983, the SDOF P–I shape of PDC-TR 06-08).
 The damage number is < 1 below the onset curve (P0, I0), 1 → 2 interpolated logarithmically
-between onset and the severe curve (P0b, I0b), 2 + log₂(scale) beyond.
+between onset and the severe curve (P0b, I0b), 2 + log₂(scale) beyond. P and I are the
+*reflected* (oblique) values on the face.
 
-| Member | Onset (1) | Severe / breach (2) | Basis |
-| --- | --- | --- | --- |
-| Glass (1.5 × 1 m) | P0 = 4.5 kPa · (t/6 mm)² · GTF (tempered 4, laminated 1.1), I0 = 2 P0/ω, ω = 2π·21 Hz·(t/6 mm) | 2 × onset (laminated 3× more: interlayer holds) | ASTM E1300 load resistance; first mode of the pane |
-| Concrete, stone, brick walls | elastic SDOF of a 3 m one-way strip: R_cr = 8 f_t h²/(6 L²), k = 384 E I/(5 L⁴), P0 = R_cr/2, I0 = x_cr √(0.78 m k) | RC: 20 P0 / 48 I0 (local breach); masonry/stone: 10 P0 / 24 I0 | Biggs 1964; PDC-TR 06-08 SDOF |
-| Steel plates | P0 = 6 σ_y t²/a² (a ≈ 1 m, yield line), I0 from Nurick–Martin φ = 1.5 | 4 P0, φ = 25 (tearing) | Nurick & Martin 1989 |
+**Walls and slabs** are a one-way strip of span L = 3 m, simply supported, as an
+elastic–perfectly-plastic SDOF (Biggs 1964, ch. 5; UFC 3-340-02 §3-19). For a peak deflection x_m:
+
+```
+impulsive asymptote      I = √(2 K_LM m R_u (x_m − x_y/2))      K_LM = 0.66 (plastic, Biggs table 5.1)
+quasi-static asymptote   P = R_u (1 − x_y / (2 x_m))            x_y = R_u / k,  m = ρ h
+```
+
+Damage number 1 = PDC-TR 06-08 B2 (moderate: visible cracks, some permanent deflection),
+2 = B4 (hazardous: failure — local breach or blow-out). B1 (μ = 1, "no visible damage") is below 1.
+
+| Member | R_u | k | x_m (1 / 2) | Basis |
+| --- | --- | --- | --- | --- |
+| Reinforced concrete (`concrete`, `concrete_hs`) | 8 M_p/L², M_p = A_s f_dy (d − a/2), a = A_s f_dy/(0.85 f'_dc), d = 0.85 h, A_s = 0.3 % of d per face, f_dy = 1.1·1.17·500 MPa, f'_dc = 1.19 f_c; ≥ cracking f_t h²/6 | 384 E I_a/(5L⁴), I_a = (I_g + I_cr)/2 | support rotation 2° / 10° | UFC 3-340-02 eq. 4-1/4-2, tables 4-1/4-2 (SIF, DIF), §4-11; PDC-TR 06-08 |
+| Masonry and stone (unreinforced) | rigid arching, crushed hinges 0.1 h: 8·0.0765 f_m h²/L²; ≥ cracking | 384 E I_g/(5L⁴) | 1.5° / 8°, ≤ 0.5 h (snap-through) | McDowell, McKee & Sevin 1956; PDC-TR 06-08 |
+| Glass (1.5 × 1 m) | P0 = 4.5 kPa · (t/6 mm)² · GTF (tempered 4, laminated 1.1), I0 = 2 P0/ω, ω = 2π·21 Hz·(t/6 mm); severe 2 × onset (laminated 3× more) | | | ASTM E1300; first mode of the pane |
+| Steel plates | P0 = 6 σ_y t²/a² (a ≈ 1 m), I0 from Nurick–Martin φ = 1.5; severe 4 P0, φ = 25 | | | Nurick & Martin 1989 |
+
+Resulting asymptotes (onset / severe):
+
+| Member | P0 | I0 | P0b | I0b |
+| --- | --- | --- | --- | --- |
+| RC C40 200 mm | 47 kPa | 1.24 kPa·s | 48 kPa | 2.8 kPa·s |
+| RC C40 250 mm | 73 kPa | 1.74 kPa·s | 75 kPa | 4.0 kPa·s |
+| RC C40 300 mm | 106 kPa | 2.3 kPa·s | 108 kPa | 5.2 kPa·s |
+| RC C40 400 mm | 190 kPa | 3.6 kPa·s | 193 kPa | 8.0 kPa·s |
+| Brick 230 mm | 38 kPa | 0.93 kPa·s | 42 kPa | 1.7 kPa·s |
+| Brick 600 mm | 281 kPa | 4.1 kPa·s | 291 kPa | 9.6 kPa·s |
+| Travertine 200 mm | 148 kPa | 1.9 kPa·s | 157 kPa | 3.2 kPa·s |
+
+A short pulse (triangular, 10 ms) must peak at ≈ 0.4–0.7 MPa to crack 250 mm RC. The quasi-static
+asymptotes of the two curves nearly coincide (elastic–perfectly-plastic: once a sustained load
+exceeds R_u the deflection is unbounded) — that is what a confined detonation's gas pressure
+meets (§7.3). *Fix:* the earlier model placed onset at elastic **cracking of plain concrete**
+(f_t, no reinforcement: 16 kPa / 107 Pa·s for 250 mm) and interpolated logarithmically to a
+local-breach curve 20–48× higher, so a 4 kg charge "cracked" 25 cm RC out to 12–20 m and a
+0.6 m brick block 7–9 m away was breached. Unit tests now pin: 4 kg at 5 m → no damage on 25 cm RC
+(D = 0.17), at 10–12 m → D < 0.1, at 1 m → cracked, at 0.5 m → breached; the 0.6 m brick block at
+7–9 m → D < 0.05; contact → breach by `contactDamage` (T* = 0.16 < 0.18).
+
+### 7.3 Confined detonations: quasi-static gas pressure
+
+Inside a room the detonation products and heated air cannot expand freely: after the shock
+reverberations a **quasi-static gas pressure** loads every surface of the enclosure for tens to
+hundreds of milliseconds (UFC 3-340-02 ch. 2, fig. 2-152).
+
+* **Confinement** (`BlastSystem.measureEnclosure`, per detonation): 6 axis rays first (fewer than
+  5 meeting a surface within 15 m → open air, done); then 64 rays on a Fibonacci sphere. A ray that
+  meets a solid destructible or the ground plane bounds the room; one that escapes, or meets
+  glazing (which fails long before the walls), is an opening. Volume `V ≈ Σ ΔΩ r³/3`, vent area
+  `A ≈ Σ ΔΩ r²` over the openings (escaped rays at the mean wall distance), closed fraction ≥ 0.5.
+  Targets met by a ray are the enclosure — minus anything standing *in* the room (compact in
+  plan, ≤ 0.3 × the room radius, with the room's own boundary behind it: a column is pressed
+  from all sides, no net gas load) — plus panels in plain view that do not stand in the room (the
+  ones the 64 rays happened to miss, e.g. the chapel's altar panels). Charges under 0.01 kg are
+  not probed; a probe is reused for detonations within 1 m and 0.5 s (cannon HE bursts).
+* **Pressure**: Weibull (1968) closed-chamber fit, `Δp_QS = 2.25 MPa · (W/V)^0.72` (W kg TNT,
+  V m³; the curve of UFC 3-340-02 fig. 2-152, NATO AASTP-1). 12 kg in the 616 m³ chapel → 132 kPa.
+  Thermobaric fills afterburn in the room air: W × 1.75 (estimate) → 203 kPa.
+* **Venting**: full pressure for a scaled vent area A/V^⅔ ≤ 0.15, none from 0.6 up (smoothstep;
+  game-level reading of UFC 3-340-02 §2-15). Blow-down: choked outflow,
+  `τ = V / (0.578 C_d A c)`, C_d = 0.6, c = 20.05 √T of the heated gas (Kinney & Graham 1985,
+  ch. 13). Impulse `i_gas = P τ (1 − e^(−t_cap/τ))` with t_cap = 50 ms (walls that fail vent the
+  room; the storey-height members here, T ≈ 20–30 ms, are well into their quasi-static regime by
+  then).
+* **Load**: faces of enclosure members that are turned to the charge and within 1.1 × the room
+  radius: `reflectedImpulseAt += i_gas`, `reflectedPressureAt = max(P_r, P_QS)`,
+  `overpressureAt = max(P_s, P_QS)`, and `damageAt = max(D(P_r, i_r), D(P_QS, i_r + i_gas))` (the
+  long-duration load read on the same P–I curve, where its quasi-static asymptote governs).
+  Loose bodies get no gas push (uniform pressure has no resultant).
+* **Chapel check** (real app, 12 kg thermobaric at the centre): measured V = 594 m³ (true 616),
+  closed 1.0, P_QS = 203 kPa, i_gas = 10.1 kPa·s; damage numbers 2.3–2.4 on the long walls, the
+  entrance wall, the altar panels and the roof (before: local breach near the charge only). A
+  plain 12 kg HE charge gives 132 kPa → D ≈ 1.2 on the 300 mm walls (cracked, not blown out).
 
 ## 8. Fragments (`fragments.ts`)
 
@@ -261,6 +350,15 @@ between onset and the severe curve (P0b, I0b), 2 + log₂(scale) beyond.
   reaching a wall 20 m away is stamped 22.8 ms, not at the 33.3 ms step boundary; BLU-109 fires
   exactly 15 ms after contact). Rounds fired at a cyclic rate leave at their own time inside the
   step (`spawnAt`), whichever order the weapon and projectile systems run in.
+* **Event bookkeeping.** Every `impact` carries `projectileId` (the round; for HEAT jets, the
+  round that fired them), `priorPerforations` (targets it had already gone through: 0 = primary
+  hit) and `targetThickness` (line-of-sight run × cos obliquity, only when the probe found the rear
+  face).
+* **Weapon controller.** Each weapon keeps its own reload/cycling timer (real reload ×
+  `PLAY_RELOAD_SCALE` = 0.4), which keeps running while it is holstered: switching from the tank
+  gun to the RPG does not carry the gun's reload over. A press on a single-shot weapon that is
+  still reloading fires the moment it is ready if the trigger is still held; one round per press.
+  `triggerDown` reports the held trigger.
 
 ---
 
@@ -292,11 +390,12 @@ Produced by `calibrationRows()` (`src/physics/ballistics/calibration.ts`), asser
 | Annealed 6 mm pane 1.5 × 1 m fails at | ≈ 3–7 kPa reflected (ASTM E1300 scale) | range | 4.7 kPa | ✓ |
 | Tempered 6 mm pane fails at | ≈ 4 × annealed | 12–28 kPa | 18.9 kPa | ✓ |
 
-**Note — the 70 kPa target.** DESIGN.md lists "1 kg TNT, R = 5 m: incident overpressure ≈ 70 kPa
-(Kingery–Bulmash)". No published model gives that: the free-air *incident* (side-on) peak is
-29 kPa (Kinney–Graham) / 31 kPa (KB with the 1.8 reflection factor), and 43 kPa even for a charge
-lying on the ground. ≈ 70 kPa is the **normally reflected** peak on a wall facing the charge.
-Rather than distort the KB fits, the tests assert both: reflected ≈ 70 kPa and incident ≈ 29 kPa.
+**Note — the 70 kPa row is the reflected value.** "1 kg TNT, R = 5 m: ≈ 70 kPa" is the
+**normally reflected** peak on a wall facing the charge (69.6 kPa here). The **incident** (side-on)
+overpressure at the same point is ≈ 30 kPa for a free-air burst (29 kPa Kinney–Graham, 31 kPa KB
+with the 1.8 ground-reflection factor) and higher for a surface burst (43 kPa for a charge lying on
+the ground, UFC 3-340-02 fig. 2-15). The tests assert both. The HUD's blast readout comes from
+`blastAt`, whose `ps` is incident and `pr` normally reflected — label them that way.
 
 ### 10.1 Further model outputs (single hits, pristine material)
 
@@ -325,12 +424,35 @@ Contact charges on the struck member (`contactDamage`):
 | L31A7 HESH (4.8 kg) on 100 mm RHA | dish 14 mm | — | scab Ø 0.29 m × 34 mm @ 126 m/s |
 | 1 kg on 240 mm brick | Ø 0.81 m | Ø 0.33 m | full depth @ 56 m/s |
 
-P–I damage distances (charge 1.2 m above ground, surface-burst equivalent, face-on):
+P–I damage distances (charge 1.2 m above the ground — the free-air/surface blend of §7 — wall
+face-on; `damageAt` ≥ 1 / ≥ 2):
 
-| Charge | annealed 6 mm breaks within | tempered 6 mm | laminated cracks / tears | 250 mm RC cracks / severe | 240 mm brick cracks / severe | 12 mm steel yields / tears |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 kg TNT | 8.5 m | 2.5 m | 7.8 / 1.7 m | 5.5 / 0.31 m | 13.6 / 0.92 m | 1.15 / 0.30 m |
-| 10.8 kg TNT (155 mm) | 37 m | 10.7 m | 34 / 7.0 m | 21 / 1.1 m | 59 / 3.7 m | 4.4 / 0.65 m |
+| Charge | annealed 6 mm breaks within | tempered 6 mm | laminated 7.6 mm cracks / tears | 200 mm RC D1 / D2 | 250 mm RC D1 / D2 | 240 mm brick D1 / D2 | 12 mm steel yields / tears |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 kg TNT | 6.8 m | 2.0 m | 5.0 / 1.1 m | 0.64 / 0.37 m | 0.50 / 0.30 m | 0.75 / 0.49 m | 0.94 / 0.15 m |
+| 4 kg TNT | 17.9 m | 5.2 m | 12.9 / 2.8 m | 1.55 / 0.86 m | 1.21 / 0.69 m | 1.83 / 1.18 m | 2.3 / 0.35 m |
+| 10.8 kg TNT (155 mm) | 35 m | 10.0 m | 25 / 5.4 m | 2.9 / 1.6 m | 2.3 / 1.3 m | 3.5 / 2.2 m | 4.2 / 0.61 m |
+
+Closer than ≈ 0.3 m the voxel elements treat the charge as a contact charge (§7.1).
+
+Tank rounds against heavy steel (what the steel elements are handed; M908/M829A4 kinetic at
+1 400/1 550 m/s; blasts on the face at 0.5 calibre (5 cm for the shaped charge); ∫i_r is the
+reflected impulse integrated over the face):
+
+| Target | M908 HE-OR kinetic | M908 blast (1.6 kg) | M830A1 HEAT-MP | L31A7 HESH (4.8 kg) |
+| --- | --- | --- | --- | --- |
+| S355 50 mm | perforates, 1 244 m/s out, 1.8 kN·s to plate, Ø92 mm | dish 17.5 mm, scab Ø171 × 18 mm @ 77 m/s; ∫i_r 1.3 kN·s over Ø0.3 m, 1.7 kN·s over 1 m² | jet Ø15 mm through; blast (25 %) dish 4.9 mm | dish 44 mm, scab Ø389 × 22 mm @ 191 m/s; ∫i_r 3.5 kN·s over Ø0.3 m, 4.8 kN·s over 1 m² |
+| S355 100 mm | perforates, 762 m/s out, 7.3 kN·s | dish 8.7 mm | jet through; dish 2.4 mm | dish 24 mm, scab Ø340 × 39 mm @ 158 m/s |
+| RHA 50 mm | perforates, 1 035 m/s out, 4.2 kN·s | dish 10.7 mm, scab Ø141 × 15 mm | jet through; dish 3.0 mm | dish 29 mm, scab Ø366 × 21 mm @ 176 m/s |
+| RHA 100 mm | **shatters** on the face, 16.0 kN·s (all of m v), dent 42 mm | dish 5.3 mm (then fires tamped in the dent) | jet through; dish 1.5 mm | dish 14.5 mm, scab Ø294 × 34 mm @ 126 m/s |
+| HEB 300 flange 19 mm | perforates, Ø112 mm, 0.3 kN·s | breach Ø128 mm, dish 34 mm | jet Ø15 mm; dish 12.9 mm, scab Ø123 mm | dish 84 mm, scab Ø420 × 9 mm @ 212 m/s |
+| HEB 500 flange 28 mm | perforates, 0.6 kN·s | dish 27.5 mm, scab Ø199 × 12 mm | dish 8.7 mm | dish 61 mm, scab Ø411 × 13 mm @ 206 m/s |
+
+The HESH and HE contact impulses (Nurick–Martin I ≈ 1 000 N·s per kg: 1.6 / 4.8 kN·s) and the
+∫i_r over the face (1.7 / 4.8 kN·s over 1 m²) agree; both are of the order of the momentum needed
+to bend a heavy member (a 4 m HEB 300 column is 470 kg: 4.8 kN·s ≈ 10 m/s of section velocity at
+the hit point before the plastic hinges absorb it). The shell body's own momentum (M908:
+16 kN·s) reaches the member through the kinetic event (above) and its casing fragments.
 
 Exterior ballistics (flat fire, speed m/s at 100 / 300 / 500 / 1 000 / 2 000 m): M855
 799/608/440/273/157; M80 764/623/495/305/202; M33 839/747/661/468/287; PGU-14 980/916/853/708/456;
@@ -359,9 +481,10 @@ Screenshots of the final run are in `.shots/ballistics/`. Results:
 * **.50 M2 AP on 12 mm S355, 30 m:** 3 × perforation, 867 → 789 m/s (V_bl 359 m/s), Ø 13 mm holes.
 * **120 mm M830A1 HEAT-MP on 20 mm S355:** jet event first (perforates, ≈ 17 mm RHA-e used,
   461 mm RHA left), then the shaped blast (contact damage number 3.96: dish and soot), and ≈ 30 body
-  fragments that splash/embed on the plate. **M908 HE-OR:** the 11 kg steel-nosed body perforates
-  20 mm steel (V_bl 138 m/s ≪ 1 404 m/s; Ø 0.2 m hole) and its 0.4 ms delay fires it ≈ 0.55 m behind
-  the plate; the second round goes through the first hole and skips off the ground 150 m down range
+  fragments that splash/embed on the plate. **M908 HE-OR:** the hardened nose cap perforates
+  20 mm steel (cap-only Lambert–Jonas, see §3; Ø 0.1 m hole) and its 0.4 ms delay fires it ≈ 0.55 m
+  behind the plate; against 100 mm RHA it breaks up on the face instead (all 16 kN·s into the
+  plate) and fires in the dent; the second round goes through the first hole and skips off the ground 150 m down range
   (0.4° graze, ricochet as a steel-bodied shell). *No "dent first, perforate after repeats" regime
   exists for 120 mm rounds against 20 mm plate: every published model perforates it on the first
   hit.* Dent-then-tear accumulation is what small arms and fragments do here (M855 splashes on
@@ -388,14 +511,20 @@ Screenshots of the final run are in `.shots/ballistics/`. Results:
 
 ## 12. Known limitations and estimates (not from a published relation)
 
+* Confined detonations: the vent-area smoothstep (A/V^⅔ 0.15 → 0.6), the 50 ms gas-duration cap
+  and the thermobaric × 1.75 gas factor are game-level estimates; rooms are probed with 64 rays
+  to 15 m (larger halls are treated as open).
+* P–I walls assume 0.3 % reinforcement per face for every `concrete` element (the damage query
+  does not know the element's bars) and a 3 m one-way span (taller walls are weaker in reality).
 * `SHAPED_CONTACT_COUPLING = 0.25`, occlusion factor 0.3, thermobaric × 1.75, the ricochet anchor
   angles, the lead-ball deformation factors, the glass ballistic limit (0.3 × Lambert–Jonas of the
   same thickness of RHA) and the 1.5 d rod cavity are game-level estimates chosen to match open
   descriptions/photographs; they are isolated as named constants.
 * Rigid-projectile NDRC above 1 km/s is extended linearly in V (`NDRC_VMAX`); long rods leave it.
-* P–I curves treat every member as a 3 m one-way strip (walls) or a 1.5 × 1 m pane (glass); the RC
-  "severe" curve stands for *local* breach as the voxel element realises it, deliberately heavier
-  than the PDC-TR 06-08 global-flexure "heavy damage" limit (≈ 2.4 kPa·s / 55 kPa for 25 cm).
+* P–I curves treat every member as a 3 m one-way strip (walls) or a 1.5 × 1 m pane (glass). The
+  RC/masonry curves are *global* (flexural) response limits; very close charges are local
+  problems (spall/breach), handled by `contactDamage` inside ≈ 0.3 m and only approximately by the
+  steep near-field reflected impulse between 0.3 m and ≈ 1 m.
 * Probes along a thin plate edge-on (e.g. down the web of an I-section) report the whole path as
   steel; the resolver then treats it as a thick plate (see the report to M3).
 * Blast loads, body impulses and camera shake are *applied* at the end of the fixed step in which

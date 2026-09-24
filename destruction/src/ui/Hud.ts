@@ -5,11 +5,11 @@ import type { AmmoSpec, ImpactEvent } from '../physics/ballistics/types.ts';
 import { bridgeOf, type Bridge, type HudHooks } from './bridge.ts';
 import { Reticle, ScopeOverlay, reticleFor, scopeFor } from './crosshair.ts';
 import { fmtDistance, fmtLength, fmtScale, fmtSpeed, num } from './format.ts';
-import { CATEGORY_SHORT_TR, CATEGORY_TR, HELP_DESKTOP, HELP_TOUCH, NAME_TR, ROLE_TR, caliberTr, upperTr } from './i18n.ts';
+import { CATEGORY_SHORT_TR, CATEGORY_TR, HELP_DESKTOP, HELP_TOUCH, NAME_TR, ROLE_TR, caliberTr, keyHints, upperTr } from './i18n.ts';
 import { Menu } from './menu.ts';
 import { ensureFonts, ensureStyle } from './theme.ts';
-import { HitGroups, ammoLine, blastRow, groupLine, impactRow, weaponSpecs, type ImpactRow } from './telemetry.ts';
-import { buildSlots, slotOf, type Slot } from '../player/slots.ts';
+import { HitGroups, ammoLine, blastRow, followThrough, groupLine, impactRow, weaponSpecs, weaponSummary, type ImpactRow } from './telemetry.ts';
+import { buildSlots, slotOf, weaponForKey, type Slot } from '../player/slots.ts';
 import { closestApproach } from '../audio/acoustics.ts';
 
 export interface HudOptions {
@@ -22,7 +22,14 @@ export interface HudOptions {
   pauseOnMenu?: boolean;
 }
 
-const ROWS = 5;
+/** Telemetry rows kept: the newest (large) and the older ones under it (one line each, fading) */
+const ROWS = 4;
+/** The weapon list shows this long after a weapon change, ms */
+const STRIP_MS = 2400;
+/** The key hints show this long after play starts, ms */
+const HINTS_MS = 14000;
+/** Telemetry steps back after this long without a hit or blast, ms */
+const IDLE_MS = 9000;
 /** 1 MOA in radians */
 const MOA = Math.PI / (180 * 60);
 /** Depth-chart viewBox of the hit group */
@@ -48,21 +55,53 @@ function setText(e: HTMLElement, s: string): void {
   if (e.textContent !== s) e.textContent = s;
 }
 
-interface RowEls {
+/**
+ * Resolve after the next two animation frames (or 150 ms in a hidden tab), so that a loading
+ * indicator paints before a scene build, which is synchronous work, blocks the page.
+ */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(fin));
+    setTimeout(fin, 150);
+  });
+}
+
+function show(e: HTMLElement, on: boolean): void {
+  const d = on ? '' : 'none';
+  if (e.style.display !== d) e.style.display = d;
+}
+
+interface OlderRow {
   root: HTMLDivElement;
-  idx: HTMLSpanElement;
   ammo: HTMLSpanElement;
   mat: HTMLSpanElement;
+  depth: HTMLSpanElement;
   cnt: HTMLSpanElement;
   tag: HTMLSpanElement;
-  v: HTMLSpanElement[];
+}
+
+interface SlotEls {
+  root: HTMLDivElement;
+  name: HTMLSpanElement;
+  count: HTMLSpanElement;
+  /** The slot's weapons, listed while it is the current one */
+  subs: HTMLDivElement;
+  subEls: Map<string, HTMLDivElement>;
 }
 
 /**
- * Heads-up display: sheet header with live status, telemetry of the last impacts and blasts,
- * the weapon card with real specifications, the weapon strip, weapon-specific reticles, help,
- * toasts and the scene menu. Everything is DOM over the canvas; per-frame work only touches
- * nodes whose text actually changed.
+ * Heads-up display. The view is the product, so the play HUD stays small: a collapsed weapon card
+ * (name, round, the numbers that define it) with the full specification on hold of I, a weapon
+ * list that shows up on a weapon change, telemetry that leads with the newest impact and lets the
+ * older ones fade, a key-hint line for the first seconds of play, weapon-specific reticles, help,
+ * toasts, a loading chip and the scene menu. Everything is DOM over the canvas; per-frame work
+ * only touches nodes whose text actually changed.
  */
 export class Hud implements HudHooks {
   readonly root: HTMLDivElement;
@@ -87,12 +126,19 @@ export class Hud implements HudHooks {
   private muteEl!: HTMLSpanElement;
   // Telemetry
   private tele!: HTMLDivElement;
-  private rows: RowEls[] = [];
   private emptyEl!: HTMLDivElement;
-  private colsEl!: HTMLDivElement;
+  private latest!: HTMLDivElement;
+  private lAmmo!: HTMLSpanElement;
+  private lMat!: HTMLSpanElement;
+  private lCnt!: HTMLSpanElement;
+  private lTag!: HTMLSpanElement;
+  private lFollow!: HTMLSpanElement;
+  private lDepth!: HTMLElement;
+  private lVals: HTMLSpanElement[] = [];
   private sumTr!: HTMLDivElement;
   private sumModel!: HTMLDivElement;
-  private summary!: HTMLDivElement;
+  private older: OlderRow[] = [];
+  private olderBox!: HTMLDivElement;
   private groupEl!: HTMLDivElement;
   private groupHead!: HTMLSpanElement;
   private groupDepth!: HTMLSpanElement;
@@ -104,24 +150,28 @@ export class Hud implements HudHooks {
   private blastVals: HTMLSpanElement[] = [];
   private blastNote!: HTMLDivElement;
   private blastTitle!: HTMLSpanElement;
-  // Weapon card
+  // Weapon card and list (docked bottom-left)
+  private dock!: HTMLDivElement;
   private card!: HTMLDivElement;
+  private slotCaps = new Map<number, HTMLSpanElement>();
   private cardCat!: HTMLSpanElement;
-  private cardKey!: HTMLSpanElement;
+  private firedEl!: HTMLSpanElement;
   private wName!: HTMLDivElement;
+  private ammoChip!: HTMLSpanElement;
+  private ammoKey!: HTMLSpanElement;
+  private sumLine!: HTMLSpanElement;
+  private coolBar!: HTMLElement;
+  private coolLbl!: HTMLSpanElement;
   private wRole!: HTMLDivElement;
   private dimLabel!: HTMLSpanElement;
   private pills!: HTMLDivElement;
   private ammoLineEl!: HTMLDivElement;
   private specs!: HTMLDivElement;
-  private firedEl!: HTMLSpanElement;
-  private coolBar!: HTMLElement;
-  private coolLbl!: HTMLSpanElement;
   private chargesEl!: HTMLDivElement;
-  // Strip
   private strip!: HTMLDivElement;
-  private slotEls = new Map<number, { root: HTMLDivElement; name: HTMLSpanElement; count: HTMLSpanElement }>();
+  private slotEls = new Map<number, SlotEls>();
   // Overlays
+  private keysEl!: HTMLDivElement;
   private readout!: HTMLDivElement;
   private rangeEl!: HTMLSpanElement;
   private rangeLbl!: HTMLSpanElement;
@@ -134,6 +184,8 @@ export class Hud implements HudHooks {
   private toastEl!: HTMLDivElement;
   private toastTimer = 0;
   private lockHint!: HTMLDivElement;
+  private loadingEl!: HTMLDivElement;
+  private loadingText!: HTMLSpanElement;
   private frameEl!: HTMLDivElement;
   private help!: HTMLDivElement;
 
@@ -153,6 +205,25 @@ export class Hud implements HudHooks {
   private lastRender = 0;
   private lastScale = -1;
   private hudVisible = true;
+  /**
+   * The HUD's own clock, ms: rendered time (each frame counts at most 250 ms), so a stall (shader
+   * compiles after a load, a hidden tab) does not use up the hints or the weapon list.
+   */
+  private clock = 0;
+  /** HUD-clock ms of the latest impact or blast (telemetry idles after IDLE_MS) */
+  private lastActivity = 0;
+  private idle = false;
+  /** Weapon list visible until (HUD clock, ms) */
+  private stripUntil = 0;
+  /** Key hints visible until (HUD clock, ms) */
+  private hintsUntil = 0;
+  private hintsKey = '';
+  private played = false;
+  /** Detail (full weapon card): I held, or toggled by a tap on touch screens */
+  private detailHeld = false;
+  private detailTouch = false;
+  private detailOn = false;
+  private loadingLabel: string | null = null;
   lite = false;
   /** Seconds of sustained slow frames (auto lite) */
   private slowFor = 0;
@@ -169,6 +240,7 @@ export class Hud implements HudHooks {
     this.weapons = weapons;
     this.opts = opts;
     this.bridge = bridgeOf(sim);
+    this.bridge.weapons ??= weapons;
     this.slots = buildSlots(weapons.weapons);
     ensureStyle();
     ensureFonts();
@@ -176,8 +248,7 @@ export class Hud implements HudHooks {
     this.root.lang = 'tr';
     this.buildHeader();
     this.buildTelemetry();
-    this.buildCard();
-    this.buildStrip();
+    this.buildDock();
     this.reticle = new Reticle(this.root);
     this.buildReadout();
     this.scope = new ScopeOverlay(this.root);
@@ -195,7 +266,8 @@ export class Hud implements HudHooks {
     this.unsub.push(
       ev.on('impact', (e) => this.onImpact(e)),
       ev.on('blast', (e) => {
-        this.lastBlast = { e, wall: performance.now() };
+        this.lastBlast = { e, wall: this.clock };
+        this.lastActivity = this.clock;
         this.fragmentHits = 0;
         this.blastDirty = true;
       }),
@@ -205,14 +277,28 @@ export class Hud implements HudHooks {
       sim.onFrame((dt) => this.frame(dt)),
     );
     const onKey = (e: KeyboardEvent) => this.onKey(e);
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'KeyI') this.detailHeld = false;
+    };
+    // Nothing stays held when the window loses focus or the tab is hidden.
+    const onBlur = () => (this.detailHeld = false);
+    const onVisibility = () => {
+      if (document.hidden) this.detailHeld = false;
+    };
     const onResize = () => {
       this.layoutDirty = true;
       this.measure();
     };
     window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('resize', onResize);
     this.unsub.push(() => {
       window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('resize', onResize);
     });
     this.bridge.hud = this;
@@ -247,10 +333,18 @@ export class Hud implements HudHooks {
     if (show) {
       this.help.classList.remove('dx-show');
       this.weapons.setTrigger(false);
+      this.detailHeld = false;
       if (document.pointerLockElement) document.exitPointerLock();
       this.menu.setMuted(this.sim.ctx.audio.muted);
-    }
+    } else if (this.sim.currentScene) this.introduceKeys();
     if (this.opts.pauseOnMenu ?? true) this.sim.paused = show;
+  }
+
+  /** First time in play (menu closed over a built scene): the key hints introduce the controls. */
+  private introduceKeys(): void {
+    if (this.played) return;
+    this.played = true;
+    this.hintsUntil = this.clock + HINTS_MS;
   }
 
   toggleHelp(): void {
@@ -260,8 +354,16 @@ export class Hud implements HudHooks {
   reload(): void {
     const id = this.sim.currentScene?.id;
     if (!id) return;
-    this.toast('Sahne yeniden kuruluyor');
-    void this.load(id).catch((err) => console.error('scene reload failed', err));
+    const def = this.opts.scenes.find((s) => s.id === id);
+    this.setLoading(def?.nameTr ?? def?.name ?? '');
+    show(this.loadingEl, !this.menu.visible);
+    void nextPaint()
+      .then(() => this.load(id))
+      .catch((err) => {
+        console.error('scene reload failed', err);
+        this.toast('Sahne kurulamadı', true);
+      })
+      .finally(() => this.setLoading(null));
   }
 
   toast(text: string, accent = false): void {
@@ -303,6 +405,7 @@ export class Hud implements HudHooks {
     this.menu.dispose();
     this.root.remove();
     if (this.bridge.hud === this) this.bridge.hud = null;
+    if (this.bridge.weapons === this.weapons && !this.bridge.player) this.bridge.weapons = null;
     if (this.opts.pauseOnMenu ?? true) this.sim.paused = false;
   }
 
@@ -334,29 +437,29 @@ export class Hud implements HudHooks {
     this.tele = p;
     const head = el('div', 'dx-tele-head', undefined, p);
     el('span', 'dx-title', 'Telemetri', head);
-    el('span', 'dx-lbl', 'Son isabetler', head);
-    const cols = el('div', 'dx-cols', undefined, p);
-    for (const c of ['Çarpma hızı', 'Açı', 'Derinlik', 'Kalıntı hız', 'Enerji']) el('span', 'dx-lbl', c, cols);
-    const rows = el('div', 'dx-rows', undefined, p);
-    this.emptyEl = el('div', 'dx-empty', 'Henüz isabet yok. Bir yüzeye ateş et: çarpma hızı, geliş açısı, nüfuz derinliği, kalıntı hız ve soğurulan enerji burada.', rows);
-    this.colsEl = cols;
-    for (let i = 0; i < ROWS; i++) {
-      const root = el('div', 'dx-row', undefined, rows);
-      const l1 = el('div', 'dx-row-1', undefined, root);
-      const idx = el('span', 'dx-num dx-dim', '', l1);
-      const ammo = el('span', 'dx-ammo', '', l1);
-      const mat = el('span', 'dx-mat', '', l1);
-      const cnt = el('span', 'dx-cnt dx-num', '', l1);
-      const tag = el('span', 'dx-tag', '', l1);
-      const l2 = el('div', 'dx-row-2', undefined, root);
-      const v: HTMLSpanElement[] = [];
-      for (let k = 0; k < 5; k++) v.push(el('span', 'dx-v', '', l2));
-      root.style.display = 'none';
-      this.rows.push({ root, idx, ammo, mat, cnt, tag, v });
+    el('span', 'dx-lbl', 'Son isabet', head);
+    this.emptyEl = el('div', 'dx-empty', 'Bir yüzeye ateş et: çarpma hızı, açı, nüfuz, kalıntı hız ve soğurulan enerji burada belirir.', p);
+
+    // The newest impact, large.
+    this.latest = el('div', 'dx-latest', undefined, p);
+    const l1 = el('div', 'dx-row-1', undefined, this.latest);
+    this.lAmmo = el('span', 'dx-ammo', '', l1);
+    this.lMat = el('span', 'dx-mat', '', l1);
+    this.lCnt = el('span', 'dx-cnt dx-num', '', l1);
+    this.lTag = el('span', 'dx-tag', '', l1);
+    this.lFollow = el('span', 'dx-follow', '', this.latest);
+    const big = el('div', 'dx-big', undefined, this.latest);
+    const depth = el('div', 'dx-depth', undefined, big);
+    el('span', 'dx-lbl', 'Nüfuz', depth);
+    this.lDepth = el('b', undefined, '', depth);
+    const vals = el('div', 'dx-vals', undefined, big);
+    for (const label of ['Çarpma', 'Açı', 'Kalıntı', 'Enerji']) {
+      const d = el('div', undefined, undefined, vals);
+      el('span', 'dx-lbl', label, d);
+      this.lVals.push(el('span', 'dx-num', '', d));
     }
-    this.summary = el('div', 'dx-summary', undefined, p);
-    this.sumTr = el('div', 'dx-tr', '', this.summary);
-    this.groupEl = el('div', 'dx-group', undefined, this.summary);
+    this.sumTr = el('div', 'dx-tr', '', this.latest);
+    this.groupEl = el('div', 'dx-group', undefined, this.latest);
     const gh = el('div', 'dx-group-head', undefined, this.groupEl);
     this.groupHead = el('span', 'dx-lbl', '', gh);
     this.groupDepth = el('span', 'dx-num', '', gh);
@@ -369,60 +472,121 @@ export class Hud implements HudHooks {
     sec.appendChild(this.groupSvg);
     this.groupNote = el('div', 'dx-group-note', '', this.groupEl);
     this.groupEl.style.display = 'none';
-    this.sumModel = el('div', 'dx-model', '', this.summary);
-    this.summary.style.display = 'none';
+    this.sumModel = el('div', 'dx-model', '', this.latest);
+    this.latest.style.display = 'none';
+
+    // Older results, one line each, fading with age.
+    this.olderBox = el('div', 'dx-older', undefined, p);
+    for (let i = 1; i < ROWS; i++) {
+      const root = el('div', 'dx-orow', undefined, this.olderBox);
+      const ammo = el('span', 'dx-ammo', '', root);
+      const mat = el('span', 'dx-mat', '', root);
+      const depthEl = el('span', 'dx-num', '', root);
+      const cnt = el('span', 'dx-cnt dx-num', '', root);
+      const tag = el('span', 'dx-tag', '', root);
+      root.style.display = 'none';
+      this.older.push({ root, ammo, mat, depth: depthEl, cnt, tag });
+    }
+    this.olderBox.style.display = 'none';
+
     this.blastBox = el('div', 'dx-blast', undefined, p);
     const bh = el('div', 'dx-tele-head', undefined, this.blastBox);
     el('span', 'dx-title', 'Patlama · kamerada', bh);
     this.blastTitle = el('span', 'dx-lbl', '', bh);
     const grid = el('div', 'dx-blast-grid', undefined, this.blastBox);
-    for (const l of ['TNT-e', 'Mesafe', 'Aşırı basınç', 'Varış', 'Ses basıncı']) el('span', 'dx-lbl', l, grid);
-    for (let i = 0; i < 5; i++) this.blastVals.push(el('span', 'dx-v', '', grid));
+    for (const l of ['TNT-e', 'Mesafe', 'Aşırı basınç', 'Varış', 'Ses düzeyi']) {
+      const c = el('div', undefined, undefined, grid);
+      el('span', 'dx-lbl', l, c);
+      this.blastVals.push(el('span', 'dx-v', '', c));
+    }
     this.blastNote = el('div', 'dx-note', '', this.blastBox);
     this.blastBox.style.display = 'none';
   }
 
+  private buildDock(): void {
+    this.dock = el('div', 'dx-dock', undefined, this.root);
+    this.buildStrip();
+    this.buildCard();
+  }
+
   private buildCard(): void {
-    const c = el('div', 'dx-panel dx-card', undefined, this.root);
+    const c = el('div', 'dx-panel dx-card', undefined, this.dock);
     this.card = c;
-    const top = el('div', 'dx-card-top', undefined, c);
-    this.cardCat = el('span', 'dx-lbl', '', top);
-    const right = el('span', 'dx-stat', undefined, top);
-    el('span', 'dx-lbl', 'Tuş', right);
-    this.cardKey = el('span', 'dx-key', '', right);
-    this.wName = el('div', 'dx-wname', '', c);
-    this.wRole = el('div', 'dx-role', '', c);
-    const dim = el('div', 'dx-dimline', undefined, c);
+    c.title = 'Ayrıntı: I tuşunu basılı tut';
+    // Touch screens: a tap on the card opens / closes the full specification.
+    c.addEventListener('click', () => {
+      if (!this.bridge.player?.touch) return;
+      this.detailTouch = !this.detailTouch;
+    });
+    const head = el('div', 'dx-card-head', undefined, c);
+    const caps = el('span', 'dx-slotcaps', undefined, head);
+    for (const s of this.slots) {
+      const cap = el('span', 'dx-key', String(s.key), caps);
+      cap.title = CATEGORY_TR[s.category] ?? s.category;
+      // Touch screens: the group numbers are buttons (a second tap steps through the group).
+      cap.addEventListener('click', (e) => {
+        if (!this.bridge.player?.touch) return;
+        e.stopPropagation();
+        const id = weaponForKey(this.slots, s.key, this.weapons.current.id);
+        if (id && id !== this.weapons.current.id) {
+          this.weapons.setTrigger(false);
+          this.weapons.select(id);
+        }
+      });
+      this.slotCaps.set(s.key, cap);
+    }
+    this.cardCat = el('span', 'dx-cat', '', head);
+
+    const main = el('div', 'dx-card-main', undefined, c);
+    this.wName = el('div', 'dx-wname', '', main);
+    const ammo = el('span', 'dx-card-ammo', undefined, main);
+    this.ammoChip = el('span', 'dx-pill dx-on', '', ammo);
+    this.ammoChip.lang = 'en';
+    this.ammoKey = el('span', 'dx-key', 'T', ammo);
+    this.ammoKey.title = 'Mühimmat değiştir';
+
+    const sum = el('div', 'dx-card-sum', undefined, c);
+    this.sumLine = el('span', 'dx-sumline', '', sum);
+    this.coolLbl = el('span', 'dx-num', 'Hazır', sum);
+    const line = el('div', 'dx-coolline', undefined, c);
+    this.coolBar = el('b', undefined, undefined, line);
+    this.chargesEl = el('div', 'dx-charges', '', c);
+
+    // Full specification (I held, help open, or a tap on touch screens).
+    const more = el('div', 'dx-card-more', undefined, c);
+    const roleLine = el('div', 'dx-card-top', undefined, more);
+    this.wRole = el('div', 'dx-role', '', roleLine);
+    const fired = el('span', 'dx-stat', undefined, roleLine);
+    el('span', 'dx-lbl', 'Atılan', fired);
+    this.firedEl = el('span', 'dx-num dx-live', '0', fired);
+    const dim = el('div', 'dx-dimline', undefined, more);
     el('i', undefined, undefined, dim);
     this.dimLabel = el('span', undefined, '', dim);
     el('i', undefined, undefined, dim);
-    const ammoHead = el('div', 'dx-card-top', undefined, c);
+    const ammoHead = el('div', 'dx-card-top', undefined, more);
     el('span', 'dx-lbl', 'Mühimmat', ammoHead);
     el('span', 'dx-lbl dx-hide-s', 'T · değiştir', ammoHead);
-    this.pills = el('div', 'dx-ammo-pills', undefined, c);
-    this.ammoLineEl = el('div', 'dx-ammo-line', '', c);
-    this.specs = el('div', 'dx-specs', undefined, c);
-    const foot = el('div', 'dx-foot', undefined, c);
-    const fired = el('span', 'dx-stat', undefined, foot);
-    el('span', 'dx-lbl', 'Atılan', fired);
-    this.firedEl = el('span', 'dx-num dx-live', '0', fired);
-    const cool = el('div', 'dx-cool', undefined, foot);
-    this.coolBar = el('b', undefined, undefined, cool);
-    for (const x of [0, 25, 50, 75, 100]) el('i', undefined, undefined, cool).style.left = `${x}%`;
-    this.coolLbl = el('span', 'dx-num', 'Hazır', foot);
-    this.chargesEl = el('div', 'dx-charges', '', c);
+    this.pills = el('div', 'dx-ammo-pills', undefined, more);
+    this.ammoLineEl = el('div', 'dx-ammo-line', '', more);
+    this.specs = el('div', 'dx-specs', undefined, more);
   }
 
   private buildStrip(): void {
-    this.strip = el('div', 'dx-panel dx-strip', undefined, this.root);
+    this.strip = el('div', 'dx-panel dx-strip', undefined, this.dock);
     for (const s of this.slots) {
       const root = el('div', 'dx-slot', undefined, this.strip);
       el('span', 'dx-key', String(s.key), root);
       el('span', 'dx-lbl', CATEGORY_SHORT_TR[s.category] ?? s.category, root);
       const name = el('span', 'dx-sname', NAME_TR[s.weapons[0]!.id] ?? s.weapons[0]!.name, root);
-      const count = el('span', 'dx-count', s.weapons.length > 1 ? `1/${s.weapons.length}` : '', root);
-      this.slotEls.set(s.key, { root, name, count });
+      const count = el('span', 'dx-count', s.weapons.length > 1 ? `${s.weapons.length}` : '', root);
+      const subs = el('div', 'dx-subs', undefined, this.strip);
+      const subEls = new Map<string, HTMLDivElement>();
+      if (s.weapons.length > 1) for (const w of s.weapons) subEls.set(w.id, el('div', 'dx-sub', NAME_TR[w.id] ?? w.name, subs));
+      subs.style.display = 'none';
+      this.slotEls.set(s.key, { root, name, count, subs, subEls });
     }
+    const foot = el('div', 'dx-strip-foot', undefined, this.strip);
+    foot.textContent = 'Aynı tuş: gruptaki sıradaki · tekerlek: tümü';
   }
 
   private buildReadout(): void {
@@ -438,6 +602,8 @@ export class Hud implements HudHooks {
   private buildOverlays(): void {
     this.frameEl = el('div', 'dx-frame', undefined, this.root);
     for (let i = 0; i < 4; i++) el('i', undefined, undefined, this.frameEl);
+    this.keysEl = el('div', 'dx-keys', undefined, this.root);
+    this.keysEl.style.display = 'none';
     this.banner = el('div', 'dx-panel dx-banner', undefined, this.root);
     this.bannerText = el('span', undefined, '', this.banner);
     this.bannerAmmo = el('span', undefined, '', this.banner);
@@ -447,6 +613,10 @@ export class Hud implements HudHooks {
     this.toastEl = el('div', 'dx-panel dx-toast', '', this.root);
     this.lockHint = el('div', 'dx-panel dx-lockhint', 'Tıkla · fare kilidi', this.root);
     this.lockHint.style.display = 'none';
+    this.loadingEl = el('div', 'dx-panel dx-loading', undefined, this.root);
+    this.loadingText = el('span', undefined, '', this.loadingEl);
+    el('i', 'dx-sweep', undefined, this.loadingEl);
+    this.loadingEl.style.display = 'none';
   }
 
   private buildHelp(): void {
@@ -466,7 +636,7 @@ export class Hud implements HudHooks {
     const tcol = el('div', 'dx-help-col', undefined, touch);
     el('span', 'dx-lbl', 'Dokunmatik', tcol);
     for (const e of HELP_TOUCH) this.helpRow(tcol, e.keys, e.label);
-    el('div', 'dx-help-foot', 'Fizik: her isabet terminal balistik modeliyle çözülür; telemetri panelindeki sayılar modelin sonucudur, efekt için ayarlanmış değerler değildir.', this.help);
+    el('div', 'dx-help-foot', 'Her isabet terminal balistik modelleriyle çözülür (NDRC, Lambert–Jonas, Lanz–Odermatt, Kingery–Bulmash). Telemetrideki sayılar modelin sonucudur; gösteri için ayarlanmış değerler değildir.', this.help);
   }
 
   private helpRow(parent: HTMLElement, keys: string[], label: string): void {
@@ -492,8 +662,9 @@ export class Hud implements HudHooks {
       this.showMenu(false);
       return;
     }
-    this.menu.setLoading(true);
-    void this.load(id).then(
+    const def = this.opts.scenes.find((s) => s.id === id);
+    this.menu.setLoading(true, def?.nameTr ?? def?.name);
+    void nextPaint().then(() => this.load(id)).then(
       () => {
         this.menu.setLoading(false);
         this.showMenu(false);
@@ -503,7 +674,7 @@ export class Hud implements HudHooks {
         console.error('scene load failed', err);
         this.menu.setLoading(false);
         if (document.pointerLockElement) document.exitPointerLock();
-        this.toast('Sahne yüklenemedi', true);
+        this.toast('Sahne kurulamadı', true);
       },
     );
   }
@@ -511,6 +682,11 @@ export class Hud implements HudHooks {
   /** Scene loader call that also turns a synchronous throw into a rejection. */
   private load(id: string): Promise<void> {
     return new Promise<void>((resolve) => resolve(this.opts.onSelectScene(id)));
+  }
+
+  private setLoading(label: string | null): void {
+    this.loadingLabel = label;
+    if (label !== null) setText(this.loadingText, upperTr(label ? `${label} kuruluyor` : 'Sahne kuruluyor'));
   }
 
   private toggleMute(): void {
@@ -529,6 +705,10 @@ export class Hud implements HudHooks {
       return;
     }
     if (!this.menu.visible) {
+      if (e.code === 'KeyI' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        this.detailHeld = true;
+        return;
+      }
       // Without player controls installed, Esc still opens the menu.
       if (!this.bridge.player && e.code === 'Escape') {
         this.showMenu(true);
@@ -551,6 +731,7 @@ export class Hud implements HudHooks {
   }
 
   private onImpact(e: ImpactEvent): void {
+    this.lastActivity = this.clock;
     if (e.agent === 'fragment') {
       this.fragmentHits++;
       this.blastDirty = true;
@@ -561,7 +742,7 @@ export class Hud implements HudHooks {
     // ground beyond a holed wall): its row goes in under the top one and it does not count as a
     // hit on a spot, so the top row, the description and the spot readout stay with what the
     // viewer is shooting at.
-    const secondary = this.flewThrough(e);
+    const secondary = followThrough(e) ?? this.flewThrough(e);
     if (!secondary) {
       // A dispersed weapon's burst is still one spot: its 95 % group radius (2.45 σ) at this range.
       const sigma = this.weapons.current.dispersionMOA * MOA;
@@ -570,7 +751,7 @@ export class Hud implements HudHooks {
       cam.getWorldDirection(_fwd);
       this.groups.select(e.time, cam.position, _fwd, g);
     }
-    const row = impactRow(e);
+    const row = impactRow(e, secondary);
     const i = this.impacts.findIndex((r) => r.key === row.key);
     if (i >= 0) {
       row.count = this.impacts[i]!.count + 1;
@@ -587,14 +768,16 @@ export class Hud implements HudHooks {
   }
 
   /**
-   * Did the round behind this impact already go through something? The projectile is still in
-   * flight when its impact is reported, with its perforation count not yet raised for this one,
-   * and the point lies on the segment it flew this step.
+   * Fallback when the resolver does not report `priorPerforations`: did the round behind this
+   * impact already go through something? The projectile is still in flight when its impact is
+   * reported, with its perforation count not yet raised for this one, and the point lies on the
+   * segment it flew this step.
    */
   private flewThrough(e: ImpactEvent): boolean {
     if (e.agent !== 'projectile') return false;
     for (const p of this.sim.ctx.projectiles.active) {
       if (p.perforations === 0 || p.ammo !== e.ammo) continue;
+      if (e.projectileId !== undefined && p.id !== e.projectileId) continue;
       const a = p.previous, b = p.position, q = e.point;
       closestApproach(a.x, a.y, a.z, b.x, b.y, b.z, q.x, q.y, q.z, _ca);
       if (_ca.distance < 0.25) return true;
@@ -613,6 +796,7 @@ export class Hud implements HudHooks {
     this.lastCharges = -1;
     const id = this.sim.currentScene?.id ?? null;
     this.menu.setCurrent(this.opts.scenes.some((s) => s.id === id) ? id : null);
+    if (id && !this.menu.visible) this.introduceKeys();
   }
 
   // ─── Per frame ─────────────────────────────────────────────────────────────────────────────
@@ -620,6 +804,7 @@ export class Hud implements HudHooks {
   private frame(realDt: number): void {
     const t0 = performance.now();
     const ctx = this.sim.ctx;
+    if (realDt > 0) this.clock += Math.min(realDt, 0.25) * 1000;
     if (realDt > 0 && realDt < 1) {
       this.fps += (1 / realDt - this.fps) * Math.min(1, realDt * 3);
       // Not while the menu is up (paused, and the sheet has its own blur) or the tab stutters once.
@@ -643,11 +828,13 @@ export class Hud implements HudHooks {
       setText(this.muteEl, ctx.audio.muted ? 'Ses kapalı' : '');
       this.frameEl.classList.toggle('dx-show', scale < 0.999);
     }
-    this.updateWeapon();
-    const nowMs = performance.now();
+    const nowMs = this.clock;
+    this.updateDetail(nowMs);
+    this.updateWeapon(nowMs);
     // Telemetry at most ~20 Hz under a GAU-8 burst.
-    if ((this.impactsDirty || this.blastDirty) && nowMs - this.lastRender > 50) {
-      this.lastRender = nowMs;
+    const wall = performance.now();
+    if ((this.impactsDirty || this.blastDirty) && wall - this.lastRender > 50) {
+      this.lastRender = wall;
       if (this.impactsDirty) this.renderImpacts();
       if (this.blastDirty) this.renderBlast();
     }
@@ -655,20 +842,40 @@ export class Hud implements HudHooks {
       this.lastBlast = null;
       this.blastDirty = true;
     }
+    const idle = nowMs - this.lastActivity > IDLE_MS && !this.detailOn;
+    if (idle !== this.idle) {
+      this.idle = idle;
+      this.tele.classList.toggle('dx-idle', idle);
+    }
     this.updateReticle();
-    this.updateOverlays();
+    this.updateOverlays(nowMs);
     this.frameMs += (performance.now() - t0 - this.frameMs) * 0.05;
   }
 
-  private updateWeapon(): void {
+  /** Full weapon card while I is held, or (touch screens) after a tap on the card. */
+  private updateDetail(nowMs: number): void {
+    const on = !this.menu.visible && (this.detailHeld || this.detailTouch);
+    if (on === this.detailOn) return;
+    this.detailOn = on;
+    this.card.classList.toggle('dx-detail', on);
+    this.root.classList.toggle('dx-detailed', on);
+    if (!on) this.stripUntil = Math.min(this.stripUntil, nowMs);
+    this.layoutDirty = true;
+  }
+
+  private updateWeapon(nowMs: number): void {
     const w = this.weapons.current;
     const a = this.weapons.currentAmmo;
     if (w !== this.lastWeapon || a !== this.lastAmmo) {
       const weaponChanged = w !== this.lastWeapon;
+      // The list shows up on a change of weapon (not at start, not on an ammunition change).
+      if (weaponChanged && this.lastWeapon) this.stripUntil = nowMs + STRIP_MS;
       this.lastWeapon = w;
       this.lastAmmo = a;
       this.renderCard(w, a, weaponChanged);
     }
+    const stripOn = !this.menu.visible && (nowMs < this.stripUntil || this.detailOn);
+    if (stripOn !== this.strip.classList.contains('dx-show')) this.strip.classList.toggle('dx-show', stripOn);
     const fired = this.weapons.roundsFired;
     if (fired !== this.lastFired) {
       this.lastFired = fired;
@@ -691,8 +898,9 @@ export class Hud implements HudHooks {
       if (placed) {
         this.chargesEl.append('Yerleştirilen şarj ');
         el('b', undefined, String(n), this.chargesEl);
-        this.chargesEl.append(n > 0 ? ' · X: birlikte patlat · B: sırayla' : ' · sol tık: yüzeye yerleştir');
+        this.chargesEl.append(n > 0 ? ' · X: hepsi birden · B: sırayla' : ' · sol tık: yüzeye yerleştir');
       }
+      this.hintsKey = '';
       this.layoutDirty = true;
     }
     if (this.layoutDirty) {
@@ -701,22 +909,27 @@ export class Hud implements HudHooks {
     }
   }
 
-  /** On narrow screens the telemetry stacks under the (variable-height) weapon card. */
+  /** On narrow screens the weapon card sits along the top and the telemetry stacks under it. */
   private layout(): void {
     const narrow = matchMedia('(max-width: 760px)').matches;
-    const top = narrow ? `${this.card.offsetTop + this.card.offsetHeight + 8}px` : '';
+    const top = narrow ? `${this.dock.offsetTop + this.dock.offsetHeight + 8}px` : '';
     if (this.tele.style.top !== top) this.tele.style.top = top;
   }
 
   private renderCard(w: WeaponSpec, a: AmmoSpec, weaponChanged: boolean): void {
     const slot = slotOf(this.slots, w.id);
-    setText(this.cardCat, CATEGORY_TR[w.category] ?? w.category);
-    setText(this.cardKey, slot ? String(slot.key) : '');
+    setText(this.cardCat, caliberTr(a.caliber));
+    for (const [key, cap] of this.slotCaps) cap.classList.toggle('dx-on', slot?.key === key);
     const trName = NAME_TR[w.id];
     setText(this.wName, trName ?? w.name);
     // Model designations are English words: keep the Turkish dotted İ out of their capitals.
     this.wName.lang = trName ? 'tr' : 'en';
-    setText(this.wRole, ROLE_TR[w.id] ?? w.role);
+    setText(this.ammoChip, a.name);
+    show(this.ammoKey, w.ammo.length > 1);
+    // Values keep their units on the same line: the line breaks only between them.
+    setText(this.sumLine, weaponSummary(w, a).replace(/(?<! ·) (?!· )/g, '\u00a0'));
+    const inSlot = slot && slot.weapons.length > 1 ? ` · grupta ${slot.weapons.findIndex((x) => x.id === w.id) + 1}/${slot.weapons.length}` : '';
+    setText(this.wRole, `${CATEGORY_TR[w.category] ?? w.category}${inSlot} — ${ROLE_TR[w.id] ?? w.role}`);
     setText(this.dimLabel, caliberTr(a.caliber));
     this.pills.replaceChildren();
     for (const id of w.ammo) {
@@ -728,7 +941,7 @@ export class Hud implements HudHooks {
       }
       el('span', `dx-pill${id === a.id ? ' dx-on' : ''}`, name, this.pills);
     }
-    setText(this.ammoLineEl, ammoLine(a));
+    setText(this.ammoLineEl, `${ammoLine(a)} — ${a.note}`);
     this.specs.replaceChildren();
     for (const s of weaponSpecs(w, a)) {
       const row = el('div', `dx-spec${s.hi ? ' dx-hi' : ''}`, undefined, this.specs);
@@ -736,6 +949,7 @@ export class Hud implements HudHooks {
       el('span', 'dx-num', s.value, row);
     }
     this.lastCharges = -1;
+    this.hintsKey = '';
     this.layoutDirty = true;
     if (weaponChanged) {
       this.reticle.setKind(reticleFor(w));
@@ -743,10 +957,10 @@ export class Hud implements HudHooks {
         const def = this.slots.find((x) => x.key === key)!;
         const on = def === slot;
         s.root.classList.toggle('dx-on', on);
+        show(s.subs, on && s.subEls.size > 0);
         if (on) {
           setText(s.name, NAME_TR[w.id] ?? w.name);
-          const i = def.weapons.findIndex((x) => x.id === w.id);
-          setText(s.count, def.weapons.length > 1 ? `${i + 1}/${def.weapons.length}` : '');
+          for (const [id, sub] of s.subEls) sub.classList.toggle('dx-on', id === w.id);
         }
       }
     }
@@ -755,36 +969,42 @@ export class Hud implements HudHooks {
   private renderImpacts(): void {
     this.impactsDirty = false;
     const list = this.impacts;
-    // Arrival flash on the newest row (Web Animations: no forced reflow to restart it).
-    if (list.length && !REDUCED_MOTION()) {
-      this.rows[0]!.root.animate?.([{ backgroundColor: 'rgba(255, 181, 71, 0.2)' }, { backgroundColor: 'rgba(255, 181, 71, 0)' }], { duration: 450, easing: 'ease-out' });
-    }
-    this.emptyEl.style.display = list.length ? 'none' : '';
-    this.colsEl.style.display = list.length ? '' : 'none';
-    for (let i = 0; i < ROWS; i++) {
-      const r = this.rows[i]!;
-      const d = list[i];
-      if (!d) {
-        r.root.style.display = 'none';
-        continue;
-      }
-      r.root.style.display = '';
-      r.root.classList.toggle('dx-new', i === 0);
-      setText(r.idx, String(i + 1).padStart(2, '0'));
-      setText(r.ammo, d.ammo);
-      setText(r.mat, d.material);
-      setText(r.cnt, d.count > 1 ? `×${num(d.count, 0)}` : '');
-      setText(r.tag, d.outcomeTr);
-      r.tag.className = `dx-tag dx-${d.outcome}`;
-      const vals = [d.speed, d.obliquity, d.depth, d.residual, d.energy];
-      for (let k = 0; k < 5; k++) setText(r.v[k]!, vals[k]!);
-    }
     const top = list[0];
-    this.summary.style.display = top ? '' : 'none';
+    show(this.emptyEl, !top);
+    show(this.latest, !!top);
     if (top) {
+      // Arrival flash on the newest result (Web Animations: no forced reflow to restart it).
+      if (!REDUCED_MOTION()) this.latest.animate?.([{ backgroundColor: 'rgba(255, 181, 71, 0.16)' }, { backgroundColor: 'rgba(255, 181, 71, 0)' }], { duration: 450, easing: 'ease-out' });
+      setText(this.lAmmo, top.ammo);
+      setText(this.lMat, top.material);
+      setText(this.lCnt, top.count > 1 ? `×${num(top.count, 0)}` : '');
+      setText(this.lTag, top.outcomeTr);
+      this.lTag.className = `dx-tag dx-${top.outcome}`;
+      setText(this.lFollow, top.follow ? `↳ ${top.follow} · mermi önceki hedefi delip geldi` : '');
+      show(this.lFollow, !!top.follow);
+      setText(this.lDepth, top.depth);
+      const vals = [top.speed, top.obliquity, top.residual, top.energy];
+      for (let k = 0; k < 4; k++) setText(this.lVals[k]!, vals[k]!);
       setText(this.sumTr, top.description);
       setText(this.sumModel, top.model);
     }
+    let shown = 0;
+    for (let i = 0; i < this.older.length; i++) {
+      const r = this.older[i]!;
+      const d = list[i + 1];
+      show(r.root, !!d);
+      if (!d) continue;
+      shown++;
+      setText(r.ammo, d.follow ? `↳ ${d.follow}` : d.ammo);
+      r.ammo.classList.toggle('dx-followed', !!d.follow);
+      setText(r.mat, d.material);
+      setText(r.depth, d.depth);
+      setText(r.cnt, d.count > 1 ? `×${num(d.count, 0)}` : '');
+      setText(r.tag, d.outcomeTr);
+      r.tag.className = `dx-tag dx-${d.outcome}`;
+    }
+    show(this.olderBox, shown > 0);
+    this.tele.classList.toggle('dx-none', !top && !this.lastBlast);
     this.renderGroup();
   }
 
@@ -825,6 +1045,7 @@ export class Hud implements HudHooks {
     this.blastDirty = false;
     const b = this.lastBlast;
     this.blastBox.style.display = b ? '' : 'none';
+    this.tele.classList.toggle('dx-none', !b && !this.impacts.length);
     if (!b) return;
     const row = blastRow(b.e, this.sim.ctx.camera.position);
     const vals = [row.tnt, row.distance, row.overpressure, row.arrival, row.spl];
@@ -846,9 +1067,9 @@ export class Hud implements HudHooks {
     const aim = this.weapons.aimPoint;
     const range = aim ? aim.distanceTo(cam.position) : NaN;
     const placed = w.delivery === 'placed';
-    const reach = (w as WeaponSpec & { placeRange?: number }).placeRange ?? 80;
+    const reach = w.placeRange ?? 80;
     setText(this.rangeLbl, w.delivery === 'indirect' ? 'Hedef' : placed ? 'Şarj' : 'Mesafe');
-    setText(this.rangeEl, Number.isFinite(range) ? (placed && range > reach ? `${fmtDistance(range)} · menzil dışı` : fmtDistance(range)) : '—');
+    setText(this.rangeEl, Number.isFinite(range) ? (placed && range > reach ? `${fmtDistance(range)} · erişim dışı` : fmtDistance(range)) : '—');
     const showSpread = w.delivery === 'direct' && w.dispersionMOA > 0 && Number.isFinite(range);
     this.spreadLine.style.display = showSpread ? '' : 'none';
     // Diameter holding 95 % of rounds: 2 · 2.45 σ · R (circular normal, Rayleigh radius).
@@ -862,9 +1083,15 @@ export class Hud implements HudHooks {
     this.root.classList.toggle('dx-scoped', scoped);
     this.reticle.setVisible(!scoped && !(p?.bulletCam));
     this.readout.style.display = p?.bulletCam || scoped ? 'none' : '';
+    // A render-only recoil kick lifts the picture, not the aim: the reticle stays on the aimed
+    // point, which appears kp·(px/rad) below and ky·(px/rad) right of the centre (small angles).
+    const kx = p && !scoped ? p.kick.yaw * pxPerRad : 0;
+    const ky = p && !scoped ? p.kick.pitch * pxPerRad : 0;
+    const tr = Math.abs(kx) + Math.abs(ky) > 0.25 ? `translate(${kx.toFixed(1)}px, ${ky.toFixed(1)}px)` : '';
+    if (this.reticle.el.style.transform !== tr) this.reticle.el.style.transform = tr;
   }
 
-  private updateOverlays(): void {
+  private updateOverlays(nowMs: number): void {
     const p = this.bridge.player;
     const bc = p?.bulletCam ?? null;
     if (bc) {
@@ -874,7 +1101,7 @@ export class Hud implements HudHooks {
       setText(this.bannerNum, bc.following ? `${fmtSpeed(bc.speed)} · ${fmtDistance(bc.distance)}` : '');
     } else if (p?.bulletCamArmed) {
       this.banner.style.display = '';
-      setText(this.bannerText, 'Mermi kamerası hazır · roket, top mermisi veya bomba at');
+      setText(this.bannerText, 'Mermi kamerası hazır · roket, top mermisi ya da bomba at');
       setText(this.bannerAmmo, '');
       setText(this.bannerNum, '');
     } else this.banner.style.display = 'none';
@@ -882,5 +1109,23 @@ export class Hud implements HudHooks {
     this.lockHint.style.display = showHint ? '' : 'none';
     if (showHint) setText(this.lockHint, upperTr(p!.lockUnavailable ? 'Sağ tuşla sürükle: bakış · sol tık: ateş' : 'Tıkla · fare kilidi'));
     this.root.classList.toggle('dx-is-touch', !!p?.touch);
+    // Key hints: the first seconds of play and while the detail is open; never on touch screens.
+    const hints = !p?.touch && !this.menu.visible && this.hudVisible && !this.scoped && !bc && (nowMs < this.hintsUntil || this.detailOn);
+    show(this.keysEl, hints);
+    if (hints) this.renderKeys();
+    show(this.loadingEl, this.loadingLabel !== null && !this.menu.visible);
+  }
+
+  private renderKeys(): void {
+    const w = this.weapons.current;
+    const key = `${w.delivery}|${w.ammo.length}|${this.weapons.charges.length > 0}`;
+    if (key === this.hintsKey) return;
+    this.hintsKey = key;
+    this.keysEl.replaceChildren();
+    for (const h of keyHints(w.delivery, w.ammo.length, this.weapons.charges.length)) {
+      const item = el('span', 'dx-khint', undefined, this.keysEl);
+      for (const k of h.keys) el('span', 'dx-cap', k, item);
+      el('span', undefined, h.label, item);
+    }
   }
 }

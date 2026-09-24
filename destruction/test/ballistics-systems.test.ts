@@ -19,8 +19,10 @@ import type { WeaponController } from '../src/weapons/WeaponController.ts';
 import { MATERIALS } from '../src/physics/materials.ts';
 import { blastAt } from '../src/physics/ballistics/blast.ts';
 import { stepFlight } from '../src/physics/ballistics/flight.ts';
-import type { Destructible } from '../src/destructibles/Destructible.ts';
-import type { BlastLoad, ImpactEvent } from '../src/physics/ballistics/types.ts';
+import { allocateDestructibleId, rayBoxEntry, type Destructible, type RayHit } from '../src/destructibles/Destructible.ts';
+import type { MaterialProps } from '../src/physics/materials.ts';
+import type { ExtendedBlastLoad } from '../src/physics/ballistics/blast.ts';
+import type { BlastLoad, ImpactEvent, ThicknessProbe } from '../src/physics/ballistics/types.ts';
 import type { BlastEvent } from '../src/app/contracts.ts';
 
 interface Rig extends TestSim {
@@ -75,6 +77,10 @@ test('perforation chains through several targets, speed falling at each', async 
   for (let i = 1; i < hits.length; i++) assert.ok(hits[i]!.speed < hits[i - 1]!.speed && hits[i]!.speed <= hits[i - 1]!.residualSpeed + 1);
   // Momentum and energy bookkeeping per plate.
   for (const e of hits) assert.ok(e.energyAbsorbed > 0 && e.momentum.z < 0);
+  // Bookkeeping fields: one round, how many plates it had already gone through, plate thickness.
+  assert.ok(hits.every((e) => e.projectileId !== undefined && e.projectileId === hits[0]!.projectileId));
+  assert.deepEqual(hits.map((e) => e.priorPerforations), [0, 1, 2]);
+  for (const e of hits) within(e.targetThickness!, 0.0059, 0.0061, 'thickness along the normal');
 });
 
 test('multi-material run: a reinforced slab is one probe of concrete + rebar + concrete', async () => {
@@ -205,6 +211,84 @@ test('blast loads arrive when the shock front does (Kingery–Bulmash arrival ti
   assert.ok(r.blasts.count === 1 && r.blastEvents[0]!.fireballRadius > 0.5);
 });
 
+/** Axis-aligned solid box (walls, floor, roof of a test room); records the blast loads it receives. */
+class BoxTarget implements Destructible {
+  readonly id = allocateDestructibleId();
+  readonly kind = 'voxel' as const;
+  readonly root = new THREE.Object3D();
+  readonly bounds: THREE.Box3;
+  readonly disposed = false;
+  readonly loads: ExtendedBlastLoad[] = [];
+  readonly name: string;
+  readonly material: MaterialProps;
+  constructor(name: string, min: THREE.Vector3, max: THREE.Vector3, material: MaterialProps = MATERIALS.concrete) {
+    this.name = name;
+    this.material = material;
+    this.bounds = new THREE.Box3(min, max);
+  }
+  raycast(o: THREE.Vector3, d: THREE.Vector3, maxDist: number): RayHit | null {
+    const t = rayBoxEntry(this.bounds, o, d, maxDist);
+    if (!(t < Infinity)) return null;
+    const point = o.clone().addScaledVector(d, t);
+    const c = this.bounds.getCenter(new THREE.Vector3()), h = this.bounds.getSize(new THREE.Vector3()).multiplyScalar(0.5);
+    const q = point.clone().sub(c).divide(h);
+    const a = Math.abs(q.x) > Math.abs(q.y) ? (Math.abs(q.x) > Math.abs(q.z) ? 'x' : 'z') : Math.abs(q.y) > Math.abs(q.z) ? 'y' : 'z';
+    const normal = new THREE.Vector3();
+    normal[a] = Math.sign(q[a]);
+    return { target: this, point, normal, distance: t, material: this.material };
+  }
+  probe(): ThicknessProbe {
+    return { segments: [{ material: this.material, start: 0, end: 0.3, strength: 1 }], exits: true };
+  }
+  applyImpact(): void {}
+  applyBlast(l: BlastLoad): void {
+    this.loads.push(l as ExtendedBlastLoad);
+  }
+  dispose(): void {}
+}
+
+test('a detonation inside a closed room adds the gas pressure to the room walls, not to open-air targets', async () => {
+  const r = await rig();
+  // 17.7 × 5.9 × 5.9 m room (the chapel's 616 m³) of 0.3 m walls on the ground, with a door.
+  const add = (name: string, a: [number, number, number], b: [number, number, number]) => {
+    const t = new BoxTarget(name, V(...a), V(...b));
+    r.ctx.addDestructible(t);
+    return t;
+  };
+  const walls = [
+    add('north', [-9.15, 0, -3.25], [9.15, 5.9, -2.95]),
+    add('south', [-9.15, 0, 2.95], [9.15, 5.9, 3.25]),
+    add('east', [8.85, 0, -2.95], [9.15, 5.9, 2.95]),
+    add('west', [-9.15, 0, -2.95], [-8.85, 5.9, 1.45]),
+    add('roof', [-9.15, 5.9, -3.25], [9.15, 6.2, 3.25]),
+  ];
+  const outside = add('outside wall', [30, 0, -3], [30.3, 4, 3]);
+  const center = V(0, 1.2, 0);
+  const enc = r.blasts.measureEnclosure(center, new Set());
+  assert.ok(enc, 'enclosed');
+  within(enc!.volume, 450, 800, 'measured volume m³');
+  within(enc!.closed, 0.85, 1, 'closed fraction');
+  // Wide enough that several of the 64 probe rays meet it.
+  const column = add('interior column', [2.5, 0, 1], [3.1, 5.9, 2]);
+  r.blasts.detonate({ center, tntKg: 12, kind: 'thermobaric' });
+  r.step(0.2);
+  const gas = r.blasts.lastGas!;
+  assert.ok(gas && gas.pressure > 120e3, `gas pressure ${(gas?.pressure ?? 0) / 1e3} kPa`);
+  for (const w of walls) assert.ok(r.blasts.lastEnclosureIds.has(w.id), `${w.name} bounds the room`);
+  assert.ok(!r.blasts.lastEnclosureIds.has(outside.id));
+  // The inside face of the far end wall is breached (P–I ≥ 2); outside the room nothing changes.
+  const east = walls[2]!.loads[0]!;
+  assert.ok(east.gas && east.damageAt(V(8.85, 2, 0), V(-1, 0, 0), MATERIALS.concrete, 0.3) >= 2);
+  assert.equal(outside.loads[0]?.gas ?? null, null);
+  // A column standing inside the room feels the gas on all sides: no net gas load on it.
+  assert.ok(!r.blasts.lastEnclosureIds.has(column.id));
+  assert.equal(column.loads[0]?.gas ?? null, null);
+  // Out in the open (no walls around), the same charge measures no enclosure.
+  const r2 = await rig();
+  r2.blasts.detonate({ center, tntKg: 12, kind: 'thermobaric' });
+  assert.equal(r2.blasts.lastGas, null);
+});
+
 test('occluded targets get a diffracted (weaker) load', async () => {
   const r = await rig();
   r.slab({ name: 'shield', thickness: 0.3, width: 4, height: 4, position: V(3, 2, 0), yaw: -Math.PI / 2 });
@@ -329,6 +413,50 @@ test('WeaponController: auto fire at the cyclic rate, tracers, indirect fire lan
   assert.equal(wc.charges.length, 0);
   assert.equal(r.blastEvents.length, n + 1);
   assert.equal(r.blastEvents[n]!.kind, 'contact');
+});
+
+test('WeaponController: each weapon keeps its own reload; a held trigger fires when ready', async () => {
+  const r = await rig();
+  const wc = createWeaponController(r.sim) as WeaponController;
+  r.slab({ name: 'backstop', width: 20, height: 10, thickness: 1, position: V(0, 5, -60) });
+  const cam = r.ctx.camera;
+  cam.position.set(0, 1.7, 0);
+  cam.lookAt(0, 1.7, -60);
+  cam.updateMatrixWorld();
+  const shots: string[] = [];
+  r.ctx.events.on('shot', (e) => shots.push(e.weapon.id));
+  const click = () => {
+    wc.setTrigger(true);
+    r.step(1 / 60);
+    wc.setTrigger(false);
+    r.step(1 / 60);
+  };
+  wc.select('tankgun');
+  click();
+  assert.deepEqual(shots, ['tankgun']);
+  assert.ok(wc.cooldown > 2, `tank gun reloading (${wc.cooldown.toFixed(2)} s)`);
+  // Switching at once: the RPG is loaded and fires on the next click.
+  wc.select('rpg7');
+  assert.equal(wc.cooldown, 0);
+  click();
+  assert.deepEqual(shots, ['tankgun', 'rpg7']);
+  // Back to the gun: its reload kept running while it was holstered.
+  const left = wc.cooldown;
+  r.step(0.5);
+  wc.select('tankgun');
+  assert.ok(wc.cooldown > 0 && wc.cooldown < 2.4 - 0.5, `gun reload left ${wc.cooldown.toFixed(2)} s`);
+  // A click during the reload does nothing; holding the trigger fires the moment it is loaded.
+  click();
+  assert.equal(shots.length, 2);
+  wc.setTrigger(true);
+  assert.equal(wc.triggerDown, true);
+  r.step(wc.cooldown + 0.05);
+  assert.deepEqual(shots, ['tankgun', 'rpg7', 'tankgun']);
+  r.step(0.5);
+  assert.equal(shots.length, 3, 'single-shot: one round per press');
+  wc.setTrigger(false);
+  assert.equal(wc.triggerDown, false);
+  void left;
 });
 
 // ─── Timing inside the fixed step (review fixes) ─────────────────────────────────────────────

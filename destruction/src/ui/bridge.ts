@@ -1,9 +1,11 @@
+import type { WeaponControllerApi } from '../app/contracts.ts';
 import type { AmmoSpec } from '../physics/ballistics/types.ts';
 
 /**
  * The player controls and the HUD are installed separately (either may be absent). They find
  * each other through this per-simulation bridge: the player publishes its view state (pointer
  * lock, aim-down-sights, bullet camera) and the HUD publishes its hooks (menu, help, toasts).
+ * Whoever holds the weapon controller publishes it too (audio follows the trigger with it).
  */
 
 export interface BulletCamView {
@@ -27,6 +29,11 @@ export interface PlayerView {
   readonly bulletCamArmed: boolean;
   /** Target time scale (slow motion on/off) */
   readonly slowMo: boolean;
+  /**
+   * Render-only recoil kick of the view, radians (+pitch up, +yaw left); zero when the camera
+   * itself kicks. The aim stays put, so on screen it sits this far from the centre.
+   */
+  readonly kick: { readonly pitch: number; readonly yaw: number };
   requestLock(): void;
 }
 
@@ -45,6 +52,8 @@ export interface HudHooks {
 export interface Bridge {
   player: PlayerView | null;
   hud: HudHooks | null;
+  /** The viewer's weapon controller (rotary guns spin up while its trigger is held) */
+  weapons: WeaponControllerApi | null;
 }
 
 const bridges = new WeakMap<object, Bridge>();
@@ -52,7 +61,7 @@ const bridges = new WeakMap<object, Bridge>();
 export function bridgeOf(sim: object): Bridge {
   let b = bridges.get(sim);
   if (!b) {
-    b = { player: null, hud: null };
+    b = { player: null, hud: null, weapons: null };
     bridges.set(sim, b);
   }
   return b;

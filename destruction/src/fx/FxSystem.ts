@@ -616,16 +616,16 @@ export class FxSystem implements System, FxApi {
 
     // Flash. Peak luminous intensity ≈ fireball radiance × projected area (a ~2300 K surface of
     // radius R_f ≈ 1.75 W^⅓), i.e. ≈ 300 W^⅔ render-candela. The white-hot phase is brief: the
-    // detonation products cool below bright incandescence within ≈ 25 ms·kg^−⅓ (high-speed footage
-    // of 1–10 kg charges; cube-root scaling, Baker et al. 1983) — the orange afterburn that follows
-    // is drawn by the fireball particles, which light nothing much in daylight. Its reach: where it
+    // detonation products cool below bright incandescence within ≈ 15 ms·kg^−⅓ (e-folding ≈ 5 ms;
+    // high-speed footage of 1–10 kg charges; cube-root scaling, Baker et al. 1983) — the orange
+    // afterburn that follows is drawn by the fireball particles, which light nothing much in daylight. Its reach: where it
     // still adds ≈ 5 % to the sunlight, √(I / 0.05 E_sun), capped at a few fireball radii.
     {
       const I = FIREBALL_CD * Math.pow(W, 2 / 3) * (thermo ? 1.5 : 1);
       const sc = this.atmo.sunColor.value;
       const eSun = Math.max(0.5, 0.2126 * sc.r + 0.7152 * sc.g + 0.0722 * sc.b);
       const reach = Math.min(Math.sqrt(I / (0.05 * eSun)), 6 * Rf + 4);
-      this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, I, reach, 0.025 * w3 * (thermo ? 2.5 : 1));
+      this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, I, reach, 0.015 * w3 * (thermo ? 2.5 : 1));
     }
 
     // 1) Fireball body: incandescent turbulent puffs that expand fast, stall and cool into soot.
