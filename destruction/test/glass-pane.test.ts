@@ -1,0 +1,239 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import * as THREE from 'three';
+import { PhysicsWorld } from '../src/physics/PhysicsWorld.ts';
+import { DestructibleRegistry } from '../src/destructibles/Registry.ts';
+import { EventBus } from '../src/core/events.ts';
+import { Rng } from '../src/core/rng.ts';
+import type { GlassPaneSpec, SimContext, SimEvents, StructureApi } from '../src/app/contracts.ts';
+import type { Destructible } from '../src/destructibles/Destructible.ts';
+import { createGlassPane, GlassPane } from '../src/destructibles/glass/index.ts';
+import { getAmmo } from '../src/physics/ballistics/ammo.ts';
+import { resolveImpact } from '../src/physics/ballistics/penetration.ts';
+import { createBlastLoad } from '../src/physics/ballistics/blast.ts';
+import { MATERIALS } from '../src/physics/materials.ts';
+
+type Ctx = SimContext & { step(dt?: number): void; shatters: number; shatterArea: number };
+
+/** Headless context: real Rapier world with a ground slab (top at y = 0), no renderer. */
+async function makeCtx(): Promise<Ctx> {
+  const physics = await PhysicsWorld.create();
+  physics.createFixed(new THREE.Vector3(0, -1, 0), undefined, [physics.R.ColliderDesc.cuboid(500, 1, 500)]);
+  const registry = new DestructibleRegistry();
+  const events = new EventBus<SimEvents>();
+  let n = 0;
+  const structure: StructureApi = {
+    link(_s, supported, region) {
+      const id = `a${++n}`;
+      supported.structural?.addAnchor(id, region);
+      return id;
+    },
+    touch() {},
+    remove() {},
+    update() {},
+  };
+  const nop = () => {};
+  const world = new THREE.Group();
+  const ctx = {
+    scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(60, 1, 0.05, 500), renderer: null as unknown as THREE.WebGLRenderer,
+    physics, registry, events, rng: new Rng(7), time: { now: 0, scale: 1, fixedDt: 1 / 60 }, world,
+    projectiles: { spawn: () => { throw new Error('no projectiles'); }, active: [] },
+    blasts: { detonate: nop }, fx: { chips: nop, dust: nop, sparks: nop, smoke: nop, flash: nop, shake: nop },
+    audio: { unlock: nop, setMuted: nop, muted: true }, structure,
+    addDestructible(d: Destructible) {
+      registry.add(d);
+      if (!d.root.parent) world.add(d.root);
+    },
+    ammo: (id: string) => getAmmo(id),
+    shatters: 0,
+    shatterArea: 0,
+    step(dt = 1 / 60) {
+      ctx.time.now += dt;
+      physics.step(dt);
+      for (const d of registry.all()) if (!d.disposed) d.fixedUpdate?.(dt);
+      for (const d of registry.all()) if (!d.disposed) d.frameUpdate?.(dt);
+      registry.sweep();
+    },
+  };
+  events.on('shatter', (e) => {
+    ctx.shatters++;
+    ctx.shatterArea += e.area;
+  });
+  return ctx as unknown as Ctx;
+}
+
+function pane(ctx: Ctx, type: GlassPaneSpec['type'], o: Partial<GlassPaneSpec> = {}): GlassPane {
+  return createGlassPane(ctx, {
+    name: `${type} pane`, type, width: 1.5, height: 1.0, thickness: type === 'laminated' ? 0.0176 : 0.006,
+    position: [0, 1.5, 0], framed: true, ...o,
+  }) as GlassPane;
+}
+
+/** Fire one round from `from` at `at` through the real ray test, probe and terminal-ballistics resolver. */
+function shoot(ctx: Ctx, target: Destructible, ammo: string, from: THREE.Vector3, at: THREE.Vector3): boolean {
+  const a = getAmmo(ammo);
+  const dir = at.clone().sub(from).normalize();
+  const hit = target.raycast(from, dir, 100);
+  if (!hit) return false;
+  const probe = target.probe(hit, dir, 1);
+  const ev = resolveImpact({ ammo: a, position: hit.point, velocity: dir.clone().multiplyScalar(a.muzzleVelocity), mass: a.mass, length: a.length, perforations: 0 }, hit, probe, ctx.rng);
+  ev.time = ctx.time.now;
+  target.applyImpact(ev);
+  return true;
+}
+
+test('tempered pane: one rifle round dices the whole pane, front first, then the collapse', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'tempered', { width: 3, height: 3, thickness: 0.01, position: [0, 1.6, 0] });
+  const from = new THREE.Vector3(0.4, 1.8, 20);
+  assert.ok(shoot(ctx, p, 'm855', from, new THREE.Vector3(0.4, 1.8, 0)));
+  assert.ok(p.hasFailed(), 'pane failed');
+  assert.equal(ctx.shatters, 1);
+  // The dice are spawned over a few frames (≤ ~8 ms each).
+  for (let k = 0; k < 20; k++) ctx.step(1 / 240);
+  assert.ok(Math.abs(ctx.shatterArea - 9) < 1e-9);
+  // ~8 mm dice, capped to 20 000 clusters for a 9 m² pane.
+  assert.ok(p.stats.dice > 10000 && p.stats.dice <= 20000, `dice ${p.stats.dice}`);
+  // The mosaic comes apart within a fraction of a second after the 2 ms crack front.
+  assert.ok(p.collapseTime > 0.003 && p.collapseTime < 0.8, `collapse ${p.collapseTime.toFixed(3)} s`);
+  // Rounds pass through where the pane was.
+  assert.equal(p.raycast(from, new THREE.Vector3(0, 0, -1), 100), null);
+  p.dispose();
+});
+
+test('tempered pane shrugs off a shallow chip', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'tempered', { thickness: 0.012 });
+  const from = new THREE.Vector3(0, 1.5, 5);
+  const dir = new THREE.Vector3(0, 0, -1);
+  const hit = p.raycast(from, dir, 100)!;
+  const a = getAmmo('m855');
+  const ev = resolveImpact({ ammo: a, position: hit.point, velocity: dir.clone().multiplyScalar(a.muzzleVelocity), mass: a.mass, length: a.length, perforations: 0 }, hit, p.probe(hit, dir, 1), ctx.rng);
+  ev.outcome = 'embed';
+  ev.depth = 0.001;
+  ev.craterDepth = 0.0008;
+  p.applyImpact(ev);
+  assert.equal(p.hasFailed(), false);
+});
+
+test('annealed pane: a burst cracks it into shards that fall, land and burst again; holes let rounds through', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'annealed', { thickness: 0.006 });
+  const from = new THREE.Vector3(0, 1.5, 15);
+  const rng = new Rng(3);
+  let hits = 0;
+  for (let k = 0; k < 25; k++) {
+    const at = new THREE.Vector3(rng.gaussian(0, 0.12), 1.5 + rng.gaussian(0, 0.12), 0);
+    if (shoot(ctx, p, 'm855', from, at)) hits++;
+    ctx.step(1 / 60);
+    ctx.step(1 / 60);
+  }
+  // Later rounds find holes where pieces have already fallen out and pass straight through.
+  assert.ok(hits >= 8 && hits < 25, `hits ${hits}`);
+  for (let k = 0; k < 120; k++) ctx.step(1 / 60);
+  console.log('annealed burst', { hits, remaining: p.remaining().toFixed(3), ...p.stats, shatters: ctx.shatters });
+  assert.ok(p.stats.cracks > 200, `crack segments ${p.stats.cracks}`);
+  assert.ok(p.remaining() < 0.99 && p.remaining() > 0.2, `remaining ${p.remaining().toFixed(3)}`);
+  assert.ok(p.stats.shards > 0 || p.stats.dice > 0, 'pieces fell out');
+  assert.ok(ctx.shatters > 0);
+  for (const x of [p.stats.impactMs, p.stats.facesMs]) assert.ok(x < 50, `per-hit cost ${x.toFixed(1)} ms`);
+  p.dispose();
+});
+
+test('laminated pane: holds together, sags with damage, tears out when heavily blasted', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'laminated', { width: 1.2, height: 1.6, position: [0, 1.2, 0] });
+  const from = new THREE.Vector3(0, 1.2, 15);
+  const rng = new Rng(9);
+  for (let k = 0; k < 30; k++) {
+    shoot(ctx, p, 'm855', from, new THREE.Vector3(rng.gaussian(0, 0.25), 1.2 + rng.gaussian(0, 0.3), 0));
+    ctx.step(1 / 30);
+  }
+  for (let k = 0; k < 90; k++) ctx.step(1 / 60);
+  assert.equal(p.hasFailed(), false, 'laminated glass stays in the frame under rifle fire');
+  assert.ok(p.sag > 0.01, `sag ${(p.sag * 100).toFixed(1)} cm`);
+  assert.ok(p.laminatedDamage > 0.2);
+  // 10 kg TNT at 3 m is still below the laminated severe curve (D ≈ 1.9): it bulges but stays.
+  p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.2, 3), tntKg: 10, kind: 'he' }, ctx.time.now));
+  assert.equal(p.hasFailed(), false, 'D < 2: held by the interlayer');
+  for (let k = 0; k < 30; k++) ctx.step(1 / 60);
+  assert.ok(p.sag > 0.05, `blast bulge ${(p.sag * 100).toFixed(1)} cm`);
+  // 10 kg at 1.2 m: beyond it — the sheet tears out of the frame.
+  p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.2, 1.2), tntKg: 10, kind: 'he' }, ctx.time.now));
+  assert.ok(p.hasFailed(), 'torn out of the frame');
+  for (let k = 0; k < 180; k++) ctx.step(1 / 60);
+  const box = new THREE.Box3().setFromObject(p.root);
+  void box;
+  p.dispose();
+});
+
+test('P–I hookup: panes fail at the distance the pressure–impulse curve says, tempered ≈ 4× stronger', async () => {
+  const ctx = await makeCtx();
+  const mat = MATERIALS.glass_annealed;
+  // Distance at which a 1 kg TNT free-air burst reaches damage 1 on a 6 mm annealed pane.
+  const dmgAt = (R: number, m = mat) => {
+    const load = createBlastLoad({ center: new THREE.Vector3(0, 10, R), tntKg: 1, kind: 'he' }, 0);
+    return load.damageAt(new THREE.Vector3(0, 10, 0), new THREE.Vector3(0, 0, 1), m, 0.006);
+  };
+  let lo = 1, hi = 200;
+  for (let k = 0; k < 60; k++) {
+    const mid = 0.5 * (lo + hi);
+    if (dmgAt(mid) >= 1) lo = mid;
+    else hi = mid;
+  }
+  const Ra = lo;
+  lo = 1;
+  hi = 200;
+  for (let k = 0; k < 60; k++) {
+    const mid = 0.5 * (lo + hi);
+    if (dmgAt(mid, MATERIALS.glass_tempered) >= 1) lo = mid;
+    else hi = mid;
+  }
+  const Rt = lo;
+  assert.ok(Rt < Ra, `tempered fails closer (${Rt.toFixed(1)} m) than annealed (${Ra.toFixed(1)} m)`);
+  for (const [type, R] of [['annealed', Ra], ['tempered', Rt]] as const) {
+    const near = pane(ctx, type, { position: [0, 10, 0] });
+    near.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 10, 0.75 * R), tntKg: 1, kind: 'he' }, ctx.time.now));
+    assert.ok(near.remaining() < 0.9, `${type} at 0.75 R_fail breaks (remaining ${near.remaining().toFixed(2)})`);
+    const far = pane(ctx, type, { position: [0, 10, 0] });
+    far.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 10, 1.5 * R), tntKg: 1, kind: 'he' }, ctx.time.now));
+    assert.equal(far.remaining(), 1, `${type} at 1.5 R_fail survives`);
+    near.dispose();
+    far.dispose();
+  }
+});
+
+test('blast throws annealed shards away from the charge at the impulse–momentum speed', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'annealed', { position: [0, 1.5, 0] });
+  p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.5, 4), tntKg: 2, kind: 'he' }, 0));
+  assert.ok(p.remaining() < 0.1, `remaining ${p.remaining()}`);
+  assert.ok(p.stats.shards > 10, `shards ${p.stats.shards}`);
+  // After 0.1 s the fragments have moved towards −z (away from the charge at z = +4).
+  let moved = 0;
+  ctx.step(1 / 60);
+  for (let k = 0; k < 6; k++) ctx.step(1 / 60);
+  ctx.physics.world.forEachRigidBody((b) => {
+    if (b.isDynamic() && b.translation().z < -0.3) moved++;
+  });
+  assert.ok(moved > 5, `shards thrown away from the charge: ${moved}`);
+  // Stable at slow-motion steps as well.
+  for (let k = 0; k < 200; k++) ctx.step(0.001);
+  ctx.physics.world.forEachRigidBody((b) => {
+    const t = b.translation();
+    assert.ok(Number.isFinite(t.x + t.y + t.z));
+  });
+  p.dispose();
+});
+
+test('dispose frees bodies and leaves the registry clean', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'annealed');
+  p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.5, 3), tntKg: 2, kind: 'he' }, 0));
+  const before = ctx.physics.dynamicCount;
+  assert.ok(before > 0);
+  p.dispose();
+  assert.equal(ctx.physics.dynamicCount, 0);
+  ctx.registry.sweep();
+  assert.equal(ctx.registry.size, 0);
+});

@@ -1,0 +1,847 @@
+import * as THREE from 'three';
+import type { Simulation } from '../app/Simulation.ts';
+import type {
+  BlastEvent, DebrisContactEvent, FractureEvent, FxApi, ShatterEvent, ShotEvent, SimContext, StructuralFailureEvent, System,
+} from '../app/contracts.ts';
+import type { ImpactEvent } from '../physics/ballistics/types.ts';
+import { rangeForOverpressure, KB } from '../physics/ballistics/blast.ts';
+import type { Rng } from '../core/rng.ts';
+import { getAtmosphere, type Atmosphere } from '../render/atmosphere.ts';
+import { ParticleLayer, newRecord, type ParticleRecord } from './ParticleLayer.ts';
+import { Chips, type ChipKind } from './Chips.ts';
+import { FlashLights } from './FlashLights.ts';
+import { Tracers } from './Tracers.ts';
+import { ShockFronts } from './ShockFronts.ts';
+import { CameraShake } from './shake.ts';
+import { createFireAtlas, createSmokeAtlas } from './textures.ts';
+import { createFireMaterial, createSmokeMaterial, createSparkMaterial } from './shaders.ts';
+import { landingTime } from './motion.ts';
+import { groundOf } from './ground.ts';
+
+/** Particle budgets (≈ 20 k total, see DESIGN.md §5). */
+export const BUDGET = { smoke: 9000, fire: 2500, sparks: 5000, chips: 3500, tracers: 384 };
+
+/** Exposure time of the virtual camera for motion streaks, s (a 180° shutter at 60 fps). */
+const SHUTTER = 1 / 120;
+
+interface Emitter { x: number; y: number; z: number; radius: number; until: number; color: number; rise: number; acc: number; rate: number }
+interface Mark { t: number; x: number; y: number; z: number; bits: number }
+const MARK_CHIPS = 1, MARK_DUST = 2, MARK_SPARKS = 4;
+
+const _c = new THREE.Color();
+const _v = new THREE.Vector3();
+const _d = new THREE.Vector3();
+const _u = new THREE.Vector3();
+const _w = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler();
+const UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Visual effects for the whole simulation: reacts to shots, impacts, blasts, fractures, debris
+ * contacts and shattering glass, draws tracers and rocket motors from the live projectile list,
+ * and implements the FxApi that destructibles call directly. Everything is pooled and GPU-driven:
+ * a frame costs the CPU only the new particles and the tracer list.
+ */
+export class FxSystem implements System, FxApi {
+  readonly name = 'fx';
+  readonly root = new THREE.Group();
+  readonly solidRoot = new THREE.Group();
+  readonly smokeLayer: ParticleLayer;
+  readonly fireLayer: ParticleLayer;
+  readonly sparkLayer: ParticleLayer;
+  readonly chipLayer: Chips;
+  readonly tracers: Tracers;
+  readonly lights: FlashLights;
+  readonly shock: ShockFronts;
+  readonly shaker = new CameraShake();
+  private ctx: SimContext;
+  private atmo: Atmosphere;
+  private rng: Rng;
+  private P: ParticleRecord = newRecord();
+  private shutter = { value: SHUTTER };
+  private emitters: Emitter[] = [];
+  private marks: Mark[] = [];
+  private markHead = 0;
+  private trails = new Map<number, { x: number; y: number; z: number; alive: boolean }>();
+  private contactsThisFrame = 0;
+  private textures: THREE.Texture[] = [];
+  private unsub: (() => void)[] = [];
+  private savedPos = new THREE.Vector3();
+  private savedQuat = new THREE.Quaternion();
+  private shakeApplied = false;
+  private lightScan = 0;
+  private sceneSun: THREE.DirectionalLight | null = null;
+  private sceneHemi: THREE.HemisphereLight | null = null;
+  /** Wall-clock cost of the last frameUpdate, ms (telemetry) */
+  lastFrameMs = 0;
+
+  constructor(sim: Simulation) {
+    const ctx = (this.ctx = sim.ctx);
+    this.rng = ctx.rng.fork();
+    this.atmo = getAtmosphere(ctx.scene);
+    const smokeAtlas = createSmokeAtlas();
+    const fireAtlas = createFireAtlas();
+    this.textures.push(smokeAtlas, fireAtlas);
+    this.smokeLayer = new ParticleLayer('fx-smoke', BUDGET.smoke, createSmokeMaterial(this.atmo, smokeAtlas));
+    this.fireLayer = new ParticleLayer('fx-fire', BUDGET.fire, createFireMaterial(this.atmo, fireAtlas));
+    this.sparkLayer = new ParticleLayer('fx-sparks', BUDGET.sparks, createSparkMaterial(this.atmo, this.shutter));
+    this.smokeLayer.mesh.renderOrder = 10;
+    this.fireLayer.mesh.renderOrder = 20;
+    this.sparkLayer.mesh.renderOrder = 25;
+    this.chipLayer = new Chips(this.atmo, BUDGET.chips);
+    this.tracers = new Tracers(this.atmo, BUDGET.tracers);
+    this.lights = new FlashLights(4);
+    this.shock = new ShockFronts(this.atmo, 4);
+    this.root.name = 'fx-root';
+    this.root.add(this.smokeLayer.mesh, this.fireLayer.mesh, this.sparkLayer.mesh, this.tracers.mesh, this.shock.group);
+    this.solidRoot.name = 'fx-solid';
+    this.solidRoot.add(this.chipLayer.mesh, this.lights.group);
+    ctx.scene.add(this.root, this.solidRoot);
+    this.atmo.fxRoot = this.root;
+
+    const ev = ctx.events;
+    this.unsub.push(
+      ev.on('shot', (e) => this.onShot(e)),
+      ev.on('impact', (e) => this.onImpact(e)),
+      ev.on('blast', (e) => this.onBlast(e)),
+      ev.on('fracture', (e) => this.onFracture(e)),
+      ev.on('debrisContact', (e) => this.onDebrisContact(e)),
+      ev.on('shatter', (e) => this.onShatter(e)),
+      ev.on('structuralFailure', (e) => this.onStructuralFailure(e)),
+    );
+    // Under a pipeline that does not shake the camera itself, shake around the scene render.
+    const scene = ctx.scene;
+    const prevBefore = scene.onBeforeRender;
+    const prevAfter = scene.onAfterRender;
+    scene.onBeforeRender = (...args) => {
+      prevBefore.apply(scene, args);
+      if (!this.atmo.pipelineHandlesShake && this.atmo.shake.active) this.applyShake();
+    };
+    scene.onAfterRender = (...args) => {
+      prevAfter.apply(scene, args);
+      this.restoreShake();
+    };
+    this.unsub.push(() => {
+      scene.onBeforeRender = prevBefore;
+      scene.onAfterRender = prevAfter;
+    });
+  }
+
+  private get now(): number {
+    return this.ctx.time.now;
+  }
+
+  // ─── FxApi ───────────────────────────────────────────────────────────────────────────────
+
+  chips(o: Parameters<FxApi['chips']>[0]): void {
+    this.mark(o.position, MARK_CHIPS);
+    this.emitChips(o.position, o.direction, o.spread, o.speed, o.count, o.size, o.color, o.kind ?? 'stone');
+  }
+
+  dust(o: Parameters<FxApi['dust']>[0]): void {
+    this.mark(o.position, MARK_DUST);
+    const n = Math.round(Math.min(24, 2 + o.amount * 3));
+    this.emitDust(o.position, o.velocity ?? null, o.radius, n, o.color, 1);
+  }
+
+  sparks(o: Parameters<FxApi['sparks']>[0]): void {
+    this.mark(o.position, MARK_SPARKS);
+    this.emitSparks(o.position, o.direction, o.count, o.speed, 1500 + 800 * (o.hot ?? 0.7), 0.9, 0.0008, 0);
+  }
+
+  smokeSource(o: Parameters<FxApi['smoke']>[0]): void {
+    if (this.emitters.length >= 48) this.emitters.shift();
+    this.emitters.push({
+      x: o.position.x, y: o.position.y, z: o.position.z, radius: o.radius, until: this.now + o.duration,
+      color: o.color ?? 0x55504a, rise: o.rise ?? 1.2, acc: 0, rate: Math.min(12, 2 + o.radius * 4),
+    });
+  }
+
+  smoke(o: Parameters<FxApi['smoke']>[0]): void {
+    this.smokeSource(o);
+  }
+
+  flash(o: Parameters<FxApi['flash']>[0]): void {
+    this.lights.fire(this.now, o.position, o.color, o.intensity, o.radius, o.duration);
+  }
+
+  shake(amount: number): void {
+    this.shaker.add(amount);
+  }
+
+  // ─── Dedup of effects a destructible already produced itself ──────────────────────────────
+
+  private mark(p: THREE.Vector3, bits: number): void {
+    if (this.marks.length < 32) this.marks.push({ t: this.now, x: p.x, y: p.y, z: p.z, bits });
+    else {
+      const m = this.marks[this.markHead]!;
+      m.t = this.now; m.x = p.x; m.y = p.y; m.z = p.z; m.bits = bits;
+      this.markHead = (this.markHead + 1) % 32;
+    }
+  }
+
+  /** Effects already emitted by the target within 0.6 m of p during this step. */
+  private marked(p: THREE.Vector3): number {
+    let bits = 0;
+    for (const m of this.marks) {
+      if (Math.abs(m.t - this.now) > 1e-6) continue;
+      const dx = m.x - p.x, dy = m.y - p.y, dz = m.z - p.z;
+      if (dx * dx + dy * dy + dz * dz < 0.36) bits |= m.bits;
+    }
+    return bits;
+  }
+
+  // ─── Primitive emitters ──────────────────────────────────────────────────────────────────
+
+  /** Billowing dust puffs of a given colour (sRGB hex), rising slightly and drifting. */
+  emitDust(p: THREE.Vector3, vel: THREE.Vector3 | null, radius: number, count: number, color: number, lifeScale: number, t0 = this.now): void {
+    const P = this.P;
+    const rng = this.rng;
+    _c.setHex(color);
+    const r = Math.max(0.03, radius);
+    // Start the cloud off the surface it came from (along its launch velocity) so the soft-particle
+    // fade against that surface does not eat it.
+    const vl = vel ? vel.length() : 0;
+    const off = vl > 1e-6 ? (r * 0.6) / vl : 0;
+    for (let i = 0; i < count; i++) {
+      rng.inBall(_u).multiplyScalar(r * 0.45);
+      P.x = p.x + _u.x + (vel?.x ?? 0) * off; P.y = p.y + _u.y + (vel?.y ?? 0) * off; P.z = p.z + _u.z + (vel?.z ?? 0) * off;
+      rng.onSphere(_d);
+      const sp = rng.range(0.3, 1.2) * Math.sqrt(r) * 2.2;
+      P.vx = (vel?.x ?? 0) * rng.range(0.4, 1.1) + _d.x * sp;
+      P.vy = (vel?.y ?? 0) * rng.range(0.4, 1.1) + Math.abs(_d.y) * sp * 0.6;
+      P.vz = (vel?.z ?? 0) * rng.range(0.4, 1.1) + _d.z * sp;
+      P.t0 = t0 + rng.range(0, 0.04);
+      P.life = rng.range(3, 7) * lifeScale * (0.6 + 0.4 * Math.sqrt(r));
+      // Dust relaxes to the air quickly (τ ≈ 0.3–0.6 s for a turbulent puff), then barely settles.
+      P.drag = rng.range(1.8, 3.2);
+      P.gravity = rng.range(-0.02, 0.01);
+      P.floor = -1e4; P.tLand = -1;
+      P.size0 = r * rng.range(0.4, 0.8);
+      P.size1 = r * rng.range(1.6, 2.6);
+      P.growth = rng.range(0.25, 0.8) * Math.max(0.4, Math.sqrt(r));
+      P.spin = rng.range(-0.4, 0.4);
+      const shade = rng.range(0.85, 1.08);
+      P.r = _c.r * shade; P.g = _c.g * shade; P.b = _c.b * shade;
+      P.opacity = rng.range(0.55, 0.85);
+      P.seed = rng.next(); P.variant = rng.chance(0.7) ? rng.int(8, 16) : rng.int(0, 8); P.heat = 0; P.extra = 1;
+      this.smokeLayer.emit(P);
+    }
+  }
+
+  /** Solid chips thrown from p within a cone around dir (half-angle `spread` rad). */
+  emitChips(p: THREE.Vector3, dir: THREE.Vector3, spread: number, speed: number, count: number, size: number, color: number, kind: ChipKind, t0 = this.now): void {
+    const rng = this.rng;
+    const ground = groundOf(this.ctx.scene);
+    _c.setHex(color);
+    const n = Math.min(160, Math.max(0, Math.round(count)));
+    _w.copy(dir);
+    if (_w.lengthSq() < 1e-9) _w.set(0, 1, 0);
+    _w.normalize();
+    for (let i = 0; i < n; i++) {
+      rng.inCone(_w, Math.min(Math.PI * 0.95, Math.max(0.05, spread)), _d);
+      const sp = speed * rng.range(0.35, 1.15);
+      const s = size * rng.range(0.4, 1.3);
+      // Drag of a tumbling chip: k ≈ 3 ρ_air Cd / (8 ρ_s r), Cd ≈ 1 (Newton drag linearised at ~15 m/s).
+      const rho = kind === 'metal' ? 7850 : kind === 'glass' ? 2500 : 2400;
+      const k = Math.min(3, (3 * 1.225 * 1.0 * 15) / (8 * rho * Math.max(s * 0.5, 1e-3)));
+      const vx = _d.x * sp, vy = _d.y * sp, vz = _d.z * sp;
+      // Floor: ground under the (drag-free) landing point, one refinement.
+      const tg = Math.max(0.05, (vy + Math.sqrt(Math.max(0, vy * vy + 2 * 9.81 * Math.max(0.1, p.y)))) / 9.81);
+      const floor = ground.heightAt(p.x + vx * tg * 0.7, p.z + vz * tg * 0.7) + s * 0.3;
+      const tl = landingTime(p.y, vy, k, 1, 0, floor, 12);
+      const life = rng.range(7, 14);
+      const shade = rng.range(0.75, 1.15);
+      this.chipLayer.emit(t0, life, p.x, p.y, p.z, vx, vy, vz, k, floor, tl, s, rng.range(4, 25), rng.next(), kind,
+        _c.r * shade, _c.g * shade, _c.b * shade);
+    }
+  }
+
+  /** Incandescent sparks / burning fragments; T0 in kelvin. */
+  emitSparks(p: THREE.Vector3, dir: THREE.Vector3, count: number, speed: number, T0: number, spread: number, width: number, kind: 0 | 1, life = 0.6, t0 = this.now): void {
+    const P = this.P;
+    const rng = this.rng;
+    const ground = groundOf(this.ctx.scene);
+    const n = Math.min(400, Math.max(0, Math.round(count)));
+    _w.copy(dir);
+    if (_w.lengthSq() < 1e-9) _w.set(0, 1, 0);
+    _w.normalize();
+    const floor = ground.heightAt(p.x, p.z);
+    for (let i = 0; i < n; i++) {
+      rng.inCone(_w, Math.min(Math.PI * 0.95, spread), _d);
+      const sp = speed * rng.range(0.3, 1.1);
+      P.x = p.x; P.y = p.y; P.z = p.z;
+      P.vx = _d.x * sp; P.vy = _d.y * sp; P.vz = _d.z * sp;
+      P.t0 = t0 + rng.range(0, 0.01);
+      P.life = life * rng.range(0.4, 1.3);
+      // Steel sparks: ~0.1–0.5 mm burning droplets, drag rate ~ 2–6 1/s.
+      P.drag = rng.range(1.5, 5);
+      P.gravity = 1;
+      P.floor = floor;
+      P.tLand = landingTime(p.y, P.vy, P.drag, 1, 0, floor, P.life);
+      P.size0 = P.size1 = width * rng.range(0.6, 1.4);
+      P.growth = 1;
+      P.spin = kind === 1 ? rng.range(8, 30) : 0;
+      P.r = 1; P.g = 1; P.b = 1;
+      P.opacity = 1;
+      P.seed = rng.next(); P.variant = 0;
+      P.heat = T0 * rng.range(0.85, 1.1);
+      P.extra = kind;
+      this.sparkLayer.emit(P);
+    }
+  }
+
+  /** A flame / flash billboard (additive). */
+  private emitFlame(x: number, y: number, z: number, vx: number, vy: number, vz: number, size0: number, size1: number, life: number, T: number, variant: number, t0 = this.now, drag = 6, gravity = -0.2, tint = 1): void {
+    const P = this.P;
+    P.x = x; P.y = y; P.z = z; P.vx = vx; P.vy = vy; P.vz = vz;
+    P.t0 = t0; P.life = life; P.drag = drag; P.gravity = gravity; P.floor = -1e4; P.tLand = -1;
+    P.size0 = size0; P.size1 = size1; P.growth = Math.max(0.005, life * 0.3); P.spin = this.rng.range(-2, 2);
+    P.r = tint; P.g = tint; P.b = tint; P.opacity = 1;
+    P.seed = this.rng.next(); P.variant = variant; P.heat = T; P.extra = 0;
+    this.fireLayer.emit(P);
+  }
+
+  // ─── Event reactions ─────────────────────────────────────────────────────────────────────
+
+  private onShot(e: ShotEvent): void {
+    const w = e.weapon;
+    if (w.delivery !== 'direct') return;
+    const rng = this.rng;
+    const t0 = Math.max(e.time, this.now);
+    const a = e.ammo;
+    const E = 0.5 * a.mass * a.muzzleVelocity * a.muzzleVelocity;
+    const cannon = w.category === 'cannon';
+    const launcher = w.category === 'launcher';
+    // Visual flash size scales with the propellant gas, ~ cube root of the muzzle energy.
+    const s = Math.cbrt(Math.max(E, 50) / 1750) * (cannon ? 1.8 : 1);
+    const o = e.origin, d = e.direction;
+    const size = 0.07 * s;
+    {
+      this.emitFlame(o.x, o.y, o.z, d.x * 2, d.y * 2, d.z * 2, size * 1.3, size * 1.6, 0.03 + 0.004 * s, 2300, 12 + rng.int(0, 4), t0, 20, 0);
+      for (let i = 0; i < 3; i++) {
+        const f = (i + 1) * 0.6 * size;
+        const v = rng.range(20, 45) * Math.sqrt(s);
+        this.emitFlame(o.x + d.x * f, o.y + d.y * f, o.z + d.z * f, d.x * v, d.y * v, d.z * v, size * 0.6, size * 1.1, rng.range(0.025, 0.045), 2000, rng.int(0, 12), t0, 25, 0);
+      }
+      this.lights.fire(t0, o, 0xffb77a, 25 * s * s, 4 + 3 * s, 0.03 + 0.01 * s);
+    }
+    // Propellant smoke: a faint puff for rifles, a real cloud for cannon.
+    const smokeN = cannon ? 8 : 2;
+    for (let i = 0; i < smokeN; i++) this.puff(o.x + d.x * 0.3 * size, o.y + d.y * 0.3 * size, o.z + d.z * 0.3 * size, d.x * rng.range(2, 6) * Math.sqrt(s), d.y * rng.range(2, 6), d.z * rng.range(2, 6) * Math.sqrt(s), 0.04 * s, 0.35 * s, rng.range(1.5, 3.5) * Math.sqrt(s), 0x9d9a94, cannon ? 0.45 : 0.12, t0);
+    if (launcher) this.backblast(e, t0);
+    if (cannon && E > 1e6) {
+      // Tank gun: the muzzle blast kicks up a ring of dust from the ground below the barrel.
+      const g = groundOf(this.ctx.scene);
+      const gy = g.heightAt(o.x, o.z);
+      if (o.y - gy < 4) this.emitDust(_v.set(o.x, gy + 0.3, o.z), null, 2.2, 14, g.dustColorAt(o.x, o.z), 1.3, t0);
+      this.shaker.add(0.35);
+    } else if (w.recoil > 0) this.shaker.add(w.recoil * 0.08);
+  }
+
+  /** Recoilless / rocket launchers vent a cone of hot gas and smoke behind the tube. */
+  private backblast(e: ShotEvent, t0: number): void {
+    const rng = this.rng;
+    const o = e.origin, d = e.direction;
+    const soft = e.ammo.id === 'javelin';
+    const n = soft ? 5 : 16;
+    for (let i = 0; i < n; i++) {
+      rng.inCone(_u.copy(d).negate(), 0.35, _d);
+      const v = rng.range(8, soft ? 12 : 35);
+      this.puff(o.x - d.x * 0.6, o.y - d.y * 0.6, o.z - d.z * 0.6, _d.x * v, _d.y * v, _d.z * v, 0.2, rng.range(1.2, 2.8), rng.range(4, 9), 0xc9c5bd, 0.55, t0);
+    }
+    if (!soft) {
+      this.emitFlame(o.x - d.x * 0.9, o.y - d.y * 0.9, o.z - d.z * 0.9, -d.x * 30, -d.y * 30, -d.z * 30, 0.35, 1.2, 0.07, 2200, rng.int(0, 12), t0, 12, 0);
+      this.lights.fire(t0, o, 0xffc58a, 300, 12, 0.06);
+    }
+  }
+
+  /** One smoke puff (lit, drifting). */
+  private puff(x: number, y: number, z: number, vx: number, vy: number, vz: number, size0: number, size1: number, life: number, color: number, opacity: number, t0 = this.now, drag = 2.2, rise = -0.03, soot = 1, diffuse = false): void {
+    const P = this.P;
+    const rng = this.rng;
+    _c.setHex(color);
+    P.x = x; P.y = y; P.z = z; P.vx = vx; P.vy = vy; P.vz = vz;
+    P.t0 = t0; P.life = life; P.drag = drag; P.gravity = rise; P.floor = -1e4; P.tLand = -1;
+    P.size0 = size0; P.size1 = size1; P.growth = life * 0.35; P.spin = rng.range(-0.3, 0.3);
+    const sh = rng.range(0.9, 1.08);
+    P.r = _c.r * sh; P.g = _c.g * sh; P.b = _c.b * sh; P.opacity = opacity;
+    P.seed = rng.next(); P.variant = diffuse ? rng.int(8, 16) : rng.int(0, 8); P.heat = 0; P.extra = soot;
+    this.smokeLayer.emit(P);
+  }
+
+  private onImpact(e: ImpactEvent): void {
+    const rng = this.rng;
+    const m = e.material;
+    const done = this.marked(e.point);
+    const E = Math.max(e.kineticEnergy, 1);
+    // Effects scale with the energy delivered (5.56 mm ball ≈ 1.7 kJ → s = 1).
+    const s = Math.cbrt(E / 1750);
+    const n = e.normal;
+    // Ejecta leave around the surface normal, skewed towards the reflected shot line.
+    _d.copy(e.direction).reflect(n).multiplyScalar(0.35).add(n).normalize();
+    const incendiary = /api|mk ?211|pgu-14|raufoss/i.test(`${e.ammo.id} ${e.ammo.name}`);
+    const hard = e.ammo.kind === 'ap' || e.ammo.kind === 'apfsds';
+    const jet = e.agent === 'jet';
+    const p = e.point;
+    const cls = m.class;
+    if (cls === 'brittle' || cls === 'soil') {
+      const soil = cls === 'soil';
+      if (!(done & MARK_DUST)) {
+        // Cloud radius ∝ the cube root of the energy (the mass of pulverised material scales with the
+        // crater volume ∝ E): ~0.15 m for 5.56 mm ball, ~0.3 m for .50 AP, ~0.7 m for 30 mm —
+        // consistent with slow-motion footage of rifle and cannon hits on masonry.
+        const r = Math.min(1.5, Math.max(0.05, (e.craterRadius || 0.02) * 2.5, 0.14 * s) * (soil ? 1.3 : 1));
+        this.emitDust(p, _v.copy(_d).multiplyScalar((soil ? 3 : 2) * Math.sqrt(s)), r, Math.round(Math.min(14, 4 + 2 * s)), m.dustColor, 0.7 + 0.15 * s);
+      }
+      if (!(done & MARK_CHIPS)) {
+        const count = Math.min(90, 6 + 10 * s * s);
+        const size = Math.min(0.08, (soil ? 0.012 : 0.008) * Math.sqrt(s));
+        this.emitChips(p, _d, soil ? 0.45 : 0.8, (soil ? 9 : 16) * Math.pow(s, 0.3), count, size, soil ? 0x4a3b2c : m.color, 'stone');
+      }
+      if ((hard || m.sparks) && !(done & MARK_SPARKS)) this.emitSparks(p, _d, hard ? 6 + 4 * s : 3, 60, 1700, 1.0, 0.0007, 0, 0.35);
+    } else if (cls === 'ductile') {
+      if (!(done & MARK_SPARKS)) {
+        // Sparks spray along the surface in the direction of travel (ricochet-like), hotter and
+        // more numerous for hard cores and long rods; a HEAT jet throws molten metal.
+        _u.copy(e.direction).addScaledVector(n, -e.direction.dot(n)).normalize().multiplyScalar(0.8).add(_d).normalize();
+        const count = Math.min(260, (jet ? 80 : hard ? 30 : 16) * Math.sqrt(s));
+        this.emitSparks(p, _u, count, jet ? 45 : 90, jet ? 2300 : 1900, jet ? 1.2 : 0.8, jet ? 0.0025 : 0.0008, 0, jet ? 1.4 : 0.6);
+        if (e.outcome === 'perforate' && e.exitPoint) this.emitSparks(e.exitPoint, e.direction, count * 0.6, 120, 2000, 0.6, 0.001, 0, 0.5);
+      }
+      this.lights.fire(this.now, p, jet ? 0xfff0d0 : 0xffa860, (jet ? 800 : 30) * Math.min(20, s), 3 + 2 * s, jet ? 0.08 : 0.025);
+      if (jet || e.ammo.kind === 'apfsds') this.emitDust(p, _v.copy(n).multiplyScalar(4), 0.25 * s, 6, 0x6d6760, 1);
+    } else if (cls === 'glass') {
+      this.emitSparks(p, e.direction, Math.min(200, 25 * s), 6, 0, 1.3, 0.004, 1, 2.5);
+      this.emitChips(p, e.direction, 0.9, 5, Math.min(60, 10 * s), 0.006, m.color, 'glass');
+      this.emitDust(p, _v.copy(e.direction).multiplyScalar(-1), 0.05, 2, 0xdfe6e6, 0.3);
+    }
+    if (e.outcome === 'perforate' && e.exitPoint && cls === 'brittle') {
+      // Rear-face spall: a cone of dust and fragments out of the back of the wall.
+      this.emitDust(e.exitPoint, _v.copy(e.direction).multiplyScalar(5), Math.max(0.08, e.spallRadius * 2), 5, m.dustColor, 1);
+      this.emitChips(e.exitPoint, e.direction, 0.5, 20 * Math.pow(s, 0.3), Math.min(60, 8 * s), 0.01, m.color, 'stone');
+    }
+    if (incendiary) {
+      // Incendiary (zirconium / misch-metal) flash on impact: a white burst and burning particles.
+      this.emitFlame(p.x + n.x * 0.05, p.y + n.y * 0.05, p.z + n.z * 0.05, 0, 0, 0, 0.12 * s, 0.25 * s, 0.05, 2600, 12 + rng.int(0, 4), this.now, 10, 0);
+      this.emitSparks(p, _d, 20 * s, 40, 2400, 1.1, 0.001, 0, 0.5);
+      this.lights.fire(this.now, p, 0xfff2d8, 60 * s, 6, 0.04);
+    }
+  }
+
+  private onBlast(e: BlastEvent): void {
+    const rng = this.rng;
+    const now = e.time;
+    const W = Math.max(e.tntKg, 1e-4);
+    const w3 = Math.cbrt(W);
+    const sw = Math.sqrt(w3);
+    const thermo = e.kind === 'thermobaric';
+    const Rf = e.fireballRadius;
+    const c = e.center;
+    const ground = groundOf(this.ctx.scene);
+    const gy = ground.heightAt(c.x, c.z);
+    const hob = c.y - gy;
+    const nearGround = hob < 1.2 * Rf;
+    // Luminous fireball duration ∝ W^⅓ (cube-root scaling of fireball phenomena, Baker et al.
+    // 1983, "Explosion Hazards and Evaluation"); the constant (≈0.12 s·kg^−⅓) matches high-speed
+    // footage of 1–10 kg charges. Thermobaric fills burn in the air ~2.5× longer.
+    const tFire = 0.12 * w3 * (thermo ? 2.5 : 1);
+    // Blast axis: away from the surface the charge sat on, else up.
+    const axis = _w.copy(e.normal ?? UP);
+    if (!e.normal && nearGround) axis.set(0, 1, 0);
+    const dustHex = ground.dustColorAt(c.x, c.z);
+    const P = this.P;
+
+    // Flash. Peak luminous intensity ≈ fireball radiance × projected area (a ~2300 K surface of
+    // radius R_f ≈ 1.75 W^⅓), i.e. ≈ 300 W^⅔ render-candela; it decays with the fireball.
+    this.lights.fire(now, _v.copy(c).addScaledVector(axis, 0.4 * Rf), thermo ? 0xffbf73 : 0xffdcae, 300 * Math.pow(W, 2 / 3) * (thermo ? 1.5 : 1), 25 * w3 + 8, tFire);
+
+    // 1) Fireball body: incandescent turbulent puffs that expand fast, stall and cool into soot.
+    const nFire = Math.round(Math.min(260, (36 + 55 * w3) * (thermo ? 1.5 : 1)));
+    const kFire = 1 / Math.max(0.01, 0.2 * tFire);
+    for (let i = 0; i < nFire; i++) {
+      rng.onSphere(_d);
+      if (_d.dot(axis) < 0) _d.addScaledVector(axis, -2 * _d.dot(axis));
+      const reach = Rf * Math.pow(rng.next(), 0.5) * 0.9;
+      const v = reach * kFire;
+      P.x = c.x + _d.x * 0.1 * Rf; P.y = c.y + _d.y * 0.1 * Rf; P.z = c.z + _d.z * 0.1 * Rf;
+      P.vx = _d.x * v; P.vy = _d.y * v; P.vz = _d.z * v;
+      P.t0 = now + rng.range(0, 0.12 * tFire);
+      P.life = tFire * rng.range(2.2, 3.6);
+      P.drag = kFire; P.gravity = -0.02; P.floor = -1e4; P.tLand = -1;
+      P.size0 = Rf * rng.range(0.15, 0.3); P.size1 = Rf * rng.range(0.45, 0.7); P.growth = tFire * 0.3;
+      P.spin = rng.range(-1.5, 1.5);
+      const soot = thermo ? 0.06 : 0.04;
+      P.r = soot; P.g = soot; P.b = soot * 1.04; P.opacity = 0.85;
+      P.seed = rng.next();
+      // Turbulent mixing: the fireball is a patchwork of hot and cooler pockets, with tongues of
+      // unburnt soot (≈15 % of the puffs never glow) — mottled, not a uniform glowing ball.
+      const sootTongue = rng.chance(thermo ? 0.08 : 0.15);
+      P.variant = rng.chance(0.5) ? rng.int(8, 16) : rng.int(0, 8);
+      P.heat = sootTongue ? 0 : (thermo ? 2050 : 2250) * rng.range(0.78, 1.06);
+      P.extra = sootTongue ? 0.35 : 0.7;
+      this.smokeLayer.emit(P);
+    }
+    // Additive flame cores for the brightest instants.
+    const nCore = Math.round(Math.min(90, 14 + 24 * w3) * (thermo ? 1.6 : 1));
+    for (let i = 0; i < nCore; i++) {
+      rng.onSphere(_d);
+      if (_d.dot(axis) < 0) _d.addScaledVector(axis, -2 * _d.dot(axis));
+      const v = Rf * rng.range(0.1, 0.65) * kFire;
+      this.emitFlame(c.x + _d.x * 0.1 * Rf, c.y + _d.y * 0.1 * Rf, c.z + _d.z * 0.1 * Rf, _d.x * v, _d.y * v, _d.z * v,
+        Rf * 0.25, Rf * rng.range(0.4, 0.7), tFire * rng.range(0.35, 0.9), thermo ? 2200 : 2450, rng.int(0, 12), now + rng.range(0, 0.08 * tFire), kFire, -0.05, 0.6);
+    }
+
+    // 2) Sooty roll-up: the hot products rise as a dark toroidal plume that greys as it dilutes.
+    //    Initial rise then decaying buoyancy: v0 up with drag, small terminal rise (entrainment).
+    const nRoll = Math.round(Math.min(90, 14 + 16 * w3) * (thermo ? 1.3 : 1));
+    const rise = 4 * sw * (thermo ? 1.3 : 1);
+    for (let i = 0; i < nRoll; i++) {
+      rng.inBall(_d);
+      const k = 0.9;
+      P.x = c.x + _d.x * Rf * 0.5; P.y = c.y + Math.abs(_d.y) * Rf * 0.4 + 0.3 * Rf; P.z = c.z + _d.z * Rf * 0.5;
+      P.vx = _d.x * 1.5; P.vy = rise * rng.range(0.6, 1.3); P.vz = _d.z * 1.5;
+      P.t0 = now + tFire * rng.range(0.4, 1.0);
+      P.life = rng.range(9, 16) * sw;
+      // Terminal rise 0.3–0.6 m/s once the momentum has been shed (k = 0.9 1/s).
+      P.drag = k; P.gravity = -(rng.range(0.3, 0.6) * k) / 9.81; P.floor = -1e4; P.tLand = -1;
+      P.size0 = Rf * rng.range(0.35, 0.55); P.size1 = Rf * rng.range(1.5, 2.4); P.growth = 2.5 * sw;
+      P.spin = rng.range(-0.25, 0.25);
+      _c.setHex(0x3d3b38);
+      P.r = _c.r; P.g = _c.g; P.b = _c.b; P.opacity = 0.62;
+      P.seed = rng.next(); P.variant = rng.int(0, 8);
+      P.heat = 0;
+      P.extra = 0.25;
+      this.smokeLayer.emit(P);
+    }
+
+    // 3) Near the ground: the dust cloud is what dominates a surface burst after ~0.2 s.
+    if (nearGround) {
+      // Crater ejecta dust thrown up in a cone, hanging as a brown-grey cloud.
+      const nCol = Math.round(Math.min(120, 24 + 30 * w3));
+      for (let i = 0; i < nCol; i++) {
+        rng.inCone(UP, 0.6, _d);
+        const v = rng.range(4, 14) * sw;
+        P.x = c.x + _d.x * 0.2 * Rf; P.y = gy + 0.1 * Rf; P.z = c.z + _d.z * 0.2 * Rf;
+        P.vx = _d.x * v; P.vy = _d.y * v; P.vz = _d.z * v;
+        P.t0 = now + rng.range(0.02, 0.5) * tFire;
+        P.life = rng.range(6, 14) * sw;
+        P.drag = rng.range(1.6, 2.6); P.gravity = rng.range(0.0, 0.03); P.floor = -1e4; P.tLand = -1;
+        P.size0 = Rf * rng.range(0.2, 0.35); P.size1 = Rf * rng.range(1.0, 1.8); P.growth = 1.5 * sw;
+        P.spin = rng.range(-0.3, 0.3);
+        _c.setHex(dustHex);
+        const shade = rng.range(0.8, 1.02);
+        P.r = _c.r * shade; P.g = _c.g * shade; P.b = _c.b * shade; P.opacity = 0.5;
+        P.seed = rng.next(); P.variant = rng.chance(0.5) ? rng.int(0, 8) : rng.int(8, 16); P.heat = 0; P.extra = rng.range(0.55, 0.85);
+        this.smokeLayer.emit(P);
+      }
+      // Base surge: dust racing outward along the ground behind the shock, then settling.
+      const nSkirt = Math.round(Math.min(140, 30 + 30 * w3));
+      for (let i = 0; i < nSkirt; i++) {
+        const a = rng.range(0, Math.PI * 2);
+        const reach = 2.6 * Rf * rng.range(0.5, 1.15);
+        const k = 1.4;
+        const v = reach * k;
+        const x = c.x + Math.cos(a) * 0.3 * Rf, z = c.z + Math.sin(a) * 0.3 * Rf;
+        P.x = x; P.y = gy + rng.range(0.05, 0.3) * Rf; P.z = z;
+        P.vx = Math.cos(a) * v; P.vy = rng.range(0.2, 1.2) * sw; P.vz = Math.sin(a) * v;
+        P.t0 = now + rng.range(0.01, 0.06) * w3;
+        P.life = rng.range(4, 9) * sw;
+        P.drag = k; P.gravity = 0.01; P.floor = -1e4; P.tLand = -1;
+        P.size0 = 0.35 * w3; P.size1 = 1.5 * w3 * rng.range(0.8, 1.3); P.growth = 1.2 * sw;
+        P.spin = rng.range(-0.3, 0.3);
+        _c.setHex(dustHex);
+        P.r = _c.r; P.g = _c.g; P.b = _c.b; P.opacity = 0.38;
+        P.seed = rng.next(); P.variant = rng.int(8, 16); P.heat = 0; P.extra = 0.9;
+        this.smokeLayer.emit(P);
+      }
+      // Ejecta: soil clods / shattered paving thrown out of the crater.
+      const mat = ground.materialAt(c.x, c.z);
+      const nEj = Math.round(Math.min(160, 24 + 50 * w3));
+      this.emitChips(_v.set(c.x, gy + 0.05, c.z), UP, 0.9, 16 * Math.pow(w3, 0.35), nEj, Math.min(0.12, 0.03 * sw), mat.class === 'soil' ? 0x4f4033 : mat.color, 'stone', now + 0.005);
+      // Dust lifted by the front as it sweeps the ground, timed by the KB arrival time.
+      this.shockDust(c, dustHex, W, now);
+      this.shock.spawn(now, c, gy, W, _c.setHex(dustHex));
+    } else if (W > 2) {
+      this.shock.spawn(now, c, gy, W, _c.setHex(dustHex));
+    }
+
+    // 4) Burning fragments for cased munitions; burning fuel droplets for thermobaric fills.
+    const cased = (e.casingMass ?? 0) > 0;
+    if (cased || thermo) {
+      const nFrag = Math.round(Math.min(200, (cased ? 30 : 60) * sw));
+      this.emitSparks(c, axis, nFrag, thermo ? 25 : 180, thermo ? 1900 : 2100, Math.PI * 0.55, thermo ? 0.004 : 0.0015, 0, thermo ? 2.2 : 0.35, now);
+    }
+  }
+
+  /** Ground dust kicked up where the shock front passes, at the KB arrival time of each radius. */
+  private shockDust(c: THREE.Vector3, hex: number, W: number, now: number): void {
+    const rng = this.rng;
+    const w3 = Math.cbrt(W);
+    // Loose surface dust is lifted where the front still carries ≳ 20 kPa (the ground-shock /
+    // dust-lofting threshold is of that order: Glasstone & Dolan 1977, §3.50ff); the band is thin
+    // and hugs the ground.
+    const rEnd = Math.min(45, rangeForOverpressure(W, 20000));
+    const r0 = Math.max(0.8, 1.5 * w3);
+    if (rEnd <= r0) return;
+    const rings = Math.min(6, Math.max(2, Math.round((rEnd - r0) / (2.5 * w3))));
+    const ground = groundOf(this.ctx.scene);
+    for (let k = 0; k < rings; k++) {
+      const r = r0 + ((rEnd - r0) * (k + 0.5)) / rings;
+      const ta = KB.arrivalTime(r / w3) * w3;
+      const n = Math.round(Math.min(22, 6 + r * 0.9));
+      for (let i = 0; i < n; i++) {
+        const a = ((i + rng.next()) / n) * Math.PI * 2;
+        const x = c.x + Math.cos(a) * r, z = c.z + Math.sin(a) * r;
+        const y = ground.heightAt(x, z) + 0.08;
+        this.puff(x, y, z, Math.cos(a) * 2.5, rng.range(0.1, 0.4), Math.sin(a) * 2.5, 0.1 + 0.015 * r, 0.35 + 0.03 * r, rng.range(1.2, 2.5), hex, 0.2 * (1 - k / (rings + 1)), now + ta, 1.8, 0.002, 1, true);
+      }
+    }
+  }
+
+  private onFracture(e: FractureEvent): void {
+    const done = this.marked(e.position);
+    const size = Math.cbrt(Math.max(e.volume, 1e-6));
+    if (!(done & MARK_DUST)) this.emitDust(e.position, e.direction ? _v.copy(e.direction).multiplyScalar(1.5) : null, Math.max(0.2, size * 1.5), Math.round(Math.min(30, 4 + e.volume * 40)), e.material.dustColor, 1.3);
+    if (!(done & MARK_CHIPS)) this.emitChips(e.position, e.direction ?? UP, 1.2, 5, Math.min(60, 8 + e.volume * 60), Math.min(0.05, 0.015 + size * 0.02), e.material.color, 'stone');
+  }
+
+  private onDebrisContact(e: DebrisContactEvent): void {
+    if (this.contactsThisFrame++ > 10) return;
+    if (this.marked(e.position) & MARK_DUST) return;
+    const m = e.material;
+    if (m.class === 'glass') {
+      this.emitSparks(e.position, UP, Math.min(30, 4 + e.impulse * 0.5), 3, 0, 1.2, 0.004, 1, 1.5);
+      return;
+    }
+    // Dust in proportion to the impact impulse of the landing piece.
+    const amount = Math.min(10, 2 + Math.sqrt(e.impulse) * 0.6);
+    this.emitDust(e.position, null, Math.max(0.1, e.size * 0.8), Math.round(amount), m.dustColor, 0.8);
+    if (e.impulse > 20) this.emitChips(e.position, UP, 1.2, 3, Math.min(20, e.impulse * 0.2), Math.min(0.03, e.size * 0.08), m.color, m.class === 'ductile' ? 'metal' : 'stone');
+    if (m.sparks && m.class === 'ductile' && e.impulse > 50) this.emitSparks(e.position, UP, 6, 12, 1400, 1.3, 0.0006, 0, 0.3);
+  }
+
+  private onShatter(e: ShatterEvent): void {
+    const n = Math.min(300, 30 + e.area * 60);
+    this.emitSparks(e.position, UP, n, 5, 0, Math.PI * 0.9, 0.004, 1, 3);
+    this.emitDust(e.position, null, Math.max(0.2, Math.sqrt(e.area) * 0.5), 5, 0xe9f1f1, 0.7);
+  }
+
+  private onStructuralFailure(e: StructuralFailureEvent): void {
+    const size = Math.cbrt(Math.max(e.mass, 1) / 2400);
+    this.emitDust(e.position, null, Math.max(0.5, size * 1.2), Math.round(Math.min(30, 6 + size * 8)), 0xbdb7ac, 2);
+  }
+
+  // ─── Per frame ───────────────────────────────────────────────────────────────────────────
+
+  frameUpdate(_simDt: number, realDt: number): void {
+    const t0 = performance.now();
+    const ctx = this.ctx;
+    const now = this.now;
+    const atmo = this.atmo;
+    atmo.time.value = now;
+    ctx.renderer.getDrawingBufferSize(atmo.resolution.value);
+    atmo.cameraNear.value = ctx.camera.near;
+    atmo.cameraFar.value = ctx.camera.far;
+    this.shutter.value = SHUTTER * Math.max(ctx.time.scale, 0.02);
+    if (!atmo.pipelineHandlesShake) this.syncLightsFromScene();
+    this.contactsThisFrame = 0;
+    this.updateEmitters(now, _simDt);
+    this.updateProjectiles(now);
+    this.lights.update(now);
+    this.shock.update(now);
+    this.smokeLayer.flush(now);
+    this.fireLayer.flush(now);
+    this.sparkLayer.flush(now);
+    this.chipLayer.flush(now);
+    // Camera shake runs on wall-clock time (it is the viewer's body, not the simulation).
+    const shaking = this.shaker.update(realDt);
+    const o = this.shaker.out;
+    atmo.shake.active = shaking;
+    atmo.shake.position.set(o.x, o.y, o.z);
+    atmo.shake.rotation.set(o.pitch, o.yaw, o.roll);
+    this.lastFrameMs = performance.now() - t0;
+  }
+
+  private updateEmitters(now: number, dt: number): void {
+    const rng = this.rng;
+    let w = 0;
+    for (let i = 0; i < this.emitters.length; i++) {
+      const e = this.emitters[i]!;
+      if (now > e.until) continue;
+      this.emitters[w++] = e;
+      e.acc += e.rate * Math.max(0, dt);
+      while (e.acc >= 1) {
+        e.acc -= 1;
+        this.puff(e.x + rng.range(-1, 1) * e.radius * 0.4, e.y, e.z + rng.range(-1, 1) * e.radius * 0.4, rng.range(-0.2, 0.2), e.rise, rng.range(-0.2, 0.2),
+          e.radius * 0.6, e.radius * rng.range(2.5, 4), rng.range(8, 16), e.color, 0.5, now, 0.6, -(e.rise * 0.6) / 9.81 * 0.6, 0.8);
+      }
+    }
+    this.emitters.length = w;
+  }
+
+  /** Tracers, rocket flames and smoke trails from the live projectiles. */
+  private updateProjectiles(now: number): void {
+    const list = this.ctx.projectiles.active;
+    const tr = this.tracers;
+    tr.begin();
+    for (const t of this.trails.values()) t.alive = false;
+    const scale = Math.max(this.ctx.time.scale, 0.02);
+    for (const p of list) {
+      if (!p.alive) continue;
+      const speed = p.velocity.length();
+      if (p.tracer && speed > 1) {
+        // Streak: distance flown during the exposure, never behind the muzzle.
+        const len = Math.min(speed * SHUTTER * scale, speed * Math.max(p.age, 0), 60);
+        _d.copy(p.velocity).divideScalar(speed);
+        const green = p.ammo.id === 'lps';
+        const I = 45;
+        tr.add(p.position.x, p.position.y, p.position.z, p.position.x - _d.x * len, p.position.y - _d.y * len, p.position.z - _d.z * len,
+          (green ? 0.25 : 1) * I, (green ? 1 : 0.22) * I, (green ? 0.3 : 0.06) * I, Math.max(0.02, p.ammo.diameter * 3));
+      }
+      if (p.ammo.rocket) this.rocketTrail(p.id, p.position, p.velocity, p.burning, now);
+    }
+    for (const [id, t] of this.trails) if (!t.alive) this.trails.delete(id);
+    tr.end();
+  }
+
+  private rocketTrail(id: number, pos: THREE.Vector3, vel: THREE.Vector3, burning: boolean, now: number): void {
+    let t = this.trails.get(id);
+    if (!t) {
+      t = { x: pos.x, y: pos.y, z: pos.z, alive: true };
+      this.trails.set(id, t);
+      return;
+    }
+    t.alive = true;
+    const dx = pos.x - t.x, dy = pos.y - t.y, dz = pos.z - t.z;
+    const dist = Math.hypot(dx, dy, dz);
+    if (burning && dist > 1e-3) {
+      const rng = this.rng;
+      const speed = vel.length();
+      _d.copy(vel).divideScalar(Math.max(speed, 1e-6));
+      // Exhaust plume: a short flame cone behind the nozzle, re-emitted every frame. Born a
+      // little in the past (and placed back along the path) so a frame always shows it.
+      const back = 0.012;
+      for (let i = 0; i < 4; i++) {
+        const off = 0.15 + i * 0.16 + rng.next() * 0.05;
+        const x = pos.x - _d.x * off - vel.x * back, y = pos.y - _d.y * off - vel.y * back, z = pos.z - _d.z * off - vel.z * back;
+        this.emitFlame(x, y, z, vel.x, vel.y, vel.z, 0.2 - i * 0.03, 0.26 - i * 0.03, 0.045, 2350 - i * 150, rng.int(0, 12), now - back, 0.01, 0);
+      }
+      // Motor smoke: a continuous white line (overlapping puffs every ≥ 0.12 m, at most 24 per
+      // frame so a 3 s Javelin burn stays inside the smoke budget) that spreads into a wispy trail
+      // over several seconds and drifts with the wind.
+      const n = Math.min(24, Math.ceil(dist / 0.12));
+      for (let i = 0; i < n; i++) {
+        const u = (i + rng.next()) / n;
+        this.puff(t.x + dx * u, t.y + dy * u, t.z + dz * u, rng.range(-0.3, 0.3), rng.range(-0.1, 0.3), rng.range(-0.3, 0.3),
+          Math.max(0.2, (0.6 * dist) / n), rng.range(0.55, 1.1), rng.range(6, 12), 0xeae7e1, 0.4, now - (1 - u) * (dist / Math.max(speed, 1)), 1.8, -0.006, 1, rng.chance(0.8));
+      }
+      if (rng.chance(0.3)) this.lights.fire(now, pos, 0xffc080, 60, 10, 0.05);
+    }
+    t.x = pos.x; t.y = pos.y; t.z = pos.z;
+  }
+
+  /**
+   * Under BasicPipeline nothing writes the atmosphere: light the particles with the scene's own
+   * directional sun and hemisphere fill (rescanned once a second in case the scene changes them).
+   */
+  private syncLightsFromScene(): void {
+    const scene = this.ctx.scene;
+    if (--this.lightScan <= 0 || !this.sceneSun?.parent) {
+      this.lightScan = 60;
+      this.sceneSun = null;
+      this.sceneHemi = null;
+      scene.traverse((o) => {
+        if (!this.sceneSun && (o as THREE.DirectionalLight).isDirectionalLight && o.visible) this.sceneSun = o as THREE.DirectionalLight;
+        if (!this.sceneHemi && (o as THREE.HemisphereLight).isHemisphereLight && o.visible) this.sceneHemi = o as THREE.HemisphereLight;
+      });
+    }
+    const a = this.atmo;
+    const sun = this.sceneSun;
+    if (sun) {
+      sun.getWorldPosition(_u);
+      sun.target.getWorldPosition(_v);
+      a.sunDirection.value.copy(_u).sub(_v).normalize();
+      a.sunColor.value.copy(sun.color).multiplyScalar(sun.intensity);
+    }
+    const hemi = this.sceneHemi;
+    if (hemi) {
+      a.skyAmbient.value.copy(hemi.color).multiplyScalar(hemi.intensity);
+      a.groundAmbient.value.copy(hemi.groundColor).multiplyScalar(hemi.intensity);
+    }
+    const fog = scene.fog as THREE.Fog | null;
+    if (fog?.color) a.hazeColor.value.copy(fog.color);
+  }
+
+  // ─── Camera shake under BasicPipeline ────────────────────────────────────────────────────
+
+  private applyShake(): void {
+    if (this.shakeApplied) return;
+    const cam = this.ctx.camera;
+    this.savedPos.copy(cam.position);
+    this.savedQuat.copy(cam.quaternion);
+    cam.position.add(this.atmo.shake.position);
+    cam.quaternion.multiply(_q.setFromEuler(_e.copy(this.atmo.shake.rotation)));
+    cam.updateMatrixWorld();
+    this.shakeApplied = true;
+  }
+
+  private restoreShake(): void {
+    if (!this.shakeApplied) return;
+    const cam = this.ctx.camera;
+    cam.position.copy(this.savedPos);
+    cam.quaternion.copy(this.savedQuat);
+    cam.updateMatrixWorld();
+    this.shakeApplied = false;
+  }
+
+  /** Live particles per layer (CPU scan, for the sandbox HUD / tests). */
+  stats(): Record<string, number> {
+    const now = this.now;
+    return {
+      smoke: this.smokeLayer.countAlive(now),
+      fire: this.fireLayer.countAlive(now),
+      sparks: this.sparkLayer.countAlive(now),
+      emitted: this.smokeLayer.emitted + this.fireLayer.emitted + this.sparkLayer.emitted + this.chipLayer.emitted,
+    };
+  }
+
+  reset(): void {
+    this.smokeLayer.clear();
+    this.fireLayer.clear();
+    this.sparkLayer.clear();
+    this.chipLayer.clear();
+    this.lights.clear();
+    this.shock.clear();
+    this.emitters.length = 0;
+    this.marks.length = 0;
+    this.trails.clear();
+    this.shaker.reset();
+    this.tracers.begin();
+    this.tracers.end();
+  }
+
+  dispose(): void {
+    for (const u of this.unsub) u();
+    this.unsub.length = 0;
+    this.smokeLayer.dispose();
+    this.fireLayer.dispose();
+    this.sparkLayer.dispose();
+    this.chipLayer.dispose();
+    this.tracers.dispose();
+    this.lights.dispose();
+    this.shock.dispose();
+    for (const t of this.textures) t.dispose();
+    this.root.removeFromParent();
+    this.solidRoot.removeFromParent();
+    if (this.atmo.fxRoot === this.root) this.atmo.fxRoot = null;
+  }
+}
+
+/** Mix two sRGB hex colours (in sRGB space; fine for tinting dust). */
+function mixHex(a: number, b: number, t: number): number {
+  const ch = (x: number, s: number) => (x >> s) & 255;
+  const m = (s: number) => Math.round(ch(a, s) * (1 - t) + ch(b, s) * t) << s;
+  return m(16) | m(8) | m(0);
+}
