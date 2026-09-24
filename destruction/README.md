@@ -11,7 +11,7 @@ mühendislik modellerinden hesaplanır; gösteri için şişirilmez. Modellerin 
 [PHYSICS.md](PHYSICS.md), mimari ve modül sözleşmeleri [DESIGN.md](DESIGN.md) dosyasındadır.
 
 - **Canlı sürüm (tarayıcıda, kurulum gerektirmez):** https://claude.ai/artifact/G3U1EdvY8rtM4rHK8n2Bty
-  (bağlantı sahibine özeldir; paylaşım ayarı sayfanın Paylaş menüsündendir)
+  (bağlantıya sahip olan herkes açabilir; paylaşım ayarı sayfanın Paylaş menüsünden değiştirilir)
 
 | | |
 | --- | --- |
