@@ -9,7 +9,8 @@ import { installAudio } from './audio/index.ts';
 import { installPlayer } from './player/index.ts';
 import { installHud } from './ui/index.ts';
 import { installStructure } from './structure/index.ts';
-import { SCENES, sceneById } from './scenes/index.ts';
+import { SCENES, SCENE_LOOKS, sceneById } from './scenes/index.ts';
+import { applyLookAfterLoad, applyLookBeforeLoad } from './scenes/look.ts';
 
 /**
  * App entry: builds the simulation with every subsystem, shows the scene menu over a live scene,
@@ -52,8 +53,9 @@ async function start(): Promise<void> {
   }
 
   let sim: Simulation;
+  const pipeline = new Pipeline({ quality: pickQuality() });
   try {
-    sim = await Simulation.create({ canvas, pipeline: new Pipeline({ quality: pickQuality() }) });
+    sim = await Simulation.create({ canvas, pipeline });
   } catch (err) {
     fail('FİZİK MOTORU (WEBASSEMBLY) BAŞLATILAMADI. SAYFAYI YEREL OLARAK ÇALIŞTIRIN: npm install && npm run dev', err);
     return;
@@ -71,7 +73,10 @@ async function start(): Promise<void> {
     const def = sceneById(id) ?? SCENES[0]!;
     loading = loading.then(async () => {
       status(`${def.nameTr.toLocaleUpperCase('tr')} KURULUYOR`);
+      // Per-scene photography (sky, exposure, ambient, lens, haze) around the scene build.
+      applyLookBeforeLoad(pipeline, SCENE_LOOKS[def.id]);
       await sim.loadScene(def);
+      applyLookAfterLoad(sim.ctx, SCENE_LOOKS[def.id]);
       if (location.hash.slice(1) !== def.id) history.replaceState(null, '', `#${def.id}`);
     });
     return loading;
