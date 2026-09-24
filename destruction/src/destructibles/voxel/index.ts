@@ -4,6 +4,7 @@ import { VoxelElement } from './VoxelElement.ts';
 
 export { VoxelElement, type VoxelStats } from './VoxelElement.ts';
 export { schedulerFor, RemeshScheduler } from './scheduler.ts';
+export { fractureQueueFor, FractureQueue, STEP_UNITS } from './jobs.ts';
 export { warmVoxelLooks, disposeVoxelTextures } from './look.ts';
 
 /**

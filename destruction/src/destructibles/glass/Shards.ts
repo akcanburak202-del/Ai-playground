@@ -3,13 +3,15 @@ import type RAPIER from '@dimforge/rapier3d-compat';
 import type { SimContext } from '../../app/contracts.ts';
 import type { ContactForceInfo, PhysicsOwner } from '../../physics/PhysicsWorld.ts';
 import type { MaterialProps } from '../../physics/materials.ts';
-import { clipHalfPlane, convexHull, pointInPoly, polyArea, polyBounds, polyCentroid, type Poly } from './polygon.ts';
+import { clipHalfPlane, convexHull, pointInPoly, polyArea, polyBounds, polyCentroid, simplifyConvex, type Poly } from './polygon.ts';
 import { createReflectionMaterial, createTransmissionMaterial, type GlassUniforms } from './look.ts';
 import { shardPieces, DICE_AREA } from './model.ts';
 import { exhausted, spend } from './budget.ts';
 
 /** Most rigid shards one pane keeps (rows of the transform texture). */
 export const MAX_SHARDS = 160;
+/** Most corners of a shard's collision outline (the drawn outline keeps all of its own). */
+const HULL_CORNERS = 12;
 
 export interface ShardInit {
   /** Outline and island holes in pane-local metres */
@@ -219,9 +221,11 @@ export class Shards {
   private createBody(s: Shard, outer: Poly, linvel: THREE.Vector3, angvel: THREE.Vector3): RAPIER.RigidBody | null {
     const phys = this.ctx.physics;
     const R = phys.R;
-    // The collider is the hull of the extruded outline: hull the 2D outline first (cheap), so Rapier
-    // only sees its corners.
-    const hull = convexHull(outer);
+    // The collider is the hull of the extruded outline: hull the 2D outline first (cheap) and keep
+    // at most HULL_CORNERS well separated corners, so Rapier's quickhull sees a small, clean input
+    // (one crack-traced shard of dozens of nearly collinear corners once took it seconds).
+    const b0 = polyBounds(outer);
+    const hull = simplifyConvex(convexHull(outer), Math.max(0.0015, 0.02 * Math.max(b0[2] - b0[0], b0[3] - b0[1])), HULL_CORNERS);
     const n = hull.length >> 1;
     const pts = new Float32Array(6 * n);
     const h = 0.5 * this.t;
@@ -232,7 +236,7 @@ export class Shards {
     }
     // Hull area ≥ piece area: scale the density so the body has the piece's true mass.
     const hullA = Math.max(polyArea(hull), s.area);
-    let desc = R.ColliderDesc.convexHull(pts);
+    let desc = n >= 3 ? R.ColliderDesc.convexHull(pts) : null;
     if (!desc) {
       const b = polyBounds(outer);
       desc = R.ColliderDesc.cuboid(Math.max(0.5 * (b[2] - b[0]), h), Math.max(0.5 * (b[3] - b[1]), h), h);

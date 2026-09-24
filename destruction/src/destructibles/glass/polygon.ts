@@ -138,6 +138,48 @@ export function convexHull(points: ArrayLike<number>): Poly {
 }
 
 /**
+ * A convex polygon (counter-clockwise) with fewer, well separated corners: corners closer than
+ * `minEdge` to their predecessor are merged, then the corner whose removal loses the least area
+ * (the smallest triangle with its neighbours) is dropped until at most `maxVerts` remain. The
+ * result stays convex and inside the original. For collision hulls: crack-traced outlines carry
+ * dozens of nearly collinear corners, and a 3D hull of their thin extrusion is nearly coplanar
+ * everywhere — the degenerate input quickhull is slowest and least robust on.
+ */
+export function simplifyConvex(hull: ArrayLike<number>, minEdge: number, maxVerts: number): Poly {
+  const xs: number[] = [], ys: number[] = [];
+  const n = hull.length >> 1;
+  for (let i = 0; i < n; i++) {
+    const x = hull[2 * i]!, y = hull[2 * i + 1]!;
+    if (xs.length && Math.hypot(x - xs[xs.length - 1]!, y - ys[ys.length - 1]!) < minEdge) continue;
+    xs.push(x);
+    ys.push(y);
+  }
+  while (xs.length > 3 && Math.hypot(xs[0]! - xs[xs.length - 1]!, ys[0]! - ys[ys.length - 1]!) < minEdge) {
+    xs.pop();
+    ys.pop();
+  }
+  const tri = (i: number) => {
+    const m = xs.length, a = (i - 1 + m) % m, b = (i + 1) % m;
+    return Math.abs((xs[i]! - xs[a]!) * (ys[b]! - ys[a]!) - (ys[i]! - ys[a]!) * (xs[b]! - xs[a]!));
+  };
+  while (xs.length > Math.max(3, maxVerts)) {
+    let best = 0, bestA = Infinity;
+    for (let i = 0; i < xs.length; i++) {
+      const a = tri(i);
+      if (a < bestA) {
+        bestA = a;
+        best = i;
+      }
+    }
+    xs.splice(best, 1);
+    ys.splice(best, 1);
+  }
+  const out: Poly = [];
+  for (let i = 0; i < xs.length; i++) out.push(xs[i]!, ys[i]!);
+  return out;
+}
+
+/**
  * A point strictly inside a polygon with holes: the middle of the widest interior interval along
  * a few horizontal scan lines. Robust for concave and slit (weakly simple) polygons where the
  * centroid may fall outside.

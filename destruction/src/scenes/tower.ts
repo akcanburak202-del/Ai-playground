@@ -19,8 +19,9 @@ import { COLLAPSE_BUDGET, PROFILES, REBAR, Site, region } from './kit.ts';
  * ground-floor columns and the storeys above lose their supports one level after another. Cutting
  * a steel section with contact charges takes P = 3/8·A lb of TNT for A in in² (US Army FM 5-250,
  * steel-cutting formula): A = 78 cm² = 12.1 in² for an HEB 200 → 4.5 lb ≈ 2.1 kg TNT, three M112
- * blocks per column, placed across the flanges and web as the manual prescribes; one compact block
- * on a single flange only holes that flange.
+ * blocks per column (0.76 kg TNT-e each); one block on a single flange only holes that flange.
+ * Three blocks on the outer flange of each ground-floor column bring the frame down: the cut
+ * columns crush under their 0.45–0.93 MN within a few steps and the storeys above follow.
  */
 
 /** Column grid (m), storey height, storeys */

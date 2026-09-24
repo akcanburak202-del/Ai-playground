@@ -12,6 +12,8 @@ import { PLAY_RELOAD_SCALE, WEAPONS, getWeapon, type WeaponData } from './arsena
 
 /** 1 MOA in radians */
 const MOA = (1 / 60) * (Math.PI / 180);
+/** Charge placements a burst of clicks can queue */
+const MAX_QUEUED_CHARGES = 5;
 
 interface PlacedCharge {
   event: ChargeEvent;
@@ -50,13 +52,14 @@ export class WeaponController implements WeaponControllerApi, System {
   private readonly sim: Simulation;
   private readonly rng: Rng;
   private trigger = false;
-  private wasDown = false;
   /**
-   * A press that has not fired yet: a single-shot weapon fires as soon as it is ready while the
-   * trigger stays held (a click during the last moments of a reload is not lost), and needs a new
-   * press for the next round.
+   * Presses not served yet. Single-shot and semi-automatic weapons keep one press through their
+   * reload/cycling (a click made while loading fires the moment the weapon is ready, held or not)
+   * and need a new press for the next round; placed charges queue up to MAX_QUEUED_CHARGES
+   * presses, so quick clicks place several charges one after another. Automatic weapons fire
+   * only while the trigger is held.
    */
-  private armed = false;
+  private presses = 0;
   /**
    * Reload / cycling time left per weapon, s. Each weapon keeps its own: switching from the tank
    * gun to the RPG does not carry the gun's reload over, and a weapon reloads while holstered.
@@ -114,8 +117,7 @@ export class WeaponController implements WeaponControllerApi, System {
     this.nextShot = 0;
     this.spin = 0;
     // A press made with the previous weapon does not fire the new one.
-    this.armed = false;
-    this.wasDown = this.trigger;
+    this.presses = 0;
   }
 
   setAmmo(ammoId: string): void {
@@ -130,8 +132,12 @@ export class WeaponController implements WeaponControllerApi, System {
   }
 
   setTrigger(down: boolean): void {
+    const w = this.current;
+    const queued = w.delivery === 'placed' ? MAX_QUEUED_CHARGES : 1;
+    if (down && !this.trigger) this.presses = Math.min(this.presses + 1, queued);
     this.trigger = down;
-    if (!down) this.armed = false;
+    // Automatic fire stops with the trigger; single-shot / semi / placed keep the press.
+    if (!down && w.delivery !== 'placed' && w.fireMode === 'auto') this.presses = 0;
   }
 
   detonate(sequenceDelay = 0): void {
@@ -149,8 +155,7 @@ export class WeaponController implements WeaponControllerApi, System {
     this.nextShot = 0;
     this.spin = 0;
     this.trigger = false;
-    this.wasDown = false;
-    this.armed = false;
+    this.presses = 0;
     this.aimPoint = null;
   }
 
@@ -170,25 +175,24 @@ export class WeaponController implements WeaponControllerApi, System {
     this.runFuses();
 
     const w = this.current;
-    if (this.trigger && !this.wasDown) this.armed = true;
-    this.wasDown = this.trigger;
-    const ready = this.armed && this.cooldown <= 0;
+    const ready = this.presses > 0 && this.cooldown <= 0;
     if (w.delivery === 'placed') {
       if (ready) {
-        this.armed = false;
+        this.presses--;
         this.placeCharge();
       }
       return;
     }
     if (w.delivery === 'indirect') {
       if (ready && this.aimPoint) {
-        this.armed = false;
+        this.presses--;
         this.callFire();
         this.setCooldown((w.reloadTime ?? 10) * PLAY_RELOAD_SCALE);
-      }
+      } else if (ready && !this.trigger) this.presses = 0; // a released click at the open sky
       return;
     }
     if (w.fireMode === 'auto') {
+      this.presses = 0;
       if (!this.trigger) {
         this.spin = Math.max(0, this.spin - dt);
         this.nextShot = Math.max(this.nextShot - dt, 0);
@@ -213,7 +217,7 @@ export class WeaponController implements WeaponControllerApi, System {
       return;
     }
     if (ready) {
-      this.armed = false;
+      this.presses--;
       this.fireRound(0);
       this.setCooldown(w.fireMode === 'semi' ? 60 / w.rpm : (w.reloadTime ?? 60 / w.rpm) * PLAY_RELOAD_SCALE);
     }

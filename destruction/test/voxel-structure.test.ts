@@ -11,6 +11,7 @@ import { createVoxelElement } from '../src/destructibles/voxel/index.ts';
 import type { VoxelElement } from '../src/destructibles/voxel/VoxelElement.ts';
 import { Rng } from '../src/core/rng.ts';
 import { makeCtx } from '../src/destructibles/voxel/headless.ts';
+import { fractureQueueFor } from '../src/destructibles/voxel/jobs.ts';
 
 const flat = { lobe: 0, lobeScale: 1, grain: 0, seed: 0 };
 
@@ -106,7 +107,12 @@ test('Voronoi split conserves material and keeps pieces apart', () => {
   const after = pieces.reduce((a, p) => a + p.grid.totalSolid, 0);
   // Only the thin gaps between pieces are lost.
   assert.ok(after / before > 0.85 && after <= before, `kept ${after / before}`);
-  for (const p of pieces) assert.ok(p.grid.nx < g.nx + 1 && p.volume > 0);
+  // Piece grids are windows around their own material (chunk-aligned: ≤ one chunk + 3 samples of
+  // slack per side), so a piece costs what its size costs, not what its parent's does.
+  for (const p of pieces) {
+    const b = p.bounds!;
+    assert.ok(p.volume > 0 && p.grid.nx <= b[3] - b[0] + 1 + 2 * 19 && p.grid.ny <= b[4] - b[1] + 1 + 2 * 19, `piece grid ${p.grid.nx}×${p.grid.ny}`);
+  }
 });
 
 test('column crushing: a notched column under load crushes and drops its top', async () => {
@@ -140,6 +146,8 @@ test('overturning: a wall left on a narrow stub at one end tips over, on a centr
     (w as unknown as { checkAt: number }).checkAt = 0;
     ctx.step();
     assert.equal(cause === 'overload', falls, `stub at x = ${stubX}: cause '${cause}'`);
+    // The released upper part is cut into pieces over a few steps (budgeted fracture queue).
+    for (let i = 0; i < 30 && fractureQueueFor(ctx).pending > 0; i++) ctx.step();
     assert.equal(ctx.physics.dynamicCount > 0, falls, `stub at x = ${stubX}: ${ctx.physics.dynamicCount} bodies`);
   }
 });

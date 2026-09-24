@@ -616,7 +616,7 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     let spec = this.followThroughSpecs.get(a.id);
     if (!spec) {
       const s: AmmoData = {
-        id: `${a.id}-ft`, name: `${a.name} follow-through`, caliber: a.caliber, kind: 'he', mass: 0.9, diameter: 0.05, length: 0.15,
+        id: `${a.id}-ft`, name: `${a.name} · ikincil şarj`, caliber: a.caliber, kind: 'he', mass: 0.9, diameter: 0.05, length: 0.15,
         muzzleVelocity: ft.speed, dragCd: 0.5, coreDensity: 7850, noseFactor: 1.0, deformable: false, fuze: 'delay', fuzeDelay: ft.delay,
         explosiveTNT: ft.tntKg, casingMass: ft.casingMass, gurney: 2700, note: 'follow-through HE charge', source: a.source,
       };

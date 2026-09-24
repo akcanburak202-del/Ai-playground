@@ -11,7 +11,7 @@ import { installHud } from './ui/index.ts';
 import { installStructure } from './structure/index.ts';
 import { SCENES, SCENE_LOOKS, sceneById } from './scenes/index.ts';
 import { applyLookAfterLoad, applyLookBeforeLoad } from './scenes/look.ts';
-import { warmVoxelLooks } from './destructibles/voxel/index.ts';
+import { fractureQueueFor, warmVoxelLooks } from './destructibles/voxel/index.ts';
 
 /**
  * App entry: builds the simulation with every subsystem, shows the scene menu over a live scene,
@@ -54,7 +54,8 @@ async function start(): Promise<void> {
   }
 
   let sim: Simulation;
-  const pipeline = new Pipeline({ quality: pickQuality() });
+  const quality = pickQuality();
+  const pipeline = new Pipeline({ quality });
   try {
     sim = await Simulation.create({ canvas, pipeline });
   } catch (err) {
@@ -63,6 +64,8 @@ async function start(): Promise<void> {
   }
 
   sim.factories = createElementFactories(sim.ctx);
+  // Large fractures are cut over several steps; slower devices get a smaller slice per step.
+  fractureQueueFor(sim.ctx).budget = [40_000, 70_000, 100_000][quality]!;
   installStructure(sim);
   installBallistics(sim);
   const weapons = createWeaponController(sim);

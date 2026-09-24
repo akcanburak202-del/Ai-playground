@@ -247,6 +247,9 @@ riddle glass). Pressure–impulse damage numbers for panes, walls and slabs.
 - **Beam.** Node chain along the axis (~0.1–0.2 m) with axial + bending constraints, plastic
   hinges (moment > Mp = Z·fy), section damage from hits (reduces A and Mp locally; perforations
   are drawn as holes), local flange dents, P-δ buckling under the imposed axial load, severing.
+  Members resting on piers or walls sit on seats (held sideways, friction only along the axis,
+  lifting off when the reaction reverses, falling when their end leaves the seat). Placed charges
+  cut a member by the FM 5-250 area rule (3.79e-3 m² per kg × √(510 MPa / σu)).
   Rendered by sweeping the real profile (I/H, cruciform, tube, box) along the smoothed deformed
   axis. A released beam becomes a rigid body (compound collider) with its bent shape frozen.
 

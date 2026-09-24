@@ -58,6 +58,8 @@ attribute vec2 aDUv;
 attribute float aHeat;
 attribute float aStrain;
 attribute float aRim;
+attribute float aCavity;
+varying float vCavity;
 varying vec2 vDUv;
 varying float vHeat;
 varying float vStrain;
@@ -70,6 +72,7 @@ vDUv = aDUv;
 vHeat = aHeat;
 vStrain = aStrain;
 vRim = aRim;
+vCavity = aCavity;
 vObj = position;
 `;
 
@@ -86,6 +89,7 @@ varying vec2 vDUv;
 varying float vHeat;
 varying float vStrain;
 varying float vRim;
+varying float vCavity;
 varying vec3 vObj;
 
 float stHash(vec3 p) {
@@ -354,7 +358,10 @@ export function createSteelMaterial(o: SteelLookOptions): { material: THREE.Mesh
       .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = clamp(stRough, 0.02, 1.0);')
       .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = clamp(stMetal, 0.0, 1.0);')
       .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\nnormal = stPerturb(normal, -vViewPosition, stHeight);')
-      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += stGlowC;');
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += stGlowC;')
+      // A dish hides part of the sky from its own floor (profileMesh.dishOcclusion): ambient and
+      // environment light only, so a dent reads in shade while direct sun still reaches into it.
+      .replace('#include <aomap_fragment>', '#include <aomap_fragment>\nreflectedLight.indirectDiffuse *= 1.0 - vCavity;\nreflectedLight.indirectSpecular *= 1.0 - vCavity;');
   };
   material.customProgramCacheKey = () => `steel:${o.finish}:${o.split}:${!!o.coat}`;
   // Shadow pass: the same holes.

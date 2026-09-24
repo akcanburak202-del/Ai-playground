@@ -5,6 +5,7 @@ import { createVoxelElement } from '../src/destructibles/voxel/index.ts';
 import { VoxelElement } from '../src/destructibles/voxel/VoxelElement.ts';
 import { Carver } from '../src/destructibles/voxel/carve.ts';
 import { makeCtx } from '../src/destructibles/voxel/headless.ts';
+import { fractureQueueFor } from '../src/destructibles/voxel/jobs.ts';
 import { createBlastLoad, gasLoad } from '../src/physics/ballistics/blast.ts';
 
 const WALL_REBAR = { diameter: 0.012, spacing: 0.2, cover: 0.035, layout: 'two-faces' } as const;
@@ -58,8 +59,25 @@ test('confined gas pressure over a whole wall fails it as a panel: large slabs t
   const load = createBlastLoad({ center, tntKg: 12, kind: 'thermobaric' }, 0, { gas });
   const before = w.grid.totalSolid;
   w.applyBlast(load);
-  const pieces = piecesOf(ctx);
-  assert.ok(w.grid.totalSolid < 0.05 * before, `wall kept ${((100 * w.grid.totalSolid) / before).toFixed(1)} %`);
+  // The failure is decided at once but realised over the following steps (fractureQueue): the
+  // wall stands whole until its slabs start to peel off, and no step does more than its budget.
+  assert.equal(w.grid.totalSolid, before, 'the wall must stand until its slabs are cut');
+  const queue = fractureQueueFor(ctx);
+  const launch = new Map<VoxelElement, THREE.Vector3>();
+  let steps = 0;
+  while (queue.pending > 0 && steps < 600) {
+    ctx.step();
+    steps++;
+    for (const p of piecesOf(ctx)) {
+      if (launch.has(p)) continue;
+      const v = bodyOf(p)!.linvel();
+      launch.set(p, new THREE.Vector3(v.x, v.y, v.z));
+    }
+  }
+  assert.equal(queue.pending, 0, 'panel failure never finished');
+  assert.ok(steps > 1 && steps <= 60, `realised over ${steps} steps (≤ 1 s)`);
+  const pieces = [...launch.keys()];
+  assert.ok(w.disposed || w.grid.totalSolid < 0.05 * before, `wall kept ${((100 * w.grid.totalSolid) / before).toFixed(1)} %`);
   assert.ok(pieces.length >= 8 && pieces.length <= 32, `${pieces.length} pieces`);
   // Large slabs through the whole thickness, not 10 cm plugs.
   const big = pieces.filter((p) => p.grid.solidVolume() > 0.1).length;
@@ -68,16 +86,15 @@ test('confined gas pressure over a whole wall fails it as a panel: large slabs t
   const n = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), rot);
   const vMax = load.reflectedImpulseAt(inFront(rot, 0, 1.5), n) / (2400 * 0.3);
   let out = 0;
-  for (const p of pieces) {
-    const v = bodyOf(p)!.linvel();
+  for (const v of launch.values()) {
     const along = -(v.x * n.x + v.y * n.y + v.z * n.z);
-    const sp = Math.hypot(v.x, v.y, v.z);
+    const sp = v.length();
     assert.ok(sp < 1.3 * vMax + 1.5, `piece at ${sp.toFixed(1)} m/s (i_r/ρt = ${vMax.toFixed(1)})`);
     if (along > 0.5 * sp) out++;
   }
   assert.ok(out >= 0.9 * pieces.length, `${out} of ${pieces.length} pieces thrown away from the charge`);
   // The empty parent leaves the structure after its support check.
-  for (let i = 0; i < 12; i++) ctx.step();
+  for (let i = 0; i < 12 && !w.disposed; i++) ctx.step();
   assert.ok(w.disposed, 'emptied wall not disposed');
 });
 

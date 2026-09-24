@@ -237,6 +237,21 @@ export function dentDisplacement(d: Dent, s: number, y: number, z: number, shift
   return d.depth * (1 - as - al) * fade;
 }
 
+/**
+ * Share of the sky a point on the floor of a dish no longer sees, 0..1 (drawn as occlusion of the
+ * ambient / environment light only). A point at the centre of a parabolic dish of depth δ and radius
+ * R sees the sky through the rim's opening, whose edge stands at elevation β = atan(δ/R); the
+ * cosine-weighted visibility of a cone of half-angle 90° − β is cos²β, so 1 − cos²β =
+ * k²/(1 + k²), k = δ/R (the standard analytic ambient occlusion of a cone, e.g. Akenine-Möller
+ * et al., Real-Time Rendering 4th ed. §11.3). It falls off with the dish profile (w/δ) towards the
+ * rim, and × 1.5 for the light the far wall of the dish would have bounced in less than the sky.
+ */
+export function dishOcclusion(d: Dent, w: number): number {
+  if (!(d.depth > 0) || !(d.R > 0)) return 0;
+  const k = d.depth / d.R;
+  return Math.min(0.6, 1.5 * ((k * k) / (1 + k * k)) * Math.min(1, w / d.depth));
+}
+
 export interface SweepFrameSource {
   /** Number of nodes and node spacing along the undeformed axis */
   n: number;
@@ -264,6 +279,8 @@ export class SweptMesh {
   private heat: Float32Array;
   private strain: Float32Array;
   private rim: Float32Array;
+  /** Sky occlusion inside dishes (0 = open, see update) */
+  private cavity: Float32Array;
   private readonly capBase: number;
   private readonly capTris: number[][];
   private readonly length: number;
@@ -287,6 +304,7 @@ export class SweptMesh {
     this.heat = new Float32Array(nv).fill(20);
     this.strain = new Float32Array(nv);
     this.rim = new Float32Array(nv);
+    this.cavity = new Float32Array(nv);
     const idx: number[] = [];
     let quads = 0;
     for (let i = 0; i < m - 1; i++) if (!outline.brk[i]) quads++;
@@ -313,6 +331,7 @@ export class SweptMesh {
     g.setAttribute('aHeat', new THREE.BufferAttribute(this.heat, 1).setUsage(THREE.DynamicDrawUsage));
     g.setAttribute('aStrain', new THREE.BufferAttribute(this.strain, 1).setUsage(THREE.DynamicDrawUsage));
     g.setAttribute('aRim', new THREE.BufferAttribute(this.rim, 1));
+    g.setAttribute('aCavity', new THREE.BufferAttribute(this.cavity, 1).setUsage(THREE.DynamicDrawUsage));
     g.setIndex(idx);
     // Texture coordinates never change: u = perimeter, v = arc length.
     for (let k = 0; k < this.rings; k++) {
@@ -396,12 +415,13 @@ export class SweptMesh {
       for (const d of dents) if (Math.abs(sRest - d.s) < d.R) near.push(d);
       for (let q = 0; q < m; q++) {
         const ov = this.outline.verts[q]!;
-        let y = ov.y, z = ov.z;
+        let y = ov.y, z = ov.z, cav = 0;
         for (const d of near) {
           const w = dentDisplacement(d, sRest, ov.y, ov.z, this.dentShift);
           if (w <= 0) continue;
           y += w * d.dy;
           z += w * d.dz;
+          cav = Math.max(cav, dishOcclusion(d, w));
           if (w > 2e-4) {
             if (k < dk0) dk0 = k;
             if (k > dk1) dk1 = k;
@@ -432,6 +452,7 @@ export class SweptMesh {
         this.nrm[3 * vi + 2] = nz;
         this.heat[vi] = heat;
         this.strain[vi] = strain;
+        this.cavity[vi] = cav;
       }
       if (k === 0) {
         first.copy(P);
@@ -472,7 +493,7 @@ export class SweptMesh {
     // A dished face is no longer flat: shade it from the deformed surface. Sharp corners are
     // separate vertices, so they stay sharp; the caps keep their own normals.
     if (dk1 >= dk0) this.recomputeRingNormals(dk0 - 1, dk1 + 1);
-    for (const name of ['position', 'normal', 'aHeat', 'aStrain']) (g.getAttribute(name) as THREE.BufferAttribute).needsUpdate = true;
+    for (const name of ['position', 'normal', 'aHeat', 'aStrain', 'aCavity']) (g.getAttribute(name) as THREE.BufferAttribute).needsUpdate = true;
     g.computeBoundingSphere();
     g.computeBoundingBox();
   }

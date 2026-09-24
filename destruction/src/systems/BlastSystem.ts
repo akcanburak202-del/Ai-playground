@@ -95,7 +95,6 @@ export class BlastSystem implements System, BlastSystemApi {
     const load = createBlastLoad(req, now, { tamping: ext.tamping });
     const thermo = req.kind === 'thermobaric';
     this.count++;
-    ctx.events.emit('blast', { ...req, center: req.center.clone(), time: now, fireballRadius: fireballRadius(req.tntKg, thermo) });
 
     const onSurface = !!req.normal || req.kind === 'contact' || req.kind === 'hesh';
     const W = hemisphericalCharge(req.tntKg, req.center.y, onSurface);
@@ -114,6 +113,8 @@ export class BlastSystem implements System, BlastSystemApi {
     this.lastGas = gas;
     if (!gas) enclosureIds.clear();
     const gasLoadFor = gas ? createBlastLoad(req, now, { tamping: ext.tamping, gas }) : null;
+    // Announced once the room is known, so listeners (HUD, audio, FX) see the confined gas load.
+    ctx.events.emit('blast', { ...req, center: req.center.clone(), time: now, fireballRadius: fireballRadius(req.tntKg, thermo), gasPressure: gas ? gas.pressure : undefined });
 
     for (const d of ctx.registry.querySphere(center, Math.max(range, gas ? gas.radius : 0))) {
       d.bounds.clampPoint(center, _p);

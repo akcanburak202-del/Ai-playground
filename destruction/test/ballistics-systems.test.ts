@@ -18,6 +18,7 @@ import { installBallistics } from '../src/systems/index.ts';
 import { SlabTarget, type SlabOptions } from '../src/systems/debug/SlabTarget.ts';
 import { createWeaponController } from '../src/weapons/index.ts';
 import type { WeaponController } from '../src/weapons/WeaponController.ts';
+import type { ChargeMarkers } from '../src/weapons/ChargeMarkers.ts';
 import { MATERIALS } from '../src/physics/materials.ts';
 import { blastAt } from '../src/physics/ballistics/blast.ts';
 import { stepFlight } from '../src/physics/ballistics/flight.ts';
@@ -276,6 +277,8 @@ test('a detonation inside a closed room adds the gas pressure to the room walls,
   r.step(0.2);
   const gas = r.blasts.lastGas!;
   assert.ok(gas && gas.pressure > 120e3, `gas pressure ${(gas?.pressure ?? 0) / 1e3} kPa`);
+  // The 'blast' event is emitted once the room is measured and carries its gas pressure.
+  assert.equal(r.blastEvents.at(-1)!.gasPressure, gas.pressure);
   for (const w of walls) assert.ok(r.blasts.lastEnclosureIds.has(w.id), `${w.name} bounds the room`);
   assert.ok(!r.blasts.lastEnclosureIds.has(outside.id));
   // The inside face of the far end wall is breached (P–I ≥ 2); outside the room nothing changes.
@@ -289,6 +292,7 @@ test('a detonation inside a closed room adds the gas pressure to the room walls,
   const r2 = await rig();
   r2.blasts.detonate({ center, tntKg: 12, kind: 'thermobaric' });
   assert.equal(r2.blasts.lastGas, null);
+  assert.equal(r2.blastEvents.at(-1)!.gasPressure, undefined);
 });
 
 test('occluded targets get a diffracted (weaker) load', async () => {
@@ -447,18 +451,84 @@ test('WeaponController: each weapon keeps its own reload; a held trigger fires w
   r.step(0.5);
   wc.select('tankgun');
   assert.ok(wc.cooldown > 0 && wc.cooldown < 2.4 - 0.5, `gun reload left ${wc.cooldown.toFixed(2)} s`);
-  // A click during the reload does nothing; holding the trigger fires the moment it is loaded.
+  // A click during the reload is kept: the round goes the moment the gun is loaded, trigger up.
   click();
   assert.equal(shots.length, 2);
+  assert.equal(wc.triggerDown, false);
+  r.step(wc.cooldown + 0.05);
+  assert.deepEqual(shots, ['tankgun', 'rpg7', 'tankgun']);
+  // Several clicks during one reload still fire one round; holding the trigger fires when ready.
+  click();
+  click();
   wc.setTrigger(true);
   assert.equal(wc.triggerDown, true);
   r.step(wc.cooldown + 0.05);
-  assert.deepEqual(shots, ['tankgun', 'rpg7', 'tankgun']);
-  r.step(0.5);
-  assert.equal(shots.length, 3, 'single-shot: one round per press');
+  assert.equal(shots.length, 4);
+  r.step(3);
+  assert.equal(shots.length, 4, 'single-shot: one round per press');
   wc.setTrigger(false);
   assert.equal(wc.triggerDown, false);
+  // Automatic weapons do not keep a released press.
+  wc.select('m4a1');
+  wc.setTrigger(true);
+  wc.setTrigger(false);
+  r.step(0.2);
+  assert.equal(shots.length, 4);
+  // A press made with one weapon does not fire the next.
+  wc.select('tankgun');
+  r.step(3);
+  wc.setTrigger(true);
+  wc.setTrigger(false);
+  wc.select('rpg7');
+  r.step(0.1);
+  assert.equal(shots.length, 4);
   void left;
+});
+
+test('WeaponController: quick clicks place several charges, each shown as a marker until it fires', async () => {
+  const r = await rig();
+  const wc = createWeaponController(r.sim) as WeaponController;
+  const markers = r.systems.find((s) => s.name === 'chargeMarkers') as ChargeMarkers;
+  assert.ok(markers, 'markers installed with the controller');
+  r.slab({ name: 'column', width: 1, height: 4, thickness: 0.6, position: V(0, 2, -6) });
+  const cam = r.ctx.camera;
+  cam.position.set(0, 1.7, 0);
+  cam.lookAt(0, 1.7, -6);
+  cam.updateMatrixWorld();
+  wc.select('demo');
+  r.step(1 / 60);
+  // Three clicks inside one placement cooldown: all three charges are placed, one after another.
+  for (let i = 0; i < 3; i++) {
+    wc.setTrigger(true);
+    r.step(1 / 60);
+    wc.setTrigger(false);
+    r.step(1 / 60);
+  }
+  assert.equal(wc.charges.length, 1);
+  r.step(1.2);
+  assert.equal(wc.charges.length, 3);
+  assert.equal(markers.count, 3);
+  const g = r.ctx.scene.getObjectByName(`charge ${wc.charges[0]!.id}`)!;
+  assert.ok(g, 'marker in the scene');
+  // Lies on the struck face (z = −5.7), its long side level, facing the viewer.
+  assert.ok(Math.abs(g.position.z - (-5.7 + 0.025)) < 0.01, `marker z ${g.position.z.toFixed(3)}`);
+  const axis = V(1, 0, 0).applyQuaternion(g.quaternion);
+  assert.ok(Math.abs(axis.y) < 1e-6);
+  wc.detonate(0.1);
+  r.step(1 / 60);
+  assert.equal(markers.count, 2);
+  r.step(0.3);
+  assert.equal(markers.count, 0);
+  // Scene reset clears markers of charges that never fired.
+  r.step(0.5);
+  wc.setTrigger(true);
+  r.step(1 / 60);
+  wc.setTrigger(false);
+  assert.equal(markers.count, 1);
+  markers.reset();
+  wc.reset();
+  assert.equal(markers.count, 0);
+  markers.dispose();
 });
 
 // ─── Timing inside the fixed step (review fixes) ─────────────────────────────────────────────
@@ -539,7 +609,7 @@ test('the weapon controller times rounds the same whichever system runs first', 
     const wc = weaponsFirst ? (createWeaponController(t.sim) as WeaponController) : null;
     installBallistics(t.sim);
     const w = wc ?? (createWeaponController(t.sim) as WeaponController);
-    assert.deepEqual(t.systems.map((s) => s.name), weaponsFirst ? ['weapons', 'projectiles', 'blasts'] : ['projectiles', 'blasts', 'weapons']);
+    assert.deepEqual(t.systems.map((s) => s.name), weaponsFirst ? ['weapons', 'chargeMarkers', 'projectiles', 'blasts'] : ['projectiles', 'blasts', 'weapons', 'chargeMarkers']);
     const slab = new SlabTarget({ name: 'target', material: MATERIALS.concrete, width: 4, height: 4, thickness: 0.3, position: V(0, 1.7, -30) });
     t.ctx.addDestructible(slab);
     const shots: number[] = [];

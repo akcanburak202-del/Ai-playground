@@ -59,6 +59,20 @@ const HINGE_LB = 0.08, HINGE_RES = 0.5, HINGE_PIN = 1.0;
 const CONNECTION_TAU = 0.02;
 /** Time over which a changed imposed load is brought on, s */
 const LOAD_RAMP = 0.25;
+/**
+ * Bearing seat (a member resting on a pier or a wall top): a guided bearing. Keeper plates hold it
+ * sideways; along its axis only friction does, C_f = 0.2 for a steel bearing plate on grout
+ * (EN 1993-1-8 §6.2.2(6)), so a member that bows (its chord shortens) or is pulled along its axis
+ * slides on the seat instead of hanging in a catenary from pins. Nothing holds it down: a seat whose
+ * reaction turns into a pull lets the member lift off.
+ */
+const SEAT_FRICTION = 0.2;
+/**
+ * Seat reactions are judged over this time, s: a reversal shorter than this lifts the end by less
+ * than ≈ g τ²/2 ≈ 5 cm and it drops back onto its seat, a push shorter than this is taken by the
+ * keepers' and the bolts' give. A game-level estimate.
+ */
+const SEAT_TAU = 0.1;
 
 export class BeamSim {
   readonly params: SteelParams;
@@ -129,7 +143,13 @@ export class BeamSim {
   /** Largest plastic hinge rotation so far, rad */
   maxHinge = 0;
   /** Events since last drain */
-  events: { type: 'hinge' | 'connection' | 'landed'; node: number; value: number }[] = [];
+  events: { type: 'hinge' | 'connection' | 'landed' | 'seat'; node: number; value: number }[] = [];
+  /**
+   * Bearing seats: held nodes that rest on a support rather than being fixed to it (checkSeat), with
+   * the low-passed reaction on the member (vertical, + up; along the axis), N, and how far the seat
+   * point has slid along the axis, m.
+   */
+  readonly seats = new Map<number, { rv: number; ax: number; slid: number }>();
   damping = 1.5;
   minSubstepDt = 1 / 480;
   maxSubsteps = 96;
@@ -265,6 +285,7 @@ export class BeamSim {
         this.rollerE.set(clone.rollerE);
         this.rollerLock = clone.rollerLock;
       }
+      for (const [j, st] of clone.seats) if (j >= i0 && j <= range[1]) this.seats.set(j - i0, { ...st });
       for (let i = 0; i < n; i++) this.updateSection(i);
       this.updateFrames();
       return;
@@ -914,6 +935,7 @@ export class BeamSim {
       const shearCap = cap / Math.sqrt(3) + 0.2 * Math.max(0, -this.reactN[e]!);
       if (this.reactN[e]! > 1.5 * cap || this.reactV[e]! > 1.5 * shearCap) this.releaseNode(i);
     }
+    for (const [i, st] of this.seats) this.checkSeat(i, st, h);
     if (this.roller >= 0) {
       // Head connection in shear: bolts plus friction under the carried load, low-passed as above.
       let fl2 = 0;
@@ -924,9 +946,82 @@ export class BeamSim {
     }
   }
 
+  /**
+   * A bearing seat under node i. The reaction the member gets there (the constraint forces on the
+   * held node, reversed, plus the node's own weight) is split into its vertical part and its part
+   * along the member axis. Along the axis the seat holds only by friction: any excess over
+   * C_f · R_v slides the seat point with the member, by the excess over the axial stiffness of the
+   * span (EA / L, half of it per substep, so the slip settles without overshoot). The vertical part
+   * is low-passed over CONNECTION_TAU like a bolted connection's reaction: once the seat would have
+   * to pull the member down (it lifts off) it lets go. A member that slides off the end of its seat
+   * is released by SteelBeam (it knows the seat's extent).
+   */
+  private checkSeat(i: number, st: { rv: number; ax: number; slid: number }, h: number): void {
+    if (!this.locked[i]) {
+      this.seats.delete(i);
+      return;
+    }
+    const h2 = h * h;
+    let fx = 0, fy = 0, fz = 0;
+    for (let j = 0; j < this.m; j++) {
+      const k = this.slotOf(j, i);
+      if (k < 0) continue;
+      const s = this.lam[j]! / h2;
+      fx += s * this.cG[9 * j + 3 * k]!;
+      fy += s * this.cG[9 * j + 3 * k + 1]!;
+      fz += s * this.cG[9 * j + 3 * k + 2]!;
+    }
+    const [gx, gy, gz] = this.gravity;
+    const g = Math.hypot(gx, gy, gz);
+    const m = this.mass[i]!;
+    // Reaction on the member: −(what its constraints push the node with) − the node's own weight.
+    const rx = -fx - m * gx, ry = -fy - m * gy, rz = -fz - m * gz;
+    const ux = g > 1e-6 ? -gx / g : 0, uy = g > 1e-6 ? -gy / g : 1, uz = g > 1e-6 ? -gz / g : 0;
+    const rv = rx * ux + ry * uy + rz * uz;
+    // Member axis at the seat, in the seat plane.
+    let tx = this.t[3 * i]!, ty = this.t[3 * i + 1]!, tz = this.t[3 * i + 2]!;
+    const tu = tx * ux + ty * uy + tz * uz;
+    tx -= tu * ux;
+    ty -= tu * uy;
+    tz -= tu * uz;
+    const tl = Math.hypot(tx, ty, tz);
+    const a = 1 - Math.exp(-h / SEAT_TAU);
+    st.rv += a * (rv - st.rv);
+    if (tl > 1e-6) {
+      tx /= tl;
+      ty /= tl;
+      tz /= tl;
+      const rax = rx * tx + ry * ty + rz * tz;
+      st.ax += a * (rax - st.ax);
+      // Friction acts at once: whatever the seat would have to hold beyond it slides the seat point
+      // the way the member pulls the node (−reaction), by half the slip that relieves the excess
+      // over the stiffness of the bar next to it, EA / ds (a displaced support loads that bar
+      // first; a sustained pull over the span is relieved over a few substeps without launching an
+      // axial wave).
+      const excess = Math.abs(rax) - SEAT_FRICTION * Math.max(0, rv);
+      if (excess > 0) {
+        const d = (-Math.sign(rax) * 0.5 * excess * this.ds) / (this.params.E * Math.max(this.A[i]!, 1e-9));
+        this.lockPos[3 * i] = this.lockPos[3 * i]! + d * tx;
+        this.lockPos[3 * i + 1] = this.lockPos[3 * i + 1]! + d * ty;
+        this.lockPos[3 * i + 2] = this.lockPos[3 * i + 2]! + d * tz;
+        st.slid += d;
+      }
+    }
+    if (g > 1e-6 && st.rv < -0.05 * m * g) {
+      this.releaseNode(i);
+      this.events.push({ type: 'seat', node: i, value: -1 });
+    }
+  }
+
+  /** Make held node i a bearing seat (it rests on its support, see checkSeat). */
+  setSeat(i: number): void {
+    if (this.locked[i]) this.seats.set(i, { rv: 0, ax: 0, slid: 0 });
+  }
+
   /** Free a support (connection failed or anchor released). */
   releaseNode(i: number): void {
     if (!this.locked[i]) return;
+    this.seats.delete(i);
     this.locked[i] = 0;
     this.refreshW(i);
     if (i === 0) {

@@ -255,6 +255,31 @@ export class DetailMap {
   }
 
   /**
+   * Crease at the rim of a dish: the plate hinges there and the hoop compression cracks its paint or
+   * scale along a thin, broken, ragged line — primer and flecks of bare steel show in it (G up to
+   * 0.5) and the soot film on top flakes off with the paint (B reduced) — so the rim reads against
+   * paint and soot alike. `strength` 0..1; the band is ≈ 8 % of the radius wide, ≥ 1.5 texels.
+   */
+  crease(cu: number, cv: number, ru: number, rv: number, strength: number, seed: number): void {
+    if (!(strength > 0)) return;
+    const A = ring(0, seed, 3), B = ring(1, seed + 7, 11), C = ring(2, seed + 13, 9);
+    const s0 = Math.floor(seed * 7919);
+    const half = Math.max(0.04, 1.5 / Math.max(1, Math.min(ru * this.w, rv * this.h)));
+    this.each(cu, cv, ru * (1.1 + 2 * half), rv * (1.1 + 2 * half), false, (i, rr, ang, du, dv) => {
+      const r0 = 1 + 0.07 * around(A, ang) + 0.035 * around(B, ang);
+      const x = Math.abs(rr - r0) / half;
+      if (x >= 1) return;
+      // Broken, not a drawn circle: gaps where the crack runs out, grain along it.
+      const gap = clamp01(0.5 + 1.6 * around(C, ang));
+      const grain = 0.6 + 0.8 * hash2(Math.round(du * 613), Math.round(dv * 617), s0);
+      const v = clamp01(strength * (1 - x * x) * grain * gap);
+      const k = 4 * i;
+      this.data[k + 1] = Math.max(this.data[k + 1]!, Math.round(0.5 * v * 255));
+      this.data[k + 2] = Math.round(this.data[k + 2]! * (1 - 0.6 * v));
+    });
+  }
+
+  /**
    * Crater of `depth` in [0, 1] (× the material's dimple scale): a smooth bowl with a raised lip,
    * added to what is there. A round striking an existing crater is resolved against the thinner
    * steel under it (probe) and its penetration starts at the crater floor, so repeated hits on one

@@ -274,6 +274,15 @@ a target). Impact-fuzed and shaped-charge rounds never ricochet (graze-sensitive
   HESH) with a scab about the squashed-charge footprint; dish depth from **Nurick & Martin** (1989,
   *Int. J. Impact Eng.* 8): `δ/t = 0.480 φ + 0.277`, `φ = I (1 + ln(R/r0)) / (π R t² √(ρ σ_y))`,
   I ≈ 1 000 N·s per kg TNT (half the (8/27) W D momentum of a slab charge on a rigid wall).
+* Which steel is removed depends on the load, not only on its size. A **placed charge**
+  (`kind: 'contact'` from the demolition tool) is treated as a member-cutting charge: the steel
+  module decides how much of the whole cross-section it severs with its area-based cutting rule
+  (`fm5250CutArea` / `contactCut` in the steel module's `section.ts`, scaled by the member's
+  ultimate strength; the figures and their source live there, not in this module). **HE, HESH and
+  the blast of a shaped charge** that strike a member are not cutting charges: they hole only the
+  struck plate (flange, web or wall) over the breach radius r_b by the rule above, plus what stands
+  within ½ · r_b behind it (a web root behind a flange; `SteelBeam` applies both paths), and leave
+  the rest of the section to carry load (it can still bend or buckle).
 * Glass in contact: always holed. Soil: crater 0.4 W^⅓ × 0.2 W^⅓ (Cooper 1996).
 
 ### 7.2 Pressure–impulse damage (`damageAt`)
@@ -353,6 +362,9 @@ hundreds of milliseconds (UFC 3-340-02 ch. 2, fig. 2-152).
   `overpressureAt = max(P_s, P_QS)`, and `damageAt = max(D(P_r, i_r), D(P_QS, i_r + i_gas))` (the
   long-duration load read on the same P–I curve, where its quasi-static asymptote governs).
   Loose bodies get no gas push (uniform pressure has no resultant).
+* **Event**: `BlastSystem.detonate` emits `'blast'` after the room has been measured, with
+  `gasPressure` = P_QS (Pa; absent in the open), so the HUD's blast row, audio and FX can tell a
+  confined detonation from one in the open.
 * **Chapel check** (real app, 12 kg thermobaric at the centre): measured V = 594 m³ (true 616),
   closed 1.0, P_QS = 203 kPa, i_gas = 10.1 kPa·s; damage numbers 2.3–2.4 on the long walls, the
   entrance wall, the altar panels and the roof (before: local breach near the charge only). A
@@ -576,7 +588,7 @@ displacement, thinnest triangle; beam: node displacement = bow, dish patches, to
 | L31A7 HESH → RHA 50 mm | contact 4.8 kg: dish 29 mm, scab Ø366 × 21 mm @ 176 m/s | thickness 51 → 29 → 18 %, torn at hit 2 |
 | L31A7 HESH → RHA 100 mm | dish 14.5 mm, scab Ø294 × 34 mm @ 126 m/s | thickness 67 → 41 → 24 %, displacement 6 → 15 → 27 mm |
 | L31A7 HESH → HEB 300 flange | dish 84 mm, scab Ø420 × 9 mm @ 212 m/s | dish 84 → 150 mm torn; bow 49 → 116 → 123 mm |
-| L31A7 HESH → box | dish 49 mm, scab Ø399 × 18 mm @ 198 m/s | dish 49 → 95 mm torn (hit 2); no bow |
+| L31A7 HESH → box | dish 49 mm, scab Ø399 × 18 mm @ 198 m/s | dish 49 → 95 mm torn (hit 2); bow 0–4 mm (first-mode energy J²/2m ≈ 12 kJ is below the girder's ≈ 15 kJ elastic capacity, so the dish takes the local energy) |
 | M830A1 HEAT-MP → RHA 50 / 100 mm | jet Ø15 mm through (50 / 100 mm RHA used); 25 % blast dish 3.0 / 1.5 mm | hits 2–3: the jet threads its own hole, the 80 mm round strikes the rim and fires on the face again |
 | M830A1 → HEB 300 flange | jet through both flanges; dish 12.9 mm, scab Ø123 × 8 mm | flange dish 12.9 → 21.8 mm torn (hit 2) |
 | M830A1 → box | jet through both walls; dish 6.1 mm, scab Ø97 × 13 mm | dish 6 → 11 → 19 mm, thickness loss 13 → 24 → 31 mm |

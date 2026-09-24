@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { CrackGraph, SEG_ARC, SEG_RADIAL } from '../src/destructibles/glass/crackGraph.ts';
 import { growStar, holeOutline } from '../src/destructibles/glass/cracks.ts';
 import { blastStar, impactStar } from '../src/destructibles/glass/model.ts';
-import { polyArea, pointInPoly } from '../src/destructibles/glass/polygon.ts';
+import { convexHull, polyArea, pointInPoly, simplifyConvex } from '../src/destructibles/glass/polygon.ts';
 import { Rng } from '../src/core/rng.ts';
 
 function rngFn(seed: number): () => number {
@@ -181,4 +181,27 @@ test('an oblique round cuts a hole stretched by 1/cos θ along its in-plane dire
   }
   assert.ok(Math.abs(area / round - 2) < 0.15, `area ratio ${(area / round).toFixed(2)}`);
   assert.ok(along / across > 1.6 && along / across < 2.5, `elongation ${(along / across).toFixed(2)}`);
+});
+
+test('shard collision outline: at most 12 separated corners, convex, inside the hull, little area lost', () => {
+  // A crack-traced 20 cm piece: 200 slightly jittered corners, several nearly coincident.
+  const pts: number[] = [];
+  for (let k = 0; k < 200; k++) {
+    const a = (k / 200) * 2 * Math.PI, r = 0.1 * (1 + 0.0005 * Math.sin(37 * a));
+    pts.push(r * Math.cos(a), r * Math.sin(a));
+  }
+  const hull = convexHull(pts);
+  const s = simplifyConvex(hull, 0.002, 12);
+  const n = s.length >> 1;
+  assert.ok(n >= 3 && n <= 12, `corners ${n}`);
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n, k = (i + 2) % n;
+    assert.ok(Math.hypot(s[2 * j]! - s[2 * i]!, s[2 * j + 1]! - s[2 * i + 1]!) >= 0.002, 'separated');
+    const cross = (s[2 * j]! - s[2 * i]!) * (s[2 * k + 1]! - s[2 * i + 1]!) - (s[2 * j + 1]! - s[2 * i + 1]!) * (s[2 * k]! - s[2 * i]!);
+    assert.ok(cross > 0, 'convex, counter-clockwise');
+    assert.ok(pointInPoly(hull, 0.999 * s[2 * i]!, 0.999 * s[2 * i + 1]!), 'inside the hull');
+  }
+  assert.ok(polyArea(s) > 0.9 * polyArea(hull), `area kept ${(polyArea(s) / polyArea(hull)).toFixed(3)}`);
+  // A triangle stays a triangle.
+  assert.equal(simplifyConvex([0, 0, 1, 0, 0, 1], 0.002, 12).length, 6);
 });

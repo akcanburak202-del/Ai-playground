@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { Simulation } from './Simulation.ts';
 import type { AmmoSpec, BlastKind } from '../physics/ballistics/types.ts';
 import { stepFlight } from '../physics/ballistics/flight.ts';
+import { fractureQueueFor } from '../destructibles/voxel/index.ts';
 
 /**
  * Scripting surface exposed as `window.__sim` for automated tests and screenshots
@@ -109,6 +110,9 @@ export function installHarness(sim: Simulation): Harness {
         geometries: info.memory.geometries,
         textures: info.memory.textures,
         simTime: sim.ctx.time.now,
+        fractureJobs: fractureQueueFor(sim.ctx).pending,
+        fractureLastMs: fractureQueueFor(sim.ctx).lastMs,
+        fractureMaxMs: fractureQueueFor(sim.ctx).maxMs,
       };
     },
   };

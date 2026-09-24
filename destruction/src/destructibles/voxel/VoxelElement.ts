@@ -14,7 +14,8 @@ import { Carver, type Roughness } from './carve.ts';
 import { probeRun, traceRay, type RunSegment, type SampleBox, type TraceHit } from './trace.ts';
 import { layoutRebar, segSegDist2, type RebarSet } from './rebar.ts';
 import { Connectivity, type Island } from './connectivity.ts';
-import { pickSeeds, planarCellDepth, splitSelection, type Piece, type Selection } from './fracture.ts';
+import { clearAllLabels, clearPieceLabels, pickSeeds, planarCellDepth, splitSelection, splitSteps, type Piece, type Selection, type SplitOutput } from './fracture.ts';
+import { PIECE_UNITS, STEP_UNITS, fractureQueueFor, type FractureQueue, type FractureWork } from './jobs.ts';
 import { VoxelLook, type DiscardUniforms } from './look.ts';
 import { buildBaseGeometry } from './baseMesh.ts';
 import { schedulerFor, type RemeshClient, type RemeshScheduler } from './scheduler.ts';
@@ -167,6 +168,12 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   private readonly conn: Connectivity;
   private readonly look: VoxelLook;
   private readonly scheduler: RemeshScheduler;
+  /** Budgeted fracture work shared by the simulation's voxel elements (jobs.ts) */
+  private readonly fractures: FractureQueue;
+  /** Fracture jobs of this element still queued (supports are not re-checked meanwhile) */
+  private jobCount = 0;
+  /** A queued job takes all of this element's material (whole panel, all islands) */
+  private doomed = false;
   private sampleBox: SampleBox;
   // rendering
   private baseMesh: THREE.Mesh | null = null;
@@ -247,6 +254,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     this.spec = spec;
     this.material = MATERIALS[spec.material];
     this.scheduler = schedulerFor(ctx);
+    this.fractures = fractureQueueFor(ctx);
     watchBlasts(ctx);
     if (piece) {
       this.name = `${piece.parent.name}·${++pieceCounter}`;
@@ -811,7 +819,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
    * Empty the static collider wherever a new piece's material lies. syncCollider keeps a coarse
    * cell while it is at least half full, so without this a piece cut from a partly emptied cell
    * would spawn inside its parent's collider and be kicked out at depenetration speed. Piece grids
-   * share the parent's lattice (cropGrid), so their samples map onto it by an integer offset.
+   * share the parent's lattice (chunk-aligned windows, see fracture.ts adoptPiece), so their
+   * samples map onto it by an integer offset.
    */
   private clearColliderUnder(piece: VoxelGrid): void {
     if (!this.voxelCollider || !this.colCells) return;
@@ -835,6 +844,96 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
             /* world replaced by a scene load */
           }
         }
+  }
+
+  /**
+   * Empty the static collider cells whose material a deferred split has taken (labelled samples;
+   * a cell stays while at least half of it is unlabelled solid, as in syncCollider). Yields work.
+   */
+  private dropStaticCollider(): void {
+    this.colCells?.fill(0);
+    if (this.fixedBody) {
+      try {
+        this.ctx.physics.removeBody(this.fixedBody);
+      } catch {
+        /* world replaced by a scene load */
+      }
+    }
+    this.fixedBody = null;
+    this.voxelCollider = null;
+  }
+
+  private *clearColliderLabelled(out: SplitOutput): Generator<number, void, void> {
+    const labels = out.labels, lb = out.labelBox;
+    if (!labels || !lb || !this.voxelCollider || !this.colCells) return;
+    let i0 = Infinity, j0 = Infinity, k0 = Infinity, i1 = -1, j1 = -1, k1 = -1;
+    for (let o = 0; o < lb.length; o += 6) {
+      if (lb[o + 3]! < 0) continue;
+      i0 = Math.min(i0, lb[o]!); j0 = Math.min(j0, lb[o + 1]!); k0 = Math.min(k0, lb[o + 2]!);
+      i1 = Math.max(i1, lb[o + 3]!); j1 = Math.max(j1, lb[o + 4]!); k1 = Math.max(k1, lb[o + 5]!);
+    }
+    if (i1 < 0) return;
+    const g = this.grid, F = this.colF, half = (F * F * F) / 2, cells = this.colCells;
+    const [nx, ny, nz] = this.colN;
+    if ((out.labelledSolid ?? 0) >= g.totalSolid) {
+      // Every solid sample goes (a whole-panel failure): drop the collider in one call.
+      this.dropStaticCollider();
+      yield 1000;
+      return;
+    }
+    const I0 = Math.max(0, Math.floor((i0 - 2) / F)), I1 = Math.min(nx - 1, Math.floor((i1 - 2) / F));
+    const J0 = Math.max(0, Math.floor((j0 - 2) / F)), J1 = Math.min(ny - 1, Math.floor((j1 - 2) / F));
+    const K0 = Math.max(0, Math.floor((k0 - 2) / F)), K1 = Math.min(nz - 1, Math.floor((k1 - 2) / F));
+    let total = 0;
+    for (let q = 0; q < cells.length; q++) total += cells[q]!;
+    // Find the cells first; if the whole collider goes (a whole-panel failure), the body is
+    // dropped in one call instead of hundreds of thousands of voxel edits.
+    const gone: number[] = [];
+    let work = 0;
+    for (let K = K0; K <= K1; K++)
+      for (let J = J0; J <= J1; J++) {
+        for (let I = I0; I <= I1; I++) {
+          const idx = I + nx * (J + ny * K);
+          if (!cells[idx]) continue;
+          work += 2 * F * F * F;
+          let n = 0;
+          for (let k = 2 + F * K; k < 2 + F * K + F; k++)
+            for (let j = 2 + F * J; j < 2 + F * J + F; j++)
+              for (let i = 2 + F * I; i < 2 + F * I + F; i++) {
+                if (g.density(i, j, k) < ISO) continue;
+                g.locate(i, j, k);
+                if (!labels[g.ci]?.[g.li]) n++;
+              }
+          if (n < half) gone.push(idx);
+        }
+        if (work > 20_000) {
+          yield work;
+          work = 0;
+          if (!this.voxelCollider || !this.colCells) return;
+        }
+      }
+    if (!this.voxelCollider || !this.colCells) return;
+    if (gone.length === total) {
+      this.dropStaticCollider();
+      yield work + 1000;
+      return;
+    }
+    for (let q = 0; q < gone.length; q++) {
+      const idx = gone[q]!;
+      cells[idx] = 0;
+      try {
+        this.voxelCollider.setVoxel(idx % nx, Math.floor(idx / nx) % ny, Math.floor(idx / (nx * ny)), false);
+      } catch {
+        /* world replaced by a scene load */
+      }
+      work += 6;
+      if (work > 20_000 && q + 1 < gone.length) {
+        yield work;
+        work = 0;
+        if (!this.voxelCollider) return;
+      }
+    }
+    if (work) yield work;
   }
 
   /**
@@ -1337,7 +1436,9 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   // ── Destructible: blasts ──────────────────────────────────────────────────────────────────
 
   applyBlast(load: BlastLoad): void {
-    if (this.disposed || this.grid.totalSolid === 0) return;
+    // All of it is already on its way out (queued whole-element failure): a later blast would
+    // only have to wait for the queue (flush) to act on material that is leaving anyway.
+    if (this.disposed || this.grid.totalSolid === 0 || this.doomed) return;
     // The BlastSystem pushes this piece's body in the same step (contact-gain limit exemption).
     if (this.dynamic) this.pushedAt = this.ctx.time.now;
     const t0 = performance.now();
@@ -1350,6 +1451,10 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const near = this.nearestSurface(c, 0.35);
     const contact = load.contactTargetId === this.id || (near !== null && near.dist < 0.3);
     let thickness = this.shape.thickness;
+    if (contact && near && this.jobCount > 0) {
+      this.flushFractures();
+      if (this.disposed || this.grid.totalSolid === 0) return;
+    }
     if (contact && near) {
       const nOut = load.normal ? this.toLocalDir(load.normal, new THREE.Vector3()).normalize() : near.normal;
       // Surface point under the charge along the normal.
@@ -1506,6 +1611,12 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       facing.divideScalar(d0);
       if (load.overpressureAt(near) < 15e3 || load.damageAt(near, facing, this.material, tRef, member) < 1) return this.shape.thickness;
     } else facing.set(0, 1, 0);
+    // A load that damages this element sees it as it ends up after any queued partial failure
+    // (rare: a second charge while a region of it is still being cut out).
+    if (this.jobCount > 0) {
+      this.flushFractures();
+      if (this.disposed || this.grid.totalSolid === 0) return this.shape.thickness;
+    }
     // Reach of the load: the distance out to which a face turned to the charge, at the same
     // reference thickness, still sees ≥ 15 kPa and a damage number ≥ 1 (both fall monotonically
     // with distance). Only patches inside that sphere can be realised, so the scan is bounded by
@@ -1774,12 +1885,17 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const budget = Math.max(1, Math.floor(this.ctx.physics.maxDynamicBodies * 0.85 - this.ctx.physics.dynamicCount));
     const n = Math.max(1, Math.min(budget, Math.min(PANEL_MAX_PIECES, Math.max(2, Math.round(area / PANEL_PIECE_AREA)))));
     const cellLen = Math.sqrt(area / n);
-    const cand = new Float64Array(cells.length * 3);
-    cells.forEach((cell, q) => {
+    // Seed candidates: every coarse cell of a small region, a strided sample of a whole wall
+    // (~150 k cells; ≤ 32 seeds are drawn, and the full list cost ~20 ms in the blast step).
+    const stride = Math.max(1, Math.floor(cells.length / 4096));
+    const nCand = Math.ceil(cells.length / stride);
+    const cand = new Float64Array(nCand * 3);
+    for (let q = 0; q < nCand; q++) {
+      const cell = cells[q * stride]!;
       const I = cell % conn.nx, J = Math.floor(cell / conn.nx) % conn.ny, K = Math.floor(cell / (conn.nx * conn.ny));
       cand[q * 3] = g.lx((I + 0.5) * F); cand[q * 3 + 1] = g.ly((J + 0.5) * F); cand[q * 3 + 2] = g.lz((K + 0.5) * F);
-    });
-    const seeds = pickSeeds(cand, cells.length, n, null, 0.6 * cellLen, this.ctx.rng);
+    }
+    const seeds = pickSeeds(cand, nCand, n, null, 0.6 * cellLen, this.ctx.rng);
     // Yield-line slabs run through the whole thickness: seeds on the mid-plane of the box, so the
     // bisector planes cut across it and never split it into layers.
     const ta = this.thicknessAxis();
@@ -1793,8 +1909,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       cells: { mask, F, nx: conn.nx, ny: conn.ny },
       test: () => 1,
     };
-    const pieces = splitSelection(g, sel, seeds, 0.5 * h, 0.12 * cellLen, this.eventSeed++);
-    this.refreshOccupancy();
+    const splitSeed = this.eventSeed++;
     // Velocity profile of the mechanism along the span: held edges from the anchors.
     const sa = this.spanAxis();
     const hs = this.shape.half[sa]!;
@@ -1811,7 +1926,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const nl = new THREE.Vector3(), wn = new THREE.Vector3(), wp = new THREE.Vector3();
     const rho = this.material.density;
     let vMax = 0;
-    const made = this.spawnPieces(pieces, (p, out) => {
+    const velocity = (p: Piece, out: THREE.Vector3) => {
       nl.set(0, 0, 0).setComponent(ta, c.getComponent(ta) >= p.seed[ta] ? 1 : -1);
       this.toWorld(p.seed[0], p.seed[1], p.seed[2], wp);
       this.toWorldDir(nl.x, nl.y, nl.z, wn);
@@ -1819,15 +1934,93 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       vMax = Math.max(vMax, v);
       // Away from the loaded face, fanning a little along the rays from the charge.
       out.copy(wp).sub(load.center).normalize().multiplyScalar(0.2).sub(wn).normalize().multiplyScalar(v);
-    }, barOwner, 0.3);
-    this.afterCut();
-    this.panelReleased = true;
-    this.stats.lastReleaseMs = performance.now() - t0;
+    };
+    // The failure is decided now; cutting the slabs and building their bodies (≈ 0.4 s of work
+    // for a 14 m chapel wall of 1.6 M samples, 32 slabs) is spread over the following steps.
     const wc = this.toWorld(g.lx(((min[0] + max[0] + 1) * F) / 2), g.ly(((min[1] + max[1] + 1) * F) / 2), g.lz(((min[2] + max[2] + 1) * F) / 2), new THREE.Vector3());
-    this.toWorldDir(ta === 0 ? 1 : 0, ta === 1 ? 1 : 0, ta === 2 ? 1 : 0, wn);
-    if (wn.dot(_v.copy(load.center).sub(wc)) > 0) wn.negate();
-    this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: wc, volume: vol, pieces: made, material: this.material, direction: wn.clone() });
-    this.ctx.fx.dust({ position: wc, velocity: wn.clone().multiplyScalar(Math.min(10, 0.5 * vMax)), radius: Math.max(1, Math.sqrt(area) * 0.6), amount: 5, color: this.material.dustColor });
+    const dir = this.toWorldDir(ta === 0 ? 1 : 0, ta === 1 ? 1 : 0, ta === 2 ? 1 : 0, new THREE.Vector3());
+    if (dir.dot(_v.copy(load.center).sub(wc)) > 0) dir.negate();
+    const self = this;
+    function* work(): FractureWork {
+      const made = yield* self.splitAndSpawn(sel, seeds, 0.5 * h, 0.12 * cellLen, splitSeed, velocity, barOwner, 0.3, MIN_PIECE_SIZE * 0.6);
+      self.stats.lastReleaseMs = performance.now() - t0;
+      self.ctx.events.emit('fracture', { time: self.ctx.time.now, position: wc, volume: vol, pieces: made, material: self.material, direction: dir });
+      self.ctx.fx.dust({ position: wc, velocity: dir.clone().multiplyScalar(Math.min(10, 0.5 * vMax)), radius: Math.max(1, Math.sqrt(area) * 0.6), amount: 5, color: self.material.dustColor });
+    }
+    // A whole panel is moving from this step on: its static collider goes now, while its
+    // (still standing) mesh waits for its slabs. Debris of neighbouring failures flying into a
+    // queued wall's collider of ~200 k voxels cost Rapier ~0.2–0.5 s per step (chapel, 12 kg).
+    if (whole) {
+      this.dropStaticCollider();
+      this.doomed = true;
+    }
+    this.queueFracture(work());
+    this.panelReleased = true;
+  }
+
+  /**
+   * Queue fracture work of this element (jobs.ts). Small jobs are run through at once by the
+   * caller's budget anyway; large ones peel pieces off over the following steps.
+   */
+  private queueFracture(work: FractureWork): void {
+    const self = this;
+    this.jobCount++;
+    function* counted(): FractureWork {
+      try {
+        yield* work;
+      } finally {
+        self.jobCount--;
+      }
+    }
+    this.fractures.push(this, counted());
+  }
+
+  /** Finish this element's queued fracture work now (a new blast must see its final state). */
+  private flushFractures(): void {
+    if (this.jobCount > 0) this.fractures.flush(this);
+  }
+
+  /**
+   * Split a coarse-cell selection into Voronoi pieces without touching the parent (samples are
+   * labelled), then commit and spawn the pieces one at a time: each piece's material leaves the
+   * parent (mesh, occupancy, collider) in the step its body appears, so the uncut remainder keeps
+   * standing in place meanwhile. Siblings share one spawn group (solver grace). Returns the bodies
+   * made; the parent's housekeeping (afterCut) and a support re-check follow.
+   */
+  private *splitAndSpawn(sel: Selection, seeds: number[], gap: number, warp: number, splitSeed: number, velocity: (p: Piece, out: THREE.Vector3) => void, barOwner: Int32Array | null, spin: number, minSize: number): Generator<number, number, void> {
+    const g = this.grid;
+    const out: SplitOutput = { pieces: [], labels: null, labelBox: null };
+    yield* splitSteps(g, sel, seeds, gap, warp, splitSeed, out, true);
+    // The failing region stops colliding as a whole before its pieces appear: a slab spawned
+    // next to still-colliding neighbours cost Rapier ~5 ms of convex-vs-voxel contacts per step
+    // and clearColliderUnderHull thousands of point projections.
+    yield* this.clearColliderLabelled(out);
+    const group = ++spawnEvents;
+    let made = 0;
+    for (const p of out.pieces) {
+      if (this.disposed) return made;
+      const n = clearPieceLabels(g, out, p.seedIndex);
+      // The static collider and occupancy lose this piece's material before it appears (with the
+      // collider gone, occupancy waits for afterCut).
+      if (this.voxelCollider) this.refreshOccupancy();
+      const k = this.spawnPieces([p], velocity, barOwner, spin, minSize, group);
+      made += k;
+      this.flushDirty();
+      yield (k ? PIECE_UNITS : 0) + (n >> 3) + p.grid.totalSolid;
+    }
+    if (this.disposed) return made;
+    if (g.totalSolid === 0 && !this.dynamic) {
+      // Nothing left (a whole panel): the element leaves the structure now; recounting its
+      // occupancy and clearing the leftover gap labels first was ~70 ms of wasted work.
+      out.labels = null;
+      this.fail('support-lost');
+      return made;
+    }
+    yield clearAllLabels(g, out) >> 3;
+    this.doomed = false;
+    this.afterCut();
+    this.afterMaterialLoss(true, 0.02);
+    return made;
   }
 
   private cylinderSelection(px: number, py: number, pz: number, a: THREE.Vector3, len: number, rad: number, lobe: number, seed: number): Selection {
@@ -2116,6 +2309,12 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   }
 
   private runStructuralCheck(): void {
+    // Material is still being cut out by a queued job: check once it is done (the job ends with
+    // afterMaterialLoss), not against a half-committed grid.
+    if (this.jobCount > 0) {
+      this.checkAt = this.ctx.time.now;
+      return;
+    }
     this.checkAt = -1;
     const t0 = performance.now();
     this.refreshOccupancy();
@@ -2134,7 +2333,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     });
     this.stats.lastCheckMs = performance.now() - t0;
     if (islands.length) this.release(islands);
-    if (!this.disposed && anchored && !this.checkCrushing()) this.checkOverturning();
+    if (!this.disposed && anchored && this.jobCount === 0 && !this.checkCrushing()) this.checkOverturning();
   }
 
   /**
@@ -2142,16 +2341,37 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
    * Voronoi chunks first (≈ one per 0.05 m³, at most 24 per event, seeds biased to the last hit).
    */
   private release(islands: Island[]): void {
+    // Small releases (chunks shot loose) happen at once; a slab or a wall that lost its supports
+    // is cut and spawned over the following steps (jobs.ts), the rest standing until its turn.
+    let samples = 0;
+    for (const island of islands) samples += island.samples;
+    // A loose piece keeps its old hull until it has been cut: its fragments would start inside it.
+    if (samples <= STEP_UNITS / 4 || this.dynamic) {
+      const it = this.releaseSteps(islands, false);
+      while (!it.next().done);
+      return;
+    }
+    // Everything left is released (a roof whose walls failed): as for a whole-panel failure,
+    // the static collider goes at once (see panelFailure).
+    if (samples >= this.grid.totalSolid) {
+      this.dropStaticCollider();
+      this.doomed = true;
+    }
+    this.queueFracture(this.releaseSteps(islands, true));
+  }
+
+  private *releaseSteps(islands: Island[], deferred: boolean): FractureWork {
     const t0 = performance.now();
     const g = this.grid, conn = this.conn, F = conn.F;
     const h3 = g.h * g.h * g.h;
     let totalVol = 0, totalPieces = 0;
     const budget = () => Math.max(0, this.ctx.physics.maxDynamicBodies * 0.85 - this.ctx.physics.dynamicCount);
-    const mask = new Uint8Array(conn.n);
+    const blast = this.pendingBlast && this.ctx.time.now <= this.pendingBlast.until ? this.pendingBlast : null;
     for (const island of islands) {
+      if (this.disposed) return;
       const vol = island.samples * h3;
       if (!vol) continue;
-      mask.fill(0);
+      const mask = new Uint8Array(conn.n);
       for (const cell of island.cells) mask[cell] = 1;
       const box: Selection['box'] = [
         island.min[0] * F, island.min[1] * F, island.min[2] * F,
@@ -2174,11 +2394,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       const seeds = n > 1 ? pickSeeds(cand, island.cells.length, n, [this.lastImpact.x, this.lastImpact.y, this.lastImpact.z], 0.55 * cellLen, this.ctx.rng) : [cand[0]!, cand[1]!, cand[2]!];
       // Rebar inside the island goes with the pieces.
       const barOwner = this.rebar ? this.assignBars(mask, seeds) : null;
-      const pieces = splitSelection(g, sel, seeds, n > 1 ? 0.5 * g.h : 0, n > 1 ? 0.25 * cellLen : 0, this.eventSeed++);
-      this.refreshOccupancy();
       totalVol += vol;
-      const blast = this.pendingBlast && this.ctx.time.now <= this.pendingBlast.until ? this.pendingBlast : null;
-      totalPieces += this.spawnPieces(pieces, (p, out) => {
+      const velocity = (p: Piece, out: THREE.Vector3) => {
         out.set(0, 0, 0);
         if (!blast) return;
         // Rigid-plastic launch speed of loosened material: v = i_r / (ρ t).
@@ -2189,8 +2406,16 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
         away.divideScalar(dist);
         const ir = blast.load.reflectedImpulseAt(_v, _s.copy(away).negate());
         out.copy(away).multiplyScalar(Math.min(60, ir / (this.material.density * Math.max(0.05, blast.thickness))));
-      }, barOwner, 0.4, blast ? MIN_PIECE_SIZE * 0.6 : RUBBLE_MIN_SIZE);
+      };
+      const gap = n > 1 ? 0.5 * g.h : 0, warp = n > 1 ? 0.25 * cellLen : 0, minSize = blast ? MIN_PIECE_SIZE * 0.6 : RUBBLE_MIN_SIZE;
+      if (deferred) totalPieces += yield* this.splitAndSpawn(sel, seeds, gap, warp, this.eventSeed++, velocity, barOwner, 0.4, minSize);
+      else {
+        const pieces = splitSelection(g, sel, seeds, gap, warp, this.eventSeed++);
+        this.refreshOccupancy();
+        totalPieces += this.spawnPieces(pieces, velocity, barOwner, 0.4, minSize);
+      }
     }
+    if (this.disposed) return;
     this.afterCut();
     this.stats.lastReleaseMs = performance.now() - t0;
     if (totalVol > 0) {
@@ -2245,7 +2470,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
    * Turn piece grids into rigid-body elements (or chips when small / over the body budget).
    * `velocity` gives each piece's initial world velocity. Returns the number of bodies made.
    */
-  private spawnPieces(pieces: Piece[], velocity: (p: Piece, out: THREE.Vector3) => void, barOwner: Int32Array | null, spin: number, minSize = MIN_PIECE_SIZE * 0.6): number {
+  private spawnPieces(pieces: Piece[], velocity: (p: Piece, out: THREE.Vector3) => void, barOwner: Int32Array | null, spin: number, minSize = MIN_PIECE_SIZE * 0.6, group = ++spawnEvents): number {
     let made = 0;
     const fx = this.ctx.fx;
     const phys = this.ctx.physics;
@@ -2255,7 +2480,6 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       inherit.set(lv.x, lv.y, lv.z);
       inheritW.set(av.x, av.y, av.z);
     }
-    const group = ++spawnEvents;
     for (const p of pieces) {
       const size = Math.cbrt(p.volume);
       const v = new THREE.Vector3();
@@ -2308,7 +2532,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
   }
 
   /** Split this whole (dynamic) piece into 2–4 fragments after a hard landing. */
-  private secondaryFracture(point: THREE.Vector3): void {
+  private *secondaryFracture(point: THREE.Vector3): FractureWork {
     const g = this.grid, conn = this.conn;
     this.refreshOccupancy();
     const cells: number[] = [];
@@ -2325,10 +2549,14 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       max = [Math.max(max[0], I), Math.max(max[1], J), Math.max(max[2], K)];
       samples += conn.count[c]!;
     }
-    this.releaseWhole({ cells, samples, min, max }, n);
+    yield* this.releaseWhole({ cells, samples, min, max }, n);
   }
 
-  private releaseWhole(island: Island, n: number): void {
+  /**
+   * Break this whole (dynamic) piece into n fragments: the split runs over steps on the piece's
+   * own grid (its mesh and hull stand in meanwhile), then all fragments replace it at once.
+   */
+  private *releaseWhole(island: Island, n: number): FractureWork {
     const g = this.grid, conn = this.conn, F = conn.F;
     const mask = new Uint8Array(conn.n);
     for (const c of island.cells) mask[c] = 1;
@@ -2347,10 +2575,15 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     const cellLen = Math.cbrt(vol / n);
     const seeds = pickSeeds(cand, island.cells.length, n, [this.lastImpact.x, this.lastImpact.y, this.lastImpact.z], 0.5 * cellLen, this.ctx.rng);
     const barOwner = this.rebar ? this.assignBars(mask, seeds) : null;
-    const pieces = splitSelection(g, sel, seeds, 0.5 * g.h, 0.25 * cellLen, this.eventSeed++);
-    const made = this.spawnPieces(pieces, (_p, out) => out.set(0, 0, 0), barOwner, 0.8, RUBBLE_MIN_SIZE);
+    const out: SplitOutput = { pieces: [], labels: null, labelBox: null };
+    yield* splitSteps(g, sel, seeds, 0.5 * g.h, 0.25 * cellLen, this.eventSeed++, out, false);
+    if (this.disposed) return;
+    const pieces = out.pieces;
+    const made = this.spawnPieces(pieces, (_p, o) => o.set(0, 0, 0), barOwner, 0.8, RUBBLE_MIN_SIZE);
+    // The fragments replace this body in the same step (they start inside its hull).
     this.ctx.events.emit('fracture', { time: this.ctx.time.now, position: this.bounds.getCenter(new THREE.Vector3()), volume: vol, pieces: made, material: this.material });
     this.fail('severed');
+    yield made * PIECE_UNITS;
   }
 
   /**
@@ -2561,6 +2794,8 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
 
   fixedUpdate(dt: number): void {
     if (this.disposed) return;
+    this.fractures.tick(this.ctx.time.now);
+    if (this.disposed) return;
     if (this.dynamic) {
       this.syncFromBody();
       if (this.body) {
@@ -2578,11 +2813,12 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
       if (this.pendingSplit) {
         const pt = this.pendingSplit.point;
         this.pendingSplit = null;
-        this.secondaryFracture(pt);
-        return;
+        // Queued with every other fracture: a pile of slabs landing in one step splits over
+        // the following steps instead of in one (measured up to 0.8 s for one step).
+        if (this.jobCount === 0) this.queueFracture(this.secondaryFracture(pt));
       }
     }
-    if (this.checkAt >= 0 && this.ctx.time.now >= this.checkAt) this.runStructuralCheck();
+    if (this.checkAt >= 0 && this.ctx.time.now >= this.checkAt && this.jobCount === 0) this.runStructuralCheck();
   }
 
   frameUpdate(_dt: number): void {
@@ -2652,6 +2888,7 @@ export class VoxelElement implements Destructible, Structural, RemeshClient, Bat
     this.body = this.fixedBody = null;
     this.voxelCollider = null;
     this.scheduler.forget(this);
+    this.fractures.forget(this);
   }
 }
 

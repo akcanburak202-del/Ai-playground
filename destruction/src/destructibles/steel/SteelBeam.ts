@@ -340,6 +340,8 @@ export class SteelBeam implements Destructible, Structural {
       }
       if (best >= 0) {
         s.anchorNode(best);
+        // It rests there: lifts off, or is pushed off its seat, when the seat cannot hold it (BeamSim.checkSeat).
+        s.setSeat(best);
         nodes.push(best);
         this.pins.set(best, regionWorld.clone());
       }
@@ -434,6 +436,23 @@ export class SteelBeam implements Destructible, Structural {
     this.wake();
   }
 
+  /**
+   * Does the member still lie over bearing `box` (plan view) anywhere between seat node i and its
+   * nearer end? Samples the axis polyline, so a bearing narrower than the node spacing still counts.
+   */
+  private onSeat(i: number, box: THREE.Box3): boolean {
+    const s = this.sim, e = i < s.n / 2 ? 0 : s.n - 1, m = 0.02;
+    const k0 = Math.min(i, e), k1 = Math.max(i, e);
+    for (let k = k0; k <= k1; k++) {
+      for (let q = 0; q < (k < k1 ? 6 : 1); q++) {
+        const f = q / 6, j = Math.min(k + 1, k1);
+        const x = s.x[3 * k]! + f * (s.x[3 * j]! - s.x[3 * k]!), z = s.x[3 * k + 2]! + f * (s.x[3 * j + 2]! - s.x[3 * k + 2]!);
+        if (x >= box.min.x - m && x <= box.max.x + m && z >= box.min.z - m && z <= box.max.z + m) return true;
+      }
+    }
+    return false;
+  }
+
   supportPresence(regionWorld: THREE.Box3): number {
     if (this.failed || this.disposed || this.mode === 'rigid') return 0;
     const box = regionWorld.clone().expandByScalar(Math.max(this.section.cy, this.section.cz));
@@ -507,10 +526,24 @@ export class SteelBeam implements Destructible, Structural {
     this.stats.substeps = st.substeps;
     this.version++;
     if (this.movedSinceMesh(MESH_TOL)) this.dirtyMesh = true;
+    let seatLost = false;
     for (const e of this.sim.events.splice(0)) {
       const i = e.node;
       _v.set(this.sim.x[3 * i]!, this.sim.x[3 * i + 1]!, this.sim.x[3 * i + 2]!);
       if (e.type === 'connection') this.ctx.fx.sparks({ position: _v.clone(), direction: new THREE.Vector3(0, 1, 0), count: 20, speed: 8, hot: 0.5 });
+      if (e.type === 'seat') seatLost = true;
+    }
+    // A member that slid along its seats (it bowed, its chord shortened) until its end no longer
+    // lies over a pier has come off that pier.
+    for (const [i, box] of this.pins) {
+      if (!this.sim.seats.has(i) || this.onSeat(i, box)) continue;
+      this.sim.releaseNode(i);
+      seatLost = true;
+    }
+    if (seatLost) {
+      // A seat let go (lift-off, or pushed off it): what is left resting on one pier tips off it.
+      for (const i of [...this.pins.keys()]) if (!this.sim.locked[i]) this.pins.delete(i);
+      this.checkBalance();
     }
     this.checkFailure();
     if (this.disposed) return;
@@ -1108,6 +1141,12 @@ export class SteelBeam implements Destructible, Structural {
     // Drawn dish: the plate cannot pass through the far side of the section.
     patch.dent.R = patch.R;
     patch.dent.depth = Math.min(patch.dish, 0.45 * Math.min(2 * this.section.cy, 2 * this.section.cz));
+    // The hinge line at the rim cracks the paint / scale (read even in shade); stronger as the rim
+    // turns sharper (rim slope 2δ/R of the parabolic dish).
+    if (patch.dish > 0.002) {
+      const L = this.detailLength(), per = this.outline.perimeter;
+      this.detail.crease(this.perimeterAt(patch.y, patch.z), patch.s / L, patch.R / per, patch.R / L, Math.min(1, (3 * patch.dish) / patch.R), patch.s * 37 + patch.plate);
+    }
     this.stats.maxDish = Math.max(this.stats.maxDish, patch.dish);
     this.pruneDents();
     this.dirtyMesh = true;
