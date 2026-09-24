@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 import { Reflector } from 'three/addons/objects/Reflector.js';
-import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { SimContext } from '../app/contracts.ts';
 import { Rng } from '../core/rng.ts';
 import { Noise3 } from '../core/noise.ts';
+import { TREE_HEIGHT, TREE_KINDS, treeGeometry } from './flora.ts';
 
 /**
  * Non-destructible scene dressing: reflecting-pool water, a distant tree line, painted signs and
@@ -62,12 +63,14 @@ export class Decor {
       m.rotation.x = -Math.PI / 2;
       return m;
     }
+    // Half the drawing buffer, 4× MSAA: the pool edges and columns mirrored at grazing angles stair-
+    // step visibly without it, and multisampling a quarter-size target costs little.
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
     const tw = Math.max(256, Math.min(1024, Math.round(size.x * 0.5)));
     const th = Math.max(256, Math.min(1024, Math.round(size.y * 0.5)));
     const normals = this.track(rippleTexture());
     const mirror = new Reflector(this.track(geo), {
-      textureWidth: tw, textureHeight: th, clipBias: 0.002, multisample: 0, color: o.deep ?? 0x0b1110, shader: WATER_SHADER,
+      textureWidth: tw, textureHeight: th, clipBias: 0.002, multisample: 4, color: o.deep ?? 0x0b1110, shader: WATER_SHADER,
     });
     this.track(mirror);
     const u = (mirror.material as THREE.ShaderMaterial).uniforms;
@@ -88,65 +91,144 @@ export class Decor {
   }
 
   /**
-   * A distant tree line in a ring around the site: Italian cypresses, umbrella pines and rounded
-   * broadleaves (olive / holm oak), instanced and unshadowed (beyond the shadow range anyway).
+   * Distant planting: groves of Italian cypress, stone pine and olive / holm oak scattered in a
+   * ring (or a rectangle) around the site, plus optional straight cypress alleys. Instanced (two
+   * variants per species), unshadowed — it stands beyond the sun-shadow range — and hazed by the
+   * pipeline's aerial perspective like any geometry.
    */
   trees(o: {
-    center?: [number, number]; inner?: number; outer?: number; count: number; seed?: number; mix?: [number, number, number]; gaps?: [number, number][];
+    center?: [number, number]; inner?: number; outer?: number; count: number; seed?: number;
+    /** Share of cypress, stone pine, olive */
+    mix?: [number, number, number];
+    /** Angular sectors [from, to] (rad, from +x towards +z) left unplanted, to keep views open */
+    gaps?: [number, number][];
     /** Plant in this rectangle [x0, z0, x1, z1] instead of the ring */
     rect?: [number, number, number, number];
+    /** Number of groves the trees gather in (0: scattered evenly) */
+    groves?: number;
+    /** Spread of a grove, m */
+    groveRadius?: number;
+    /** Straight rows of cypress: [x0, z0, x1, z1, spacing] */
+    alleys?: [number, number, number, number, number][];
     /** Height multiplier */
     scale?: number;
   }): void {
     const rng = new Rng(o.seed ?? 7);
     const [cx, cz] = o.center ?? [0, 0];
-    const mix = o.mix ?? [0.45, 0.25, 0.3];
-    const kinds = [cypressGeometry(), pineGeometry(), broadleafGeometry()];
-    const mats = kinds.map(() => this.track(new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0, vertexColors: true })));
-    const lists: THREE.Matrix4[][] = [[], [], []];
-    const tints: THREE.Color[][] = [[], [], []];
-    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
-    const base = [new THREE.Color(0x26331c), new THREE.Color(0x323d22), new THREE.Color(0x4a5234)];
-    for (let i = 0; i < o.count; i++) {
+    const mix = o.mix ?? [0.4, 0.35, 0.25];
+    const inner = o.inner ?? 100, outer = o.outer ?? 250;
+    const place = (out: THREE.Vector3): boolean => {
       if (o.rect) {
         const [x0, z0, x1, z1] = o.rect;
-        p.set(rng.range(x0, x1), -0.1, rng.range(z0, z1));
-      } else {
-        const a = rng.range(0, Math.PI * 2);
-        if (o.gaps?.some(([g0, g1]) => angleIn(a, g0, g1))) continue;
-        const inner = o.inner ?? 100, outer = o.outer ?? 250;
-        const r = Math.sqrt(rng.range(inner * inner, outer * outer));
-        p.set(cx + r * Math.cos(a), -0.1, cz + r * Math.sin(a));
+        out.set(rng.range(x0, x1), 0, rng.range(z0, z1));
+        return true;
       }
-      const u = rng.next();
-      const k = u < mix[0] ? 0 : u < mix[0] + mix[1] ? 1 : 2;
-      const h = (k === 0 ? rng.range(9, 15) : k === 1 ? rng.range(8, 13) : rng.range(5, 8)) * (o.scale ?? 1);
-      q.setFromAxisAngle(UP, rng.range(0, Math.PI * 2));
-      const wide = k === 0 ? rng.range(0.85, 1.15) : rng.range(0.8, 1.25);
-      s.set(h * wide, h, h * wide);
-      lists[k]!.push(m.compose(p, q, s).clone());
-      tints[k]!.push(base[k]!.clone().multiplyScalar(rng.range(0.8, 1.15)));
+      const a = rng.range(0, Math.PI * 2);
+      if (o.gaps?.some(([g0, g1]) => angleIn(a, g0, g1))) return false;
+      const r = Math.sqrt(rng.range(inner * inner, outer * outer));
+      out.set(cx + r * Math.cos(a), 0, cz + r * Math.sin(a));
+      return true;
+    };
+    const groves: THREE.Vector3[] = [];
+    for (let g = 0, tries = 0; g < (o.groves ?? 0) && tries < 500; tries++) {
+      const p = new THREE.Vector3();
+      if (place(p)) {
+        groves.push(p);
+        g++;
+      }
     }
-    kinds.forEach((geo, k) => {
-      const list = lists[k]!;
-      if (!list.length) {
-        geo.dispose();
-        return;
+    const lists: THREE.Matrix4[][] = TREE_KINDS.flatMap(() => [[], []]);
+    const tints: THREE.Color[][] = TREE_KINDS.flatMap(() => [[], []]);
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
+    const plant = (kind: number, at: THREE.Vector3) => {
+      const [h0, h1] = TREE_HEIGHT[TREE_KINDS[kind]!];
+      const h = rng.range(h0, h1) * (o.scale ?? 1);
+      q.setFromAxisAngle(UP, rng.range(0, Math.PI * 2));
+      const wide = rng.range(0.85, 1.15);
+      s.set(h * wide, h, h * wide);
+      const slot = 2 * kind + (rng.next() < 0.5 ? 0 : 1);
+      lists[slot]!.push(m.compose(at.clone().setY(-0.15), q, s).clone());
+      tints[slot]!.push(new THREE.Color().setScalar(rng.range(0.82, 1.12)));
+    };
+    for (let i = 0; i < o.count; i++) {
+      const u = rng.next();
+      const kind = u < mix[0] ? 0 : u < mix[0] + mix[1] ? 1 : 2;
+      if (groves.length) {
+        const g = groves[rng.int(0, groves.length)]!;
+        const r = o.groveRadius ?? 14;
+        p.set(g.x + rng.gaussian(0, r), 0, g.z + rng.gaussian(0, r));
+        if (!o.rect && Math.hypot(p.x - cx, p.z - cz) < inner * 0.9) continue;
+      } else if (!place(p)) continue;
+      plant(kind, p);
+    }
+    for (const [x0, z0, x1, z1, spacing] of o.alleys ?? []) {
+      const len = Math.hypot(x1 - x0, z1 - z0);
+      const n = Math.max(2, Math.round(len / spacing) + 1);
+      for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        plant(0, p.set(x0 + t * (x1 - x0) + rng.range(-0.3, 0.3), 0, z0 + t * (z1 - z0) + rng.range(-0.3, 0.3)));
       }
-      const im = new THREE.InstancedMesh(this.track(geo), mats[k]!, list.length);
+    }
+    const mat = this.track(new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0, vertexColors: true, envMapIntensity: 0.7 }));
+    lists.forEach((list, slot) => {
+      if (!list.length) return;
+      const geo = this.track(treeGeometry(TREE_KINDS[slot >> 1]!, slot & 1));
+      const im = new THREE.InstancedMesh(geo, mat, list.length);
       list.forEach((mm, i) => {
         im.setMatrixAt(i, mm);
-        im.setColorAt(i, tints[k]![i]!);
+        im.setColorAt(i, tints[slot]![i]!);
       });
       im.instanceMatrix.needsUpdate = true;
       if (im.instanceColor) im.instanceColor.needsUpdate = true;
       im.castShadow = false;
       im.receiveShadow = false;
-      im.frustumCulled = false;
+      im.computeBoundingSphere();
       im.name = 'trees';
       this.track({ dispose: () => im.dispose() });
       this.group.add(im);
     });
+  }
+
+  /**
+   * A low range of hills on the horizon, `radius` away: a ring whose crest follows fractal noise
+   * between `height[0]` and `height[1]`, dressed in dark scrub green. At that distance the
+   * pipeline's aerial perspective turns it into the blue-grey silhouette of a real horizon, which
+   * gives the golden-hour sky something to sit on.
+   */
+  ridge(o: { radius: number; height: [number, number]; seed?: number; color?: number; center?: [number, number] }): void {
+    const n = new Noise3(o.seed ?? 5);
+    const seg = 720;
+    const [cx, cz] = o.center ?? [0, 0];
+    const pos = new Float32Array((seg + 1) * 3 * 3);
+    const col = new Float32Array((seg + 1) * 3 * 3);
+    const base = new THREE.Color(o.color ?? 0x3d4431), foot = base.clone().multiplyScalar(0.7);
+    const idx: number[] = [];
+    for (let i = 0; i <= seg; i++) {
+      const a = (i / seg) * Math.PI * 2;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      // Periodic noise: sample on a circle so the crest closes seamlessly.
+      const u = 0.5 + 0.5 * n.fbm(ca * 3.1, sa * 3.1, 0.37, 5, 2.1, 0.55);
+      const h = o.height[0] + (o.height[1] - o.height[0]) * Math.pow(Math.min(1, Math.max(0, u)), 1.4);
+      const r0 = o.radius * 0.93, r1 = o.radius, r2 = o.radius * 1.02;
+      const ring: [number, number, number][] = [[r0, -2, 0], [r1, h * 0.55, 1], [r2, h, 2]];
+      ring.forEach(([r, y, k]) => {
+        const j = (i * 3 + k) * 3;
+        pos[j] = cx + ca * r; pos[j + 1] = y; pos[j + 2] = cz + sa * r;
+        (k === 0 ? foot : base).toArray(col, j);
+      });
+      if (i < seg) for (const k of [0, 1]) {
+        const a0 = i * 3 + k, b0 = (i + 1) * 3 + k;
+        idx.push(a0, b0, a0 + 1, b0, b0 + 1, a0 + 1);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    const mesh = this.mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, side: THREE.DoubleSide }), ORIGIN, 0, false);
+    mesh.name = 'ridge';
+    mesh.frustumCulled = false;
   }
 
   /**
@@ -273,20 +355,40 @@ export interface SignSpec {
 function paintSign(g: CanvasRenderingContext2D, x0: number, y0: number, px: number, py: number, o: SignSpec): void {
   g.save();
   g.translate(x0, y0);
-  g.fillStyle = o.paper ?? '#dcd6c8';
-  g.fillRect(0, 0, px, py);
-  // Weathering: faint mottling and a darker lower edge, so the board is not a flat decal.
+  // Weathered paper: faint mottling, built at 1/8 resolution in memory and drawn stretched (the
+  // noise varies over ~60 px), then a darker lower edge. No getImageData: reading a GPU-backed
+  // canvas back stalls on every board (it cost the range's fifteen boards over a second).
+  const paper = parseInt((o.paper ?? '#dcd6c8').slice(1), 16);
+  const pr = (paper >> 16) & 255, pg = (paper >> 8) & 255, pb = paper & 255;
   const n = new Noise3(o.lines.join('').length * 17 + 3);
-  const img = g.getImageData(x0, y0, px, py);
-  for (let y = 0; y < py; y++)
-    for (let x = 0; x < px; x++) {
-      const k = 4 * (y * px + x);
-      const v = 1 + 0.04 * n.fbm(x / 60, y / 60, 0.5, 3) - 0.07 * Math.pow(y / py, 5);
-      img.data[k] = img.data[k]! * v;
-      img.data[k + 1] = img.data[k + 1]! * v;
-      img.data[k + 2] = img.data[k + 2]! * v;
-    }
-  g.putImageData(img, x0, y0);
+  const lw = Math.ceil(px / 8), lh = Math.ceil(py / 8);
+  const mottle = document.createElement('canvas');
+  mottle.width = lw;
+  mottle.height = lh;
+  const sg = mottle.getContext('2d');
+  if (sg) {
+    const img = sg.createImageData(lw, lh);
+    for (let y = 0; y < lh; y++)
+      for (let x = 0; x < lw; x++) {
+        const v = 1 + 0.04 * n.fbm((x * 8) / 60, (y * 8) / 60, 0.5, 3);
+        const k = 4 * (y * lw + x);
+        img.data[k] = pr * v;
+        img.data[k + 1] = pg * v;
+        img.data[k + 2] = pb * v;
+        img.data[k + 3] = 255;
+      }
+    sg.putImageData(img, 0, 0);
+    g.imageSmoothingEnabled = true;
+    g.drawImage(mottle, 0, 0, px, py);
+  } else {
+    g.fillStyle = o.paper ?? '#dcd6c8';
+    g.fillRect(0, 0, px, py);
+  }
+  const edge = g.createLinearGradient(0, 0, 0, py);
+  edge.addColorStop(0.55, 'rgba(0,0,0,0)');
+  edge.addColorStop(1, 'rgba(0,0,0,0.07)');
+  g.fillStyle = edge;
+  g.fillRect(0, 0, px, py);
   g.fillStyle = o.accent ?? '#a8432b';
   g.fillRect(0, 0, px, Math.round(py * 0.07));
   g.fillStyle = o.ink ?? '#1f1d1a';
@@ -313,102 +415,6 @@ function angleIn(a: number, a0: number, a1: number): boolean {
   const t = (x: number) => ((x % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
   const x = t(a), lo = t(a0), hi = t(a1);
   return lo <= hi ? x >= lo && x <= hi : x >= lo || x <= hi;
-}
-
-/** Colour a geometry's vertices: darker towards the base and inside the crown (fake occlusion). */
-function shade(g: THREE.BufferGeometry, base: number, top: number, trunkBelow = -1): THREE.BufferGeometry {
-  const pos = g.getAttribute('position') as THREE.BufferAttribute;
-  const col = new Float32Array(pos.count * 3);
-  const trunk = new THREE.Color(0x3a2e24);
-  for (let i = 0; i < pos.count; i++) {
-    const y = pos.getY(i);
-    const t = Math.min(1, Math.max(0, (y - base) / (top - base)));
-    const v = y < trunkBelow ? 0 : 0.55 + 0.45 * Math.pow(t, 0.7);
-    if (y < trunkBelow) {
-      col[3 * i] = trunk.r;
-      col[3 * i + 1] = trunk.g;
-      col[3 * i + 2] = trunk.b;
-    } else col.fill(v, 3 * i, 3 * i + 3);
-  }
-  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  return g;
-}
-
-/** Lumpy displacement so crowns are not perfect solids of revolution. */
-function lumpy(g: THREE.BufferGeometry, amp: number, freq: number, seed: number): THREE.BufferGeometry {
-  const n = new Noise3(seed);
-  const pos = g.getAttribute('position') as THREE.BufferAttribute;
-  const v = new THREE.Vector3();
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    const r = Math.hypot(v.x, v.z);
-    if (r < 1e-4) continue;
-    const k = 1 + amp * n.fbm(v.x * freq, v.y * freq, v.z * freq, 3);
-    pos.setXYZ(i, v.x * k, v.y, v.z * k);
-  }
-  g.computeVertexNormals();
-  return g;
-}
-
-/** Unit-height Italian cypress: a slender flame on a short trunk. */
-function cypressGeometry(): THREE.BufferGeometry {
-  const pts: THREE.Vector2[] = [];
-  for (let i = 0; i <= 14; i++) {
-    const t = i / 14;
-    const y = 0.06 + t * 0.94;
-    const r = 0.1 * Math.pow(Math.sin(Math.PI * Math.min(1, t * 1.15 + 0.02)), 0.8) * (1 - 0.35 * t);
-    pts.push(new THREE.Vector2(Math.max(0.004, r), y));
-  }
-  pts.unshift(new THREE.Vector2(0.012, 0), new THREE.Vector2(0.012, 0.06));
-  const g = lumpy(new THREE.LatheGeometry(pts, 14), 0.3, 16, 11);
-  return shade(g, 0.05, 1, 0.055);
-}
-
-/**
- * A crown built from several noisy blobs (so it breaks up into masses of foliage instead of one
- * smooth solid) on a thin trunk. Unit height; `blobs` are [x, y, z, radius, flatten].
- */
-function crownGeometry(trunkTop: number, trunkR: number, blobs: [number, number, number, number, number][], seed: number): THREE.BufferGeometry {
-  const parts: THREE.BufferGeometry[] = [];
-  const trunk = new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkTop, 6, 1, true).translate(0, trunkTop / 2, 0);
-  trunk.deleteAttribute('uv');
-  parts.push(trunk);
-  const n = new Noise3(seed);
-  const v = new THREE.Vector3();
-  blobs.forEach(([x, y, z, r, flat], i) => {
-    // Welded icosphere, so the displaced crown shades smoothly (a polyhedron is non-indexed).
-    const ico = new THREE.IcosahedronGeometry(r, 1);
-    ico.deleteAttribute('uv');
-    ico.deleteAttribute('normal');
-    const b = mergeVertices(ico, 1e-5);
-    ico.dispose();
-    const pos = b.getAttribute('position') as THREE.BufferAttribute;
-    for (let k = 0; k < pos.count; k++) {
-      v.fromBufferAttribute(pos, k);
-      const d = 1 + 0.3 * n.fbm(v.x * 7 + i * 3.1, v.y * 7, v.z * 7, 3);
-      pos.setXYZ(k, x + v.x * d, y + v.y * d * flat, z + v.z * d);
-    }
-    b.computeVertexNormals();
-    parts.push(b);
-  });
-  trunk.computeVertexNormals();
-  const merged = mergeGeometries(parts, false)!;
-  for (const p of parts) p.dispose();
-  return shade(merged, trunkTop, 1, trunkTop * 0.98);
-}
-
-/** Unit-height umbrella (stone) pine: a bare trunk and a flat, wide crown of several masses. */
-function pineGeometry(): THREE.BufferGeometry {
-  return crownGeometry(0.66, 0.022, [
-    [0, 0.8, 0, 0.26, 0.42], [0.2, 0.77, 0.08, 0.2, 0.45], [-0.19, 0.78, -0.06, 0.21, 0.42], [0.05, 0.8, -0.2, 0.19, 0.45], [-0.04, 0.79, 0.2, 0.18, 0.45],
-  ], 23);
-}
-
-/** Unit-height rounded broadleaf (olive, holm oak): an irregular crown of a few masses. */
-function broadleafGeometry(): THREE.BufferGeometry {
-  return crownGeometry(0.34, 0.03, [
-    [0, 0.66, 0, 0.3, 0.9], [0.18, 0.56, 0.1, 0.22, 0.85], [-0.17, 0.58, -0.08, 0.23, 0.85], [0.05, 0.8, -0.05, 0.2, 0.9], [-0.06, 0.52, 0.2, 0.2, 0.8],
-  ], 37);
 }
 
 /** Tileable ripple normal map: a few long-crested waves with integer wave numbers. */

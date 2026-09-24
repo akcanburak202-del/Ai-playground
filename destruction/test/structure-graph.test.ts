@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
-import { StructureGraph, PRESENCE_MIN, delay, type GraphHost } from '../src/structure/StructureGraph.ts';
+import { StructureGraph, PRESENCE_MIN, delay, isSplice, type GraphHost } from '../src/structure/StructureGraph.ts';
 import type { Destructible, DestructibleKind, RayHit, Structural } from '../src/destructibles/Destructible.ts';
 import { MATERIALS } from '../src/physics/materials.ts';
 import type { SimEvents, StructuralFailureEvent } from '../src/app/contracts.ts';
@@ -301,7 +301,15 @@ test('a steel member that sags away from what it carries lets go of it', () => {
   const g = new StructureGraph(h);
   // A beam whose top surface follows `top(x)`; it keeps all its material (presence stays 1).
   class SaggingBeam extends MockEl {
-    sag = 0;
+    private dip = 0;
+    /** Vertical drop of the free end, m; the bounds follow, as the contract asks of real elements */
+    get sag(): number {
+      return this.dip;
+    }
+    set sag(v: number) {
+      this.dip = v;
+      this.bounds.min.y = 2.6 - v;
+    }
     override raycast(o: THREE.Vector3, d: THREE.Vector3, maxDist: number): RayHit | null {
       if (d.y > -0.99) return null;
       const t = (o.x + 3) / 6; // 0 at the fixed end, 1 at the free end
@@ -328,4 +336,51 @@ test('a steel member that sags away from what it carries lets go of it', () => {
   assert.equal(slab.released.length, 1, 'the sagged beam lets the slab go');
   assert.equal(slab.failed, false, 'the slab still has its wall');
   assert.equal(beam.presenceCalls > 0, true);
+});
+
+test('a spliced column stack follows the cut storey almost at once', () => {
+  const h = host();
+  const g = new StructureGraph(h);
+  // Four storeys of an HEB column, each 3.6 m, spliced at the floors.
+  const cols = [0, 1, 2, 3].map((k) => new MockEl(h, `col ${k}`, [-0.1, k * 3.6, -0.1], [0.1, (k + 1) * 3.6, 0.1], 2.2e3, 'beam'));
+  g.link('ground', cols[0]!, base(cols[0]!));
+  for (let k = 1; k < 4; k++) {
+    const y = k * 3.6;
+    g.link(cols[k - 1]!, cols[k]!, new THREE.Box3(new THREE.Vector3(-0.15, y - 0.3, -0.15), new THREE.Vector3(0.15, y + 0.1, 0.15)));
+  }
+  assert.ok(isSplice(cols[0]!, cols[1]!));
+  // A slab resting on steel is not a splice: it keeps the steel bearing delay.
+  const slab = new MockEl(h, 'slab', [-3, 14.4, -3], [3, 14.6, 3], 50e3);
+  assert.equal(isSplice(cols[3]!, slab), false);
+  g.link(cols[3]!, slab, top(cols[3]!, slab));
+  run(g, h, 0.1);
+  const t0 = h.time.now;
+  cols[0]!.failed = true; // severed by a charge
+  run(g, h, 1);
+  const at = cols.slice(1).map((c) => c.released[0]!.time - t0);
+  // √(2·5 mm / g) = 32 ms ± 15 % per splice, to within a step: the top storey goes ~0.1 s after
+  // the cut, not ~0.3 s (which would open a 1 m gap at every splice within a second of falling).
+  for (let k = 0; k < at.length; k++) {
+    const per = k === 0 ? at[0]! : at[k]! - at[k - 1]!;
+    assert.ok(per >= 0.025 && per <= 0.037 + 1 / 60, `splice ${k + 1} after ${per.toFixed(3)} s`);
+  }
+  const tSlab = slab.released[0]!.time - t0;
+  assert.ok(tSlab - at[2]! >= 0.08, `the slab bears on steel: ${(tSlab - at[2]!).toFixed(3)} s`);
+});
+
+test('glazing lets go one pane per step (a pane breaks on the spot)', () => {
+  const h = host();
+  const g = new StructureGraph(h);
+  const slab = new MockEl(h, 'slab', [-5, 3, -1], [5, 3.2, 1], 50e3);
+  g.link('ground', slab, base(slab));
+  const panes = [0, 1, 2, 3, 4].map((i) => new MockEl(h, `pane ${i}`, [-5 + 2 * i, 0.1, 0.9], [-3.1 + 2 * i, 2.9, 0.92], 1e3, 'glass'));
+  for (const p of panes) g.link(slab, p, new THREE.Box3(new THREE.Vector3(p.bounds.min.x, 2.8, 0.85), new THREE.Vector3(p.bounds.max.x, 3.05, 1)));
+  run(g, h, 0.1);
+  const t0 = h.time.now;
+  slab.disposed = true;
+  g.remove(slab);
+  run(g, h, 0.5);
+  const times = panes.map((p) => p.released[0]!.time);
+  assert.equal(new Set(times.map((t) => t.toFixed(6))).size, 5, 'no two panes in the same step');
+  assert.ok(Math.max(...times) - t0 < 0.05 + 5 / 60 + 1e-9, 'all gone within the glazing delay plus a step each');
 });

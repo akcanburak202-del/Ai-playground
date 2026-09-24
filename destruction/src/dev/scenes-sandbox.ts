@@ -13,7 +13,8 @@ import { installAudio } from '../audio/index.ts';
 import { installPlayer } from '../player/index.ts';
 import { installHud } from '../ui/index.ts';
 import { installStructure, type StructureGraph } from '../structure/index.ts';
-import { SCENES, sceneById, Site } from '../scenes/index.ts';
+import { SCENES, SCENE_LOOKS, sceneById, Site } from '../scenes/index.ts';
+import { applyLookAfterLoad, applyLookBeforeLoad } from '../scenes/look.ts';
 
 /**
  * The architecture scenes with everything wired — effectively the app: production pipeline,
@@ -118,9 +119,10 @@ const chargeSystem: System = {
 
 const timing = { scene: '', buildMs: 0, loadMs: 0, firstFrameMs: 0, parts: {} as Record<string, number> };
 
+const pipeline = new Pipeline({ quality });
 const kit = await createSandbox({
   title: 'Destruction — scenes',
-  pipeline: new Pipeline({ quality }),
+  pipeline,
   camera: { position: [0, 1.7, 12], lookAt: [0, 1.5, 0] },
   install(sim) {
     sim.factories = createElementFactories(sim.ctx);
@@ -157,7 +159,9 @@ async function load(id: string): Promise<typeof timing> {
     },
   };
   const t0 = performance.now();
+  applyLookBeforeLoad(pipeline, SCENE_LOOKS[id]);
   await sim.loadScene(timed);
+  applyLookAfterLoad(ctx, SCENE_LOOKS[id]);
   timing.scene = id;
   timing.loadMs = Math.round(performance.now() - t0);
   timing.buildMs = Math.round(buildMs);

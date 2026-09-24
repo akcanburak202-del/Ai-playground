@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import type { BeamProfile, SceneDef } from '../app/contracts.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import { createTerrain } from '../destructibles/terrain/index.ts';
-import { REBAR, Site } from './kit.ts';
+import type { SceneLook } from './look.ts';
+import { COLLAPSE_BUDGET, REBAR, Site } from './kit.ts';
 
 /**
  * Barselona Pavyonu — after Ludwig Mies van der Rohe's German Pavilion (Barcelona, 1929). A
@@ -30,24 +31,38 @@ const CRUCIFORM: BeamProfile = { type: 'cruciform', arm: 0.09, t: 0.02 };
 const MULLION: BeamProfile = { type: 'box', h: 0.1, b: 0.05, t: 0.004 };
 const TINOS = 0x6f9a80;
 
+/**
+ * Golden-hour photography settings (see look.ts). More sky light than the other scenes: the
+ * white soffit of the roof sees only what bounces off the travertine, which the environment map
+ * (a dark ground hemisphere) does not carry; at the default 0.55 it went nearly black. No glass
+ * reflection probes: during a roof collapse the glass module recaptured every probe on every
+ * frame (19.6 s of glass frame time over 4 s of collapse, measured; see look.ts).
+ */
+export const pavilionLook: SceneLook = { sky: { turbidity: 3.2, rayleigh: 1.8 }, exposure: 1.0, ambient: 0.8, fov: 55, visibility: 7000, glassProbes: false };
+
 export const pavilion: SceneDef = {
   id: 'pavilion',
   name: 'Barcelona Pavilion',
   nameTr: 'Barselona Pavyonu',
   blurb: 'After Mies van der Rohe (Barcelona, 1929): travertine podium and pool, a thin roof slab on eight chrome cruciform columns, freestanding onyx, green marble and travertine walls, tinted glass.',
   blurbTr: 'Mies van der Rohe’dan (Barselona, 1929): traverten podyum ve havuz, sekiz krom haç kesitli kolona oturan ince çatı döşemesi, serbest oniks, yeşil mermer ve traverten duvarlar, renkli cam.',
-  spawn: { position: [-17.5, 1.6, 10.5], lookAt: [0, 2.2, -1] },
+  // On the podium's west strip, eye height over the travertine: the big pool in the foreground,
+  // the roof floating on its chrome columns, the onyx wall glowing under it.
+  spawn: { position: [-16.2, 2.2, 4.8], lookAt: [3, 2.1, -2.5] },
   sun: { elevation: 10, azimuth: 305 },
   build(ctx, make) {
     const site = new Site(ctx, make);
+    site.look(pavilionLook);
+    site.budget(COLLAPSE_BUDGET);
     site.time('terrain', () => createTerrain(ctx, { plaza: { halfX: 26, halfZ: 16, finish: 'travertine' } }));
     const stone = (name: string, material: 'travertine' | 'marble' | 'onyx', finish: 'travertine' | 'marble' | 'onyx', x0: number, x1: number, z0: number, z1: number, y0: number, y1: number, o: { voxel?: number; tint?: number } = {}) =>
       site.box(name, { material, finish, size: [x1 - x0, y1 - y0, z1 - z0], at: [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2], voxel: o.voxel ?? 0.025, tint: o.tint });
 
-    // Podium around the pool.
-    // Podium around the pool, laid as travertine blocks of up to 6 m.
+    // Podium around the pool, laid as travertine blocks of up to 6 m. 7.5 cm voxels: the podium is
+    // 0.6 m deep and 500 m² (≈ 0.7 M voxels at this size, 2.2 M at 5 cm, which alone would take the
+    // scene past its 3 s load budget); the roof, which breaks and falls, gets 5 cm.
     const block = (name: string, x0: number, x1: number, z0: number, z1: number) =>
-      site.tiles(name, { material: 'travertine', finish: 'travertine', size: [x1 - x0, TOP, z1 - z0], at: [(x0 + x1) / 2, TOP / 2, (z0 + z1) / 2], voxel: 0.1, tile: 6 });
+      site.tiles(name, { material: 'travertine', finish: 'travertine', size: [x1 - x0, TOP, z1 - z0], at: [(x0 + x1) / 2, TOP / 2, (z0 + z1) / 2], voxel: 0.075, tile: 6 });
     const podium = [
       ...block('Podyum (kuzey)', PX0, PX1, PZ0, POOL.z0),
       ...block('Podyum', POOL.x1, PX1, POOL.z0, PZ1),
@@ -70,7 +85,7 @@ export const pavilion: SceneDef = {
       }
     const roof = site.box('Çatı döşemesi', {
       material: 'concrete', finish: 'smooth-concrete', size: [ROOF.x1 - ROOF.x0, ROOF.t, ROOF.z1 - ROOF.z0],
-      at: [(ROOF.x0 + ROOF.x1) / 2, TOP + STOREY + ROOF.t / 2, (ROOF.z0 + ROOF.z1) / 2], voxel: 0.075, rebar: REBAR.slab, tint: 1.25,
+      at: [(ROOF.x0 + ROOF.x1) / 2, TOP + STOREY + ROOF.t / 2, (ROOF.z0 + ROOF.z1) / 2], voxel: 0.05, rebar: REBAR.slab, tint: 1.25,
     });
     for (const c of cols) site.on(c, roof);
 
@@ -88,8 +103,12 @@ export const pavilion: SceneDef = {
     glassWall(site, podium, roof, { axis: 'x', at: 3.9, from: -2.8, to: 10.0, panes: 4, type: 'laminated', t: 0.0128, tint: 0x8fa79b });
     glassWall(site, podium, roof, { axis: 'z', at: 11.4, from: -3.2, to: 3.2, panes: 2, type: 'annealed', t: 0.01, tint: 0x7fa088 });
 
-    site.time('decor', () => site.decor.trees({ rect: [-90, -130, 90, -60], count: 170, seed: 5, mix: [0.35, 0.35, 0.3] }));
-    site.time('decor', () => site.decor.trees({ inner: 90, outer: 260, count: 320, seed: 9, mix: [0.35, 0.35, 0.3] }));
+    // A dark grove behind the pavilion (as on Montjuïc) and scattered groves further out.
+    site.time('decor', () => {
+      site.decor.trees({ rect: [-90, -130, 90, -60], count: 120, seed: 5, mix: [0.35, 0.45, 0.2] });
+      site.decor.trees({ inner: 100, outer: 280, count: 200, seed: 9, mix: [0.4, 0.4, 0.2], groves: 12, groveRadius: 14 });
+      site.decor.ridge({ radius: 1150, height: [30, 120], seed: 5 });
+    });
   },
 };
 

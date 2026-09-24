@@ -1,19 +1,26 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { SceneDef } from '../app/contracts.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import { createTerrain } from '../destructibles/terrain/index.ts';
-import { PROFILES, REBAR, Site, region } from './kit.ts';
+import type { SceneLook } from './look.ts';
+import { COLLAPSE_BUDGET, PROFILES, REBAR, Site, region } from './kit.ts';
 
 /**
  * Çelik Kule — a six-storey steel moment frame: HEB 200 columns on a 6 m grid (two bays by one),
- * IPE 360 edge beams continuous over the columns, IPE 300 cross beams, CHS X-bracing in the east
- * end frame, 200 mm RC floor slabs, and a frameless tempered-glass curtain wall on the south and east
- * faces from the first floor up (the ground storey is open: pilotis).
+ * IPE 360 edge beams continuous over the columns, IPE 300 cross beams, CHS
+ * X-bracing in the east end frame, 200 mm RC floor slabs, and a stick-system curtain wall of
+ * tempered glass on the south and east faces from the first floor up: dark anodised mullions on
+ * every joint, a transom at each floor line and a back-painted spandrel hiding the slab edge.
  *
  * Loads are realistic for an office floor: slab self-weight 4.7 kPa plus 1.5 kPa of finishes,
  * services and the quasi-permanent share of the imposed load, so a middle ground-floor column
- * carries ≈ 0.8 MN, about 45 % of its buckling resistance (EN 1993-1-1 curve c). Blow the
- * ground-floor columns and the storeys above lose their supports one level after another.
+ * carries ≈ 0.8 MN, well within its buckling resistance (EN 1993-1-1 curve c). Blow the
+ * ground-floor columns and the storeys above lose their supports one level after another. Cutting
+ * a steel section with contact charges takes P = 3/8·A lb of TNT for A in in² (US Army FM 5-250,
+ * steel-cutting formula): A = 78 cm² = 12.1 in² for an HEB 200 → 4.5 lb ≈ 2.1 kg TNT, three M112
+ * blocks per column. (Checked in the browser: 2.3 kg per ground column brings the tower down; the
+ * same charges leave an HEB 300 standing, as the formula predicts — it needs ≈ 3.9 kg.)
  */
 
 /** Column grid (m), storey height, storeys */
@@ -22,24 +29,32 @@ const XS = [-6, 0, 6], ZS = [-3, 3], STOREY = 3.6, N = 6;
 const SLAB_T = 0.2, EDGE = 0.3;
 /** Superimposed dead + quasi-permanent imposed load on the floors, Pa (EN 1991-1-1, ψ₂ = 0.3) */
 const SUPERIMPOSED = 1500;
+/** Glass plane outside the slab edge, m */
+const GLASS_OUT = 0.12;
+/** Curtain-wall frame: mullion face width and depth, transom height, m */
+const MULL_W = 0.06, MULL_D = 0.16, TRANSOM_H = 0.09;
+
+/** Golden-hour photography settings (see look.ts). Many panes: no reflection probes. */
+export const towerLook: SceneLook = { sky: { turbidity: 3, rayleigh: 1.7, mieCoefficient: 0.003 }, exposure: 0.9, ambient: 0.6, fov: 55, visibility: 7000, glassProbes: false };
 
 export const tower: SceneDef = {
   id: 'tower',
   name: 'Steel Tower',
   nameTr: 'Çelik Kule',
-  blurb: 'A six-storey steel moment frame: HEB 200 columns, IPE beams, X-bracing in one bay, RC floor slabs, a frameless tempered-glass curtain wall on two faces over an open ground storey. Demolition-ready.',
-  blurbTr: 'Altı katlı çelik moment çerçeve: HEB 200 kolonlar, IPE kirişler, tek açıklıkta X çaprazlar, betonarme döşemeler; açık zemin katın üstünde iki cephede çerçevesiz temperli cam giydirme. Yıkıma hazır.',
-  spawn: { position: [17, 1.7, -19], lookAt: [0, 8, 0] },
-  sun: { elevation: 12, azimuth: 222 },
+  blurb: 'A six-storey steel moment frame: HEB columns, IPE beams, X-bracing in one bay, RC floor slabs, a tempered-glass curtain wall with slim mullions on two faces over an open ground storey. Demolition-ready.',
+  blurbTr: 'Altı katlı çelik moment çerçeve: HEB kolonlar, IPE kirişler, tek açıklıkta X çaprazlar, betonarme döşemeler; açık zemin katın üstünde iki cephede ince kayıtlı temperli cam giydirme. Yıkıma hazır.',
+  spawn: { position: [19, 1.6, -21], lookAt: [0, 8.5, 0] },
+  sun: { elevation: 10, azimuth: 250 },
   build(ctx, make) {
     const site = new Site(ctx, make);
+    site.look(towerLook);
+    site.budget(COLLAPSE_BUDGET);
     site.time('terrain', () => createTerrain(ctx, { plaza: { halfX: 24, halfZ: 20, finish: 'concrete' } }));
     const level = (k: number) => k * STOREY;
     const slabs = new Map<number, Destructible>();
 
     // Columns: one member per storey. Ground storey: fixed base, loaded head (roller). Above:
     // anchored on the column below.
-    const cols: Destructible[][] = XS.map(() => []);
     const colAt = new Map<string, Destructible>();
     for (let k = 0; k < N; k++)
       XS.forEach((x, i) =>
@@ -52,7 +67,6 @@ export const tower: SceneDef = {
           if (k === 0) site.ground(c);
           else site.at(colAt.get(`${k - 1}/${x}/${z}`)!, c, region(x, z, 0.15, level(k) - 0.3, level(k) + 0.1));
           colAt.set(`${k}/${x}/${z}`, c);
-          cols[i]!.push(c);
         }),
       );
 
@@ -107,31 +121,65 @@ export const tower: SceneDef = {
       }
     }
 
-    // Tempered glass curtain wall (structural silicone, no visible frame), south and east faces.
-    const south = { along: 'x' as const, at: ZS[0]! - EDGE - 0.1 - 0.12, from: XS[0]! - EDGE, to: XS[2]! + EDGE, panes: 6 };
-    const east = { along: 'z' as const, at: XS[2]! + EDGE + 0.12, from: ZS[0]! - EDGE - 0.1, to: ZS[1]! + EDGE + 0.1, panes: 3 };
-    for (const face of [south, east]) {
-      const w = (face.to - face.from) / face.panes;
-      for (let k = 1; k < N; k++) {
-        const y0 = level(k), y1 = level(k + 1);
-        for (let i = 0; i < face.panes; i++) {
-          const s = face.from + (i + 0.5) * w;
-          const [x, z] = face.along === 'x' ? [s, face.at] : [face.at, s];
-          const pane = site.glass({
-            name: `Cam ${face.along}${k}-${i}`, type: 'tempered', width: w - 0.02, height: STOREY - 0.02, thickness: 0.012,
-            position: [x, (y0 + y1) / 2, z], rotation: [0, face.along === 'x' ? 0 : Math.PI / 2, 0], tint: 0x9db3b0, framed: true,
-          });
-          // Unitised structural-silicone glazing: each unit hangs from the slab edge above and is
-          // restrained at the slab edge below.
-          const edge = (y: number, depth: number) => face.along === 'x'
-            ? new THREE.Box3(new THREE.Vector3(s - w / 2 + 0.05, y - depth, face.at + 0.12), new THREE.Vector3(s + w / 2 - 0.05, y, face.at + 0.3))
-            : new THREE.Box3(new THREE.Vector3(face.at - 0.3, y - depth, s - w / 2 + 0.05), new THREE.Vector3(face.at - 0.12, y, s + w / 2 - 0.05));
-          site.at(slabs.get(k)!, pane, edge(y0, SLAB_T));
-          site.at(slabs.get(k + 1)!, pane, edge(y1, SLAB_T));
-        }
-      }
-    }
+    curtainWall(site, slabs, level);
 
-    site.time('decor', () => site.decor.trees({ inner: 70, outer: 260, count: 380, seed: 17, mix: [0.3, 0.3, 0.4] }));
+    site.time('decor', () => {
+      site.decor.trees({ inner: 90, outer: 300, count: 260, seed: 17, mix: [0.45, 0.35, 0.2], groves: 14, groveRadius: 16 });
+      site.decor.ridge({ radius: 1150, height: [25, 95], seed: 17 });
+    });
   },
 };
+
+/**
+ * Stick-system curtain wall on the south (−z) and east (+x) faces, storeys 1–5: framed tempered
+ * units hung from the slab edge above and restrained at the slab edge below, dark anodised
+ * mullions on every joint, a transom at each floor line and a spandrel of back-painted glass
+ * hiding the slab edge and the beams. The frame and spandrel of a storey are carried by the slab
+ * above it and go with it.
+ */
+function curtainWall(site: Site, slabs: Map<number, Destructible>, level: (k: number) => number): void {
+  const zS = ZS[0]! - EDGE - 0.1 - GLASS_OUT, xE = XS[2]! + EDGE + GLASS_OUT;
+  const south = { along: 'x' as const, at: zS, out: -1, from: XS[0]! - EDGE, to: XS[2]! + EDGE + GLASS_OUT, panes: 6 };
+  const east = { along: 'z' as const, at: xE, out: 1, from: ZS[0]! - EDGE - 0.1 - GLASS_OUT, to: ZS[1]! + EDGE + 0.1, panes: 3 };
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x24272a, roughness: 0.38, metalness: 0.75 });
+  const spandrelMat = new THREE.MeshStandardMaterial({ color: 0x15191a, roughness: 0.12, metalness: 0.1 });
+  for (let k = 1; k < N; k++) {
+    const y0 = level(k), y1 = level(k + 1);
+    const frame: THREE.BufferGeometry[] = [];
+    const spandrel: THREE.BufferGeometry[] = [];
+    for (const face of [south, east]) {
+      const w = (face.to - face.from) / face.panes;
+      // Box in face coordinates: s along the face, y up, d outwards from the glass plane.
+      const put = (list: THREE.BufferGeometry[], s: number, y: number, d: number, ls: number, ly: number, ld: number) => {
+        const g = face.along === 'x' ? new THREE.BoxGeometry(ls, ly, ld) : new THREE.BoxGeometry(ld, ly, ls);
+        const o = face.at + face.out * d;
+        g.translate(face.along === 'x' ? s : o, y, face.along === 'x' ? o : s);
+        list.push(g);
+      };
+      for (let i = 0; i < face.panes; i++) {
+        const s = face.from + (i + 0.5) * w;
+        const [x, z] = face.along === 'x' ? [s, face.at] : [face.at, s];
+        const pane = site.glass({
+          name: `Cam ${face.along}${k}-${i}`, type: 'tempered', width: w - MULL_W, height: STOREY - TRANSOM_H, thickness: 0.012,
+          position: [x, (y0 + y1) / 2 + TRANSOM_H / 2, z], rotation: [0, face.along === 'x' ? 0 : Math.PI / 2, 0], tint: 0x9fb4b0, framed: true,
+        });
+        // Each unit hangs from the slab edge above and is restrained at the slab edge below.
+        const edge = (y: number) => face.along === 'x'
+          ? new THREE.Box3(new THREE.Vector3(s - w / 2 + 0.05, y - SLAB_T, face.at + GLASS_OUT), new THREE.Vector3(s + w / 2 - 0.05, y, face.at + GLASS_OUT + 0.18))
+          : new THREE.Box3(new THREE.Vector3(face.at - GLASS_OUT - 0.18, y - SLAB_T, s - w / 2 + 0.05), new THREE.Vector3(face.at - GLASS_OUT, y, s + w / 2 - 0.05));
+        site.at(slabs.get(k)!, pane, edge(y0));
+        site.at(slabs.get(k + 1)!, pane, edge(y1));
+      }
+      // Mullions on every joint (and both ends), a transom on the floor line, the spandrel behind.
+      for (let i = 0; i <= face.panes; i++) put(frame, face.from + i * w, (y0 + y1) / 2, 0.02, MULL_W, STOREY, MULL_D);
+      put(frame, (face.from + face.to) / 2, y0 + TRANSOM_H / 2, 0.02, face.to - face.from, TRANSOM_H, MULL_D * 0.8);
+      if (k === N - 1) put(frame, (face.from + face.to) / 2, y1 + 0.07, 0.02, face.to - face.from + MULL_W, 0.14, MULL_D);
+      put(spandrel, (face.from + face.to) / 2, y1 - 0.34, -0.035, face.to - face.from - 0.02, 0.84, 0.02);
+    }
+    const slab = slabs.get(k + 1)!;
+    const fg = mergeGeometries(frame, false)!, sg = mergeGeometries(spandrel, false)!;
+    for (const g of [...frame, ...spandrel]) g.dispose();
+    site.attach(slab, fg, frameMat, 'curtain-frame');
+    site.attach(slab, sg, spandrelMat, 'spandrel');
+  }
+}

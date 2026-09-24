@@ -1,7 +1,8 @@
 import type { SceneDef } from '../app/contracts.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import { createTerrain } from '../destructibles/terrain/index.ts';
-import { REBAR, Site } from './kit.ts';
+import type { SceneLook } from './look.ts';
+import { COLLAPSE_BUDGET, REBAR, Site } from './kit.ts';
 
 /**
  * Işık Kilisesi — after Tadao Ando's Church of the Light (Ibaraki, 1989). A board-formed
@@ -24,16 +25,24 @@ const SLIT = 0.18, CROSS_Y = 4.05;
 /** The slicing wall: 15° to the long axis, crossing the south wall's inner face at x = −4.5 */
 const SLICE_DEG = 15, SLICE_X0 = -4.5, SLICE_FROM = -11, SLICE_TO = 3, SLICE_H = 5.6;
 
+/** Golden-hour photography settings (see look.ts). */
+export const chapelLook: SceneLook = { sky: { turbidity: 3.4, rayleigh: 1.7 }, exposure: 0.9, ambient: 0.55, fov: 55, visibility: 7000, glassProbes: true };
+
 export const chapel: SceneDef = {
   id: 'chapel',
   name: 'Church of the Light',
   nameTr: 'Işık Kilisesi',
   blurb: 'After Tadao Ando (Ibaraki, 1989): a board-formed reinforced-concrete box sliced by a freestanding wall at 15°, the altar wall cut through by a cross of light, a thin roof slab on the side walls.',
   blurbTr: 'Tadao Ando’dan (İbaraki, 1989): 15° açılı serbest bir duvarın kestiği kalıp izli betonarme kutu; sunak duvarını boydan boya kesen ışık haçı, yan duvarlara oturan ince çatı döşemesi.',
-  spawn: { position: [-17, 1.7, 16], lookAt: [-1, 3.2, 0] },
-  sun: { elevation: 11, azimuth: 64 },
+  // From the south-east across the pool: the cross in the sunlit altar wall, the long south wall
+  // raked by the low sun (shows the board marks and tie holes), the slicing wall in cool shade.
+  spawn: { position: [17, 1.6, 15], lookAt: [1, 2.6, 0] },
+  // Early morning, east by south: the light comes through the cross into the nave.
+  sun: { elevation: 9, azimuth: 72 },
   build(ctx, make) {
     const site = new Site(ctx, make);
+    site.look(chapelLook);
+    site.budget(COLLAPSE_BUDGET);
     site.time('terrain', () => createTerrain(ctx, { plaza: { halfX: 21, halfZ: 15, finish: 'pavers' } }));
     const concrete = { material: 'concrete' as const, finish: 'board-formed-concrete' as const, rebar: REBAR.wall, tint: 0.92 };
     const wall = (name: string, x0: number, x1: number, z0: number, z1: number, y0: number, y1: number, voxel = 0.025): Destructible =>
@@ -71,7 +80,10 @@ export const chapel: SceneDef = {
     for (const el of [north, southE, southW, west, ul, ur]) site.on(el, roof);
 
     buildForecourt(site);
-    site.time('decor', () => site.decor.trees({ inner: 70, outer: 240, count: 360, seed: 11, mix: [0.35, 0.2, 0.45] }));
+    site.time('decor', () => {
+      site.decor.trees({ inner: 80, outer: 260, count: 240, seed: 11, mix: [0.45, 0.35, 0.2], groves: 12, groveRadius: 14 });
+      site.decor.ridge({ radius: 1150, height: [30, 110], seed: 11 });
+    });
   },
 };
 

@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { SceneDef, SimContext } from '../app/contracts.ts';
+import type { Destructible } from '../destructibles/Destructible.ts';
 import { createTerrain } from '../destructibles/terrain/index.ts';
+import type { SceneLook } from './look.ts';
 import { PROFILES, REBAR, Site, type V3 } from './kit.ts';
 
 /**
@@ -18,6 +20,9 @@ const LANE = 25;
 /** Gap between neighbouring targets, m */
 const GAP = 1.1;
 
+/** Golden-hour photography settings (see look.ts). */
+export const rangeLook: SceneLook = { sky: { turbidity: 3.2, rayleigh: 1.8 }, exposure: 1.0, fov: 60, visibility: 7000, glassProbes: true };
+
 export const range: SceneDef = {
   id: 'range',
   name: 'Proving Ground',
@@ -28,10 +33,14 @@ export const range: SceneDef = {
   sun: { elevation: 9, azimuth: 300 },
   build(ctx, make) {
     const site = new Site(ctx, make);
+    site.look(rangeLook);
     site.time('terrain', () => createTerrain(ctx, { plaza: { halfX: 25, halfZ: 5, finish: 'concrete' } }));
     buildTargets(ctx, site);
     buildLane(site);
-    site.time('decor', () => site.decor.trees({ inner: 140, outer: 320, count: 420, seed: 3, mix: [0.4, 0.3, 0.3] }));
+    site.time('decor', () => {
+      site.decor.trees({ inner: 140, outer: 320, count: 260, seed: 3, mix: [0.4, 0.35, 0.25], groves: 14, groveRadius: 16 });
+      site.decor.ridge({ radius: 1150, height: [30, 110], seed: 3 });
+    });
   },
 };
 
@@ -117,6 +126,7 @@ function buildTargets(ctx: SimContext, site: Site): void {
     site.on(col, block);
     const blockWeight = 1.6 * 0.8 * 1.6 * 2400 * 9.80665;
     site.load(block, 1.2e6 - blockWeight);
+    testRig(site, s.x, 4.8, block);
     signs.push({ x: s.x, lines: ['HEB 300 · N = 1,2 MN', 'S355 kolon, L = 4 m, deney yükü', 'Loaded column'] });
   }
   // IPE 400 beam on two reinforced piers, 5 m span.
@@ -158,7 +168,33 @@ function buildTargets(ctx: SimContext, site: Site): void {
     const m = site.decor.mesh(merged, new THREE.MeshStandardMaterial({ color: 0x33373b, roughness: 0.5, metalness: 0.7 }), new THREE.Vector3());
     m.name = 'test-frames';
   }
-  site.decor.signs(signs.map((s) => ({ at: [s.x, 0, 2.2] as V3, lines: s.lines, width: 0.9, height: 0.45 })));
+  site.time('signs', () => site.decor.signs(signs.map((s) => ({ at: [s.x, 0, 2.2] as V3, lines: s.lines, width: 0.9, height: 0.45 }))));
+}
+
+/**
+ * The column's self-reacting load rig: a steel crosshead on the load block, pulled down by two
+ * anchored high-strength bars, so the column carries the full 1.2 MN. Each Ø 75 mm bar takes
+ * 0.6 MN, σ = N/A = 0.6 MN / 4 418 mm² = 136 MPa, far under the 835 MPa yield of prestressing
+ * bar (EN 10138-4 Y1030H). The crosshead rides on the block and falls with it; the bars stay in
+ * their anchors.
+ */
+function testRig(site: Site, x: number, top: number, block: Destructible): void {
+  const steel = new THREE.MeshStandardMaterial({ color: 0x2f3336, roughness: 0.5, metalness: 0.65 });
+  const r = 0.0375, dx = 1.0, head = top + 0.36;
+  const fixed: THREE.BufferGeometry[] = [];
+  for (const k of [-1, 1]) {
+    fixed.push(new THREE.CylinderGeometry(r, r, head + 0.16, 14).translate(x + k * dx, (head + 0.16) / 2, 0));
+    fixed.push(new THREE.BoxGeometry(0.5, 0.06, 0.5).translate(x + k * dx, 0.03, 0));
+    fixed.push(new THREE.CylinderGeometry(0.075, 0.075, 0.1, 6).translate(x + k * dx, 0.11, 0));
+  }
+  const bars = mergeGeometries(fixed.map((g) => g.deleteAttribute('uv')), false)!;
+  for (const g of fixed) g.dispose();
+  site.decor.mesh(bars, steel, new THREE.Vector3()).name = 'test-rig-bars';
+  const moving: THREE.BufferGeometry[] = [new THREE.BoxGeometry(2 * dx + 0.3, 0.36, 0.5).translate(x, top + 0.18, 0)];
+  for (const k of [-1, 1]) moving.push(new THREE.CylinderGeometry(0.075, 0.075, 0.1, 6).translate(x + k * dx, head + 0.05, 0));
+  const crosshead = mergeGeometries(moving.map((g) => g.deleteAttribute('uv')), false)!;
+  for (const g of moving) g.dispose();
+  site.attach(block, crosshead, steel.clone(), 'test-rig-crosshead');
 }
 
 /**
@@ -199,9 +235,9 @@ function buildLane(site: Site): void {
   edgeGeo.dispose();
   edgeMat.dispose();
   const boards: [number, string][] = [[LANE, '25 m'], [LANE + 25, '50 m'], [LANE + 75, '100 m']];
-  site.decor.signs(boards.map(([z, label]) => ({
+  site.time('signs', () => site.decor.signs(boards.map(([z, label]) => ({
     at: [-24.5, 0, z] as V3, rotY: Math.PI / 2, lines: [label, 'Hedef hattına mesafe', 'Distance to targets'], width: 0.9, height: 0.45, accent: '#d7a531',
-  })));
+  }))));
   // Concrete firing pad.
   const pad = new THREE.BoxGeometry(46, 0.12, 4);
   site.decor.mesh(pad, new THREE.MeshStandardMaterial({ color: 0xa9a59c, roughness: 0.9 }), new THREE.Vector3(0, 0.03, LANE + 1.6), 0, false).receiveShadow = true;

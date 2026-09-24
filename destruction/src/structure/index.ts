@@ -4,7 +4,7 @@ import type { Destructible } from '../destructibles/Destructible.ts';
 import { StructureGraph } from './StructureGraph.ts';
 import { guardDegenerateHulls } from './guards.ts';
 
-export { StructureGraph, PRESENCE_MIN, delay, bearingHits, type GraphHost, type LinkInfo } from './StructureGraph.ts';
+export { StructureGraph, PRESENCE_MIN, delay, bearingHits, isSplice, type GraphHost, type LinkInfo } from './StructureGraph.ts';
 export { guardDegenerateHulls } from './guards.ts';
 
 /**

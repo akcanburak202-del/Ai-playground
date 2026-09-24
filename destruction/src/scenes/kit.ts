@@ -5,7 +5,9 @@ import type {
 import type { Destructible } from '../destructibles/Destructible.ts';
 import type { MaterialId } from '../physics/materials.ts';
 import { setExternalLoad } from '../structure/index.ts';
+import { ReflectionProbes } from '../destructibles/glass/index.ts';
 import { Decor } from './decor.ts';
+import { applyLookAfterLoad, type SceneLook } from './look.ts';
 
 export type V3 = [number, number, number];
 
@@ -26,10 +28,19 @@ export interface BoxOpts {
 
 /** Rigid-body budget for a scene's rubble (DESIGN.md §5 allows 900; rubble at 500 keeps a collapse near 30 fps). */
 export const DEFAULT_BODY_BUDGET = 500;
+/**
+ * Budget for scenes whose big slabs come down whole (roofs, floors). The voxel module cuts an
+ * island into pieces up to 85 % of the budget and pulverises the rest into dust. Each piece is
+ * ~2 meshes, and every mesh is drawn again in the depth and shadow passes (measured: ~9 draw calls
+ * per piece; 410 pieces of the pavilion roof took the frame to 4 100 calls against a budget of
+ * 800). 300 keeps pieces of a 0.3 m slab at ~0.25 m³ (0.9 m across) and the draw calls near half.
+ */
+export const COLLAPSE_BUDGET = 300;
 
 /** Common structural profiles (EN 10365 dimensions, m). */
 export const PROFILES = {
   HEB200: { type: 'I', h: 0.2, b: 0.2, tw: 0.009, tf: 0.015 },
+  HEB240: { type: 'I', h: 0.24, b: 0.24, tw: 0.01, tf: 0.017 },
   HEB300: { type: 'I', h: 0.3, b: 0.3, tw: 0.011, tf: 0.019 },
   IPE300: { type: 'I', h: 0.3, b: 0.15, tw: 0.0071, tf: 0.0107 },
   IPE360: { type: 'I', h: 0.36, b: 0.17, tw: 0.008, tf: 0.0127 },
@@ -75,6 +86,17 @@ export class Site {
    */
   budget(bodies: number): void {
     this.ctx.physics.maxDynamicBodies = bodies;
+  }
+
+  /**
+   * Everything of the scene's look that can still be set once the pipeline has run its setup
+   * (loadScene calls it before build): glass reflection probes (a pane acquires them on its first
+   * frame), lens, haze and ambient scale. Only the sky constants and exposure must come before the
+   * load (applyLookBeforeLoad); the rest is right here whatever the app wires.
+   */
+  look(look: SceneLook): void {
+    ReflectionProbes.enabled = look.glassProbes ?? true;
+    applyLookAfterLoad(this.ctx, look);
   }
 
   // ── Elements ──────────────────────────────────────────────────────────────────────────────
@@ -195,7 +217,25 @@ export class Site {
   load(el: Destructible, newtons: number): void {
     setExternalLoad(this.ctx, el, newtons);
   }
+
+  /**
+   * Non-structural dressing carried by an element (curtain-wall frames on a slab edge, triglyphs
+   * on a frieze block): `geo` is given in world space and re-expressed in the element's frame, so
+   * it moves with the element and goes when the element goes. Geometry and material are owned
+   * (and disposed) by the decor.
+   */
+  attach(el: Destructible, geo: THREE.BufferGeometry, mat: THREE.Material, name: string, shadows = true): THREE.Mesh {
+    el.root.updateMatrixWorld(true);
+    geo.applyMatrix4(_inv.copy(el.root.matrixWorld).invert());
+    const m = new THREE.Mesh(this.decor.track(geo), this.decor.track(mat));
+    m.name = name;
+    m.castShadow = m.receiveShadow = shadows;
+    el.root.add(m);
+    return m;
+  }
 }
+
+const _inv = new THREE.Matrix4();
 
 /** Axis-aligned box around a point: centre (x, z), half size r in plan, y from y0 to y1. */
 export function region(x: number, z: number, r: number, y0: number, y1: number): THREE.Box3 {

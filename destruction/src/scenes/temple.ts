@@ -4,7 +4,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { SceneDef, SimContext } from '../app/contracts.ts';
 import type { Destructible } from '../destructibles/Destructible.ts';
 import { createTerrain } from '../destructibles/terrain/index.ts';
-import { Site } from './kit.ts';
+import type { SceneLook } from './look.ts';
+import { COLLAPSE_BUDGET, Site } from './kit.ts';
 
 /**
  * Dor Tapınağı — a Doric marble temple after the Parthenon's proportions, reduced to a 4 × 6
@@ -32,27 +33,35 @@ const CORNICE_OUT = 0.24;
 /** Warm Pentelic marble: iron-bearing, weathered to honey */
 const PENTELIC = 0xf4e6cc;
 
+/** Golden-hour photography settings (see look.ts). */
+export const templeLook: SceneLook = { sky: { turbidity: 3.6, rayleigh: 1.6 }, exposure: 1.0, fov: 55, visibility: 6000, glassProbes: true };
+
 export const temple: SceneDef = {
   id: 'temple',
   name: 'Doric Temple',
   nameTr: 'Dor Tapınağı',
   blurb: 'A Doric marble temple on Parthenon proportions (4 × 6 columns): fluted drum columns with entasis, architraves, frieze, pediments and a cella; dry masonry held only by weight and friction.',
   blurbTr: 'Parthenon oranlarında Dor düzeninde mermer tapınak (4 × 6 kolon): entasisli yivli tambur kolonlar, arşitrav, friz, alınlıklar ve naos; yalnızca ağırlık ve sürtünmeyle ayakta duran harçsız taş.',
-  spawn: { position: [-12, 1.6, 17], lookAt: [0, 3.6, 0] },
+  // Low, from the front-left corner of the precinct: the peristyle rises over the viewer and the
+  // entasis, flutes and triglyph rhythm read against the sky.
+  spawn: { position: [-9.5, 1.6, 14.5], lookAt: [0, 4.2, 0] },
   sun: { elevation: 9, azimuth: 300 },
   build(ctx, make) {
     const site = new Site(ctx, make);
-    site.time('terrain', () => createTerrain(ctx, { plaza: { halfX: 18, halfZ: 20, finish: 'travertine' } }));
+    site.look(templeLook);
+    // A paved margin around the crepidoma, then the dry grass of the hilltop.
+    site.time('terrain', () => createTerrain(ctx, { plaza: { halfX: 8, halfZ: 10, finish: 'travertine' } }));
     const marble = { material: 'marble' as const, finish: 'marble' as const, tint: PENTELIC };
     const ax = ((NX - 1) * BAY) / 2, az = ((NZ - 1) * BAY) / 2;
     const r0 = D / 2;
 
-    // Crepidoma: three steps; the top one is the stylobate.
+    // Crepidoma: three steps; the top one is the stylobate. Voxels: 5 cm on the stylobate (the
+    // columns stand on it and it takes the hits), 6.5 cm below (exactly four per 26 cm riser).
     let stylobate: Destructible | null = null;
     for (let i = 0; i < STEPS; i++) {
       const grow = (STEPS - 1 - i) * STEP_D;
       const hx = ax + r0 + 0.3 + grow, hz = az + r0 + 0.3 + grow;
-      const step = site.box(i === STEPS - 1 ? 'Stilobat' : `Basamak ${i + 1}`, { ...marble, size: [2 * hx, STEP_H, 2 * hz], at: [0, (i + 0.5) * STEP_H, 0], voxel: i === STEPS - 1 ? 0.06 : 0.1 });
+      const step = site.box(i === STEPS - 1 ? 'Stilobat' : `Basamak ${i + 1}`, { ...marble, size: [2 * hx, STEP_H, 2 * hz], at: [0, (i + 0.5) * STEP_H, 0], voxel: i === STEPS - 1 ? 0.05 : 0.065 });
       if (i === 0) site.ground(step);
       else site.on(stylobate!, step);
       stylobate = step;
@@ -131,10 +140,13 @@ export const temple: SceneDef = {
     buildCella(site, stylobate!, base, ax, az, top);
     trueBeds(ctx, shapes);
     site.time('settle', () => settle(ctx, loose, 0.8));
+    site.budget(COLLAPSE_BUDGET + loose.length);
+    keepStonesLive(site, loose);
     triglyphs(site, frieze, ax, az, top + ARCH_H);
 
     site.time('decor', () => {
-      site.decor.trees({ inner: 60, outer: 240, count: 340, seed: 23, mix: [0.55, 0.15, 0.3] });
+      site.decor.trees({ inner: 70, outer: 260, count: 240, seed: 23, mix: [0.55, 0.2, 0.25], groves: 12, groveRadius: 14 });
+      site.decor.ridge({ radius: 1150, height: [40, 140], seed: 23 });
     });
   },
 };
@@ -269,6 +281,32 @@ function trueBeds(ctx: SimContext, shapes: Map<Destructible, ShapeFn>): void {
 }
 
 /**
+ * The standing stones are architecture, not rubble: keep them out of the rigid-body budget. Once a
+ * collapse goes over budget the physics world freezes (makes fixed) the oldest sleeping bodies,
+ * and the colonnade — built first, asleep — would be first in line: a frozen drum no longer
+ * topples when hit, and hangs in the air when the drum under it is shot away. A stone the budget
+ * freezes is made dynamic again and put back to sleep; the world has already dropped it from its
+ * budget list, so it is never picked again and the next sleeping rubble is frozen instead.
+ */
+function keepStonesLive(site: Site, loose: Destructible[]): void {
+  const phys = site.ctx.physics;
+  const stones = new Set(loose);
+  const handles = new Set<number>();
+  phys.world.forEachRigidBody((b) => {
+    if (!b.isDynamic() || b.numColliders() === 0) return;
+    const el = phys.ownerOf(b.collider(0))?.destructible;
+    if (el && stones.has(el)) handles.add(b.handle);
+  });
+  const off = phys.onFrozen((b) => {
+    if (!handles.delete(b.handle)) return;
+    b.setBodyType(phys.R.RigidBodyType.Dynamic, false);
+    b.sleep();
+  });
+  // Unsubscribed with the rest of the scene's dressing when the world is cleared.
+  site.decor.track({ dispose: off });
+}
+
+/**
  * Let the loose stones find their beds together before the viewer arrives (woken all at once —
  * a stack woken piecemeal, a stone at a time, is kicked about by its sleeping neighbours), then
  * put them to sleep until something disturbs them. Steps only the physics world and the stones.
@@ -281,9 +319,18 @@ function settle(ctx: SimContext, loose: Destructible[], seconds: number): void {
   });
   for (const b of bodies) b.wakeUp();
   const dt = 1 / 60;
-  for (let i = 0; i < Math.round(seconds / dt); i++) {
-    phys.step(dt);
-    for (const el of loose) if (!el.disposed) el.fixedUpdate?.(dt);
+  // Settling is preparation, not an event: a stone finding its bed must not raise dust, clatter or
+  // crack anything (FX were reset before the build, so their puffs would greet the viewer).
+  const bus = ctx.events;
+  const emit = bus.emit;
+  bus.emit = () => {};
+  try {
+    for (let i = 0; i < Math.round(seconds / dt); i++) {
+      phys.step(dt);
+      for (const el of loose) if (!el.disposed) el.fixedUpdate?.(dt);
+    }
+  } finally {
+    bus.emit = emit;
   }
   for (const b of bodies) {
     b.setLinvel({ x: 0, y: 0, z: 0 }, false);

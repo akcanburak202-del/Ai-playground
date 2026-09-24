@@ -15,12 +15,17 @@ import { G } from '../core/units.ts';
  * region has fallen below PRESENCE_MIN no longer holds that region. The supported element is told
  * (`releaseAnchor`) after the time it takes to drop through the bearing's deformation capacity δ,
  * t = √(2δ/g) (free fall, constant acceleration kinematics) — tens of milliseconds per level, so a
- * collapse runs down the structure as a visible sequence instead of in one frame.
+ * collapse runs down the structure as a visible sequence instead of in one frame. What an element
+ * carries starts its own countdown the moment the element loses its last support. Column splices
+ * (an upright steel member standing on another) have almost no play, so a cut column line drops
+ * as one within a few steps instead of opening a gap at every floor. Panes, which break on the
+ * spot when released, go one per step.
  *
  * Load flow: top-down over the active links, each element delivers its own weight plus what it
  * carries to its bearing supports, split by the lever rule (share ∝ 1 / horizontal distance from
  * the element's centre to the contact; exact for two supports, the usual tributary approximation
- * beyond). The carried load goes to `setImposedLoad` (column crushing / buckling checks).
+ * beyond). The carried load goes to `setImposedLoad` (column crushing / buckling checks). Weights
+ * are cached and re-measured only for elements that were touched (lost material).
  *
  * Pure logic over the Destructible / Structural interfaces: no DOM, no renderer.
  */
@@ -31,12 +36,17 @@ export const PRESENCE_MIN = 0.35;
 const DELTA_BRITTLE = 0.02;
 const DELTA_STEEL = 0.05;
 const DELTA_GLAZING = 0.012;
+const DELTA_SPLICE = 0.005;
 /** Touched supporters are re-measured at most this often (their own checks are debounced too), s */
 const EVAL_INTERVAL = 0.05;
 /** Steel members are re-measured on this period even when nobody touched them, s */
 const SWEEP_INTERVAL = 0.25;
+/** A steel member whose bounds moved less than this since its last measurement is not re-probed, m */
+const MOVE_TOL = 0.002;
 /** Weights drift as material is shot away; the load flow is refreshed at most this often, s */
 const WEIGHT_INTERVAL = 1;
+/** Glass panes let go per fixed step at most (each break is several ms of work in the pane) */
+const GLASS_PER_STEP = 1;
 /** Load changes smaller than this are not pushed (N, and relative) */
 const PUSH_ABS = 500;
 const PUSH_REL = 0.02;
@@ -75,6 +85,8 @@ interface Link {
   load: number;
   /** Rays that found a steel supporter under the bearing plane when linked (0: not probed) */
   probe: number;
+  /** A column splice (judged when linked: a falling column no longer stands upright) */
+  splice: boolean;
 }
 
 interface Node {
@@ -90,6 +102,11 @@ interface Node {
   target: number;
   /** Point loads arriving at the element, [x, z, N] triples: where they act in plan */
   pts: number[];
+  /** Bounds when its supports were last measured (steel sweep: unmoved members are skipped) */
+  snap: THREE.Box3 | null;
+  /** Own weight at the last measurement, N; re-measured after the element was touched */
+  w: number;
+  wDirty: boolean;
   pushed: number;
   pushedAt: number;
   touched: boolean;
@@ -137,8 +154,12 @@ export class StructureGraph implements StructureApi {
     const b = supported.bounds;
     const h = Math.max(1e-3, b.max.y - b.min.y);
     const bearing = b.isEmpty() || centre.y <= b.min.y + 0.25 * h;
-    const l: Link = { id, supporter: parent, supported: child, region, centre, bearing, active: true, releaseAt: -1, load: 0, probe: 0 };
-    if (parent && bearing && (parent.el.kind === 'beam' || parent.el.kind === 'plate')) l.probe = bearingHits(parent.el, region);
+    const splice = !!parent && bearing && isSplice(parent.el, supported);
+    const l: Link = { id, supporter: parent, supported: child, region, centre, bearing, active: true, releaseAt: -1, load: 0, probe: 0, splice };
+    if (parent && bearing && (parent.el.kind === 'beam' || parent.el.kind === 'plate')) {
+      l.probe = bearingHits(parent.el, region);
+      (parent.snap ??= new THREE.Box3()).copy(parent.el.bounds);
+    }
     this.links.set(id, l);
     child.down.push(l);
     parent?.up.push(l);
@@ -154,6 +175,9 @@ export class StructureGraph implements StructureApi {
   touch(el: Destructible): void {
     const node = this.nodes.get(el);
     if (!node || node.gone) return;
+    // Material went: weigh the element again at the next load flow (weighing is not free — a slab
+    // sums every rebar segment — so untouched elements keep their cached weight).
+    node.wDirty = true;
     this.weightsDirty = true;
     if (!node.touched && node.up.length) {
       node.touched = true;
@@ -204,27 +228,34 @@ export class StructureGraph implements StructureApi {
       this.touchedList.length = w;
     }
     // Steel members deform without losing material: re-measure each of them every SWEEP_INTERVAL,
-    // a few per step (round robin), so the cost per step stays small.
+    // a few per step (round robin), so the cost per step stays small — and only the ones that
+    // have moved since they were last measured (a probe is a few dozen ray casts; a member whose
+    // bounds have not changed cannot have sagged away from what it carries, and material loss
+    // arrives through touch()).
     if (this.steel.length) {
       const due = Math.ceil((this.steel.length * dt) / SWEEP_INTERVAL);
       for (let i = 0; i < due; i++) {
         const node = this.steel[this.sweep++ % this.steel.length]!;
-        if (!node.gone && node.up.length && now - node.lastEval >= EVAL_INTERVAL) {
-          node.lastEval = now;
-          this.measure(node, now);
-        }
+        if (node.gone || !node.up.length || now - node.lastEval < EVAL_INTERVAL) continue;
+        if (node.snap && sameBox(node.snap, node.el.bounds, MOVE_TOL)) continue;
+        node.lastEval = now;
+        this.measure(node, now);
       }
     }
 
-    // Releases that have come due.
+    // Releases that have come due. A pane that loses its frame breaks on the spot (tempered glass
+    // dices the whole pane, ~8 ms of work each), so at most one pane lets go per step and
+    // the rest follow on the next steps: a floor's worth of glazing goes over a few frames rather
+    // than in one 80 ms step.
     if (this.pending.length) {
-      let w = 0;
+      let w = 0, glass = 0;
       for (const l of this.pending) {
         if (!l.active) continue;
-        if (l.releaseAt > now) {
+        if (l.releaseAt > now || (l.supported.el.kind === 'glass' && glass >= GLASS_PER_STEP)) {
           this.pending[w++] = l;
           continue;
         }
+        if (l.supported.el.kind === 'glass') glass++;
         this.release(l, now);
       }
       this.pending.length = w;
@@ -287,7 +318,7 @@ export class StructureGraph implements StructureApi {
     let node = this.nodes.get(el);
     if (!node) {
       node = {
-        el, s: el.structural ?? null, up: [], down: [], external: 0, target: 0, pts: [], pushed: 0, pushedAt: -Infinity,
+        el, s: el.structural ?? null, up: [], down: [], external: 0, target: 0, pts: [], snap: null, w: 0, wDirty: true, pushed: 0, pushedAt: -Infinity,
         touched: false, lastEval: -Infinity, gone: false, fell: false, indeg: 0,
       };
       this.nodes.set(el, node);
@@ -299,6 +330,7 @@ export class StructureGraph implements StructureApi {
   /** Re-measure a supporter's contact regions and schedule the ones it no longer holds. */
   private measure(node: Node, now: number): void {
     const s = node.s;
+    (node.snap ??= new THREE.Box3()).copy(node.el.bounds);
     const steel = node.el.kind === 'beam' || node.el.kind === 'plate';
     for (const l of node.up) {
       if (!l.active || l.releaseAt >= 0) continue;
@@ -329,9 +361,12 @@ export class StructureGraph implements StructureApi {
     const w = last ? safeWeight(child) : 0;
     child.s?.releaseAnchor(l.id);
     if (!last) return;
-    // Nothing holds it any more: its mass starts to fall. Steel members and plates report their
-    // own failure when they come loose (they know whether they buckled, were severed or let go).
+    // Nothing holds it any more: its mass starts to fall, and what it carries starts its own
+    // countdown now (not a step later, when the element reports itself failed). Steel members and
+    // plates report their own failure when they come loose (they know whether they buckled, were
+    // severed or let go).
     child.fell = true;
+    for (const u of child.up) this.schedule(u, now);
     const k = child.el.kind;
     if (k === 'beam' || k === 'plate') return;
     const pos = child.el.bounds.isEmpty() ? l.centre.clone() : child.el.bounds.getCenter(new THREE.Vector3());
@@ -478,9 +513,28 @@ export function bearingHits(sup: Destructible, region: THREE.Box3): number {
   return hits;
 }
 
+/** The element's own weight (cached until it is touched), N; 0 for anything non-finite. */
 function safeWeight(node: Node): number {
-  const w = node.s?.weight() ?? 0;
-  return Number.isFinite(w) && w > 0 ? w : 0;
+  if (node.wDirty) {
+    const w = node.s?.weight() ?? 0;
+    node.w = Number.isFinite(w) && w > 0 ? w : 0;
+    node.wDirty = false;
+  }
+  return node.w;
+}
+
+function sameBox(a: THREE.Box3, b: THREE.Box3, tol: number): boolean {
+  return Math.abs(a.min.x - b.min.x) <= tol && Math.abs(a.min.y - b.min.y) <= tol && Math.abs(a.min.z - b.min.z) <= tol
+    && Math.abs(a.max.x - b.max.x) <= tol && Math.abs(a.max.y - b.max.y) <= tol && Math.abs(a.max.z - b.max.z) <= tol;
+}
+
+/** Two upright steel members, one standing on the other: a column splice. */
+export function isSplice(supporter: Destructible, supported: Destructible): boolean {
+  return supporter.kind === 'beam' && supported.kind === 'beam' && upright(supporter.bounds) && upright(supported.bounds);
+}
+
+function upright(b: THREE.Box3): boolean {
+  return !b.isEmpty() && b.max.y - b.min.y > 3 * Math.max(b.max.x - b.min.x, b.max.z - b.min.z);
 }
 
 /** A support's share of a point load falls with the load's plan distance from its contact. */
@@ -495,13 +549,17 @@ function leverWeight(l: Link, x: number, z: number): number {
  * Time for a supported element to drop through the deformation capacity δ of its bearing once the
  * support below it has gone, t = √(2δ/g). δ ≈ 20 mm for concrete or stone bearing on concrete or
  * stone (crushing of the bearing edge), 50 mm for steel (plastic rotation of a connection before
- * it lets go), 12 mm for glass in a frame (the glazing bite). Engineering estimates; the ±15 %
- * spread per link (a hash of its id, so runs are reproducible) keeps a row of identical bearings
- * from letting go on the same step.
+ * it lets go), 12 mm for glass in a frame (the glazing bite), and 5 mm for a bolted column splice
+ * (2 mm hole clearance, EN 1090-2 normal holes, plus bearing of the splice plates): a column is
+ * continuous through its splices, so the storey above follows the one below almost at once
+ * instead of hanging on for a bearing's worth of fall and opening a gap. Engineering estimates;
+ * the ±15 % spread per link (a hash of its id, so runs are reproducible) keeps a row of identical
+ * bearings from letting go on the same step.
  */
-export function delay(l: { id: string; supporter: { el: Destructible } | null; supported: { el: Destructible } }): number {
+export function delay(l: { id: string; supporter: { el: Destructible } | null; supported: { el: Destructible }; splice?: boolean }): number {
   const a = l.supported.el.kind, b = l.supporter?.el.kind;
-  const delta = a === 'glass' ? DELTA_GLAZING : a === 'beam' || a === 'plate' || b === 'beam' || b === 'plate' ? DELTA_STEEL : DELTA_BRITTLE;
+  const splice = l.splice ?? (!!l.supporter && isSplice(l.supporter.el, l.supported.el));
+  const delta = a === 'glass' ? DELTA_GLAZING : splice ? DELTA_SPLICE : a === 'beam' || a === 'plate' || b === 'beam' || b === 'plate' ? DELTA_STEEL : DELTA_BRITTLE;
   let h = 2166136261;
   for (let i = 0; i < l.id.length; i++) h = Math.imul(h ^ l.id.charCodeAt(i), 16777619);
   const jitter = 0.85 + 0.3 * (((h >>> 0) % 1000) / 1000);
