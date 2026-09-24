@@ -226,6 +226,10 @@ const CSS = /* css */ `
 .dx-hit { position: absolute; left: 50%; top: 50%; opacity: 0; transition: opacity 0.18s ease-out; }
 .dx-hit.dx-show { opacity: 1; transition: none; }
 
+/* Lite panels: no backdrop blur (see Hud.setLite), a denser tint instead. */
+.dx-root.dx-lite .dx-panel { -webkit-backdrop-filter: none; backdrop-filter: none; background: rgba(24, 21, 18, 0.82); }
+.dx-root.dx-lite .dx-menu::before { -webkit-backdrop-filter: none; backdrop-filter: none; }
+
 /* Clean view: only the reticle (and transient messages) remain. */
 .dx-root.dx-clean :is(.dx-top, .dx-ruler, .dx-tele, .dx-card, .dx-strip, .dx-readout) { display: none; }
 

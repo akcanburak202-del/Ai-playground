@@ -130,9 +130,15 @@ const kit = await createSandbox({
         disposables.push(env, pm);
       });
     }
-    const concrete = new THREE.MeshStandardMaterial({ color: 0xffffff, map: stoneTexture('concrete'), roughness: 0.9 });
-    const travertine = new THREE.MeshStandardMaterial({ color: 0xffffff, map: stoneTexture('travertine'), roughness: 0.7 });
-    const plaster = new THREE.MeshStandardMaterial({ color: 0xffffff, map: stoneTexture('plaster'), roughness: 0.95 });
+    // The 256 px tiles repeat a few times per face so close-ups through the glass stay sharp.
+    const tiled = (kind: 'concrete' | 'travertine' | 'plaster', n: number) => {
+      const t = stoneTexture(kind);
+      t.repeat.set(n, n);
+      return t;
+    };
+    const concrete = new THREE.MeshStandardMaterial({ color: 0xffffff, map: tiled('concrete', 2), roughness: 0.9 });
+    const travertine = new THREE.MeshStandardMaterial({ color: 0xffffff, map: tiled('travertine', 3), roughness: 0.7 });
+    const plaster = new THREE.MeshStandardMaterial({ color: 0xffffff, map: tiled('plaster', 3), roughness: 0.95 });
     const bronze = new THREE.MeshStandardMaterial({ color: 0x2a241f, metalness: 0.85, roughness: 0.38 });
     const steel = new THREE.MeshStandardMaterial({ color: 0x18191a, metalness: 0.6, roughness: 0.45 });
     const oak = new THREE.MeshStandardMaterial({ color: 0x8a5a36, roughness: 0.6 });
@@ -228,6 +234,23 @@ if (pipeline instanceof Pipeline) {
     spawn: { position: [0.6, 1.75, 10.5], lookAt: [0.3, 1.9, 0] }, sun: { elevation: 11, azimuth: 38 }, build: () => {},
   };
   pipeline.setup(ctx, sceneDef);
+}
+if (params.get('terrain') !== '1') {
+  // The pipeline's fallback ground is two 4 km triangles. Their interpolated depth (SwiftShader)
+  // is off by centimetres, enough to overdraw the plaza and the glass lying on it in some views, so
+  // it is replaced by a finely subdivided plane just under the plaza (as the terrain module does).
+  const fallback = ctx.scene.getObjectByName('basic-ground') as THREE.Mesh | undefined;
+  if (fallback) {
+    fallback.visible = false;
+    const geo = new THREE.PlaneGeometry(1200, 1200, 120, 120).rotateX(-Math.PI / 2);
+    const mat = (fallback.material as THREE.MeshStandardMaterial).clone();
+    disposables.push(geo, mat);
+    const ground = new THREE.Mesh(geo, mat);
+    ground.name = 'sandbox-ground';
+    ground.position.y = -0.01;
+    ground.receiveShadow = true;
+    ctx.world.add(ground);
+  }
 }
 
 const v3 = (a: [number, number, number]) => new THREE.Vector3(a[0], a[1], a[2]);

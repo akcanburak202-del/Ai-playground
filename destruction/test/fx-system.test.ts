@@ -139,3 +139,36 @@ test('fx system: every event kind at any frame step stays finite and within the 
   fx.dispose();
   assert.equal(getAtmosphere(ctx.scene).fxRoot, null);
 });
+
+test('fx system: sustained 30 mm fire (GAU-8, 65 rounds/s) is thinned before it overwrites live particles', () => {
+  const { sim, ctx } = fakeSim();
+  const fx = new FxSystem(sim);
+  ctx.fx = fx;
+  // One isolated hit: nothing is thinned (full reaction).
+  ctx.time.now = 0.01;
+  const before = fx.chipLayer.emitted;
+  ctx.events.emit('impact', impact(ctx, 'pgu14', 'concrete'));
+  const single = fx.chipLayer.emitted - before;
+  assert.ok(single >= 80, `single 30 mm hit throws its full chip count (${single})`);
+  // Ten seconds of continuous fire into concrete, one fixed step per round.
+  const dt = 1 / 65;
+  const chipsLife: number[] = [];
+  for (let i = 0; i < 650; i++) {
+    ctx.time.now += dt;
+    const e = impact(ctx, 'pgu14', 'concrete');
+    e.point.set((i % 13) * 0.3 - 2, 1 + Math.floor(i / 13) % 5 * 0.3, 0);
+    ctx.events.emit('impact', e);
+    fx.frameUpdate(dt, dt);
+    if (i % 65 === 64) chipsLife.push(fx.chipLayer.emitted);
+  }
+  const load = fx.poolLoad();
+  assert.ok(load.chips < BUDGET.chips * 0.75, `chip load ${load.chips.toFixed(0)} stays under the pool`);
+  assert.ok(load.smoke < BUDGET.smoke * 0.75, `smoke load ${load.smoke.toFixed(0)}`);
+  assert.ok(load.sparks < BUDGET.sparks * 0.9, `spark load ${load.sparks.toFixed(0)}`);
+  // Over the last 5 s fewer chips were emitted than the pool holds: none of them got recycled early.
+  const last5 = chipsLife[9]! - chipsLife[4]!;
+  assert.ok(last5 < BUDGET.chips, `chips emitted in 5 s of fire: ${last5}`);
+  assert.ok(last5 > 500, `the burst still throws debris (${last5})`);
+  assert.ok(allFinite(fx));
+  fx.dispose();
+});

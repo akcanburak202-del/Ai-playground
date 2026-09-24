@@ -140,15 +140,22 @@ test('reticles, scopes and scene drawings are chosen sensibly', () => {
 });
 
 test('hit group: a burst on one spot reads as a cavity that keeps deepening', () => {
+  // The viewer stands 10 m in front of the wall, looking at it (−z).
+  const eye = new THREE.Vector3(0, 1.5, 10), fwd = new THREE.Vector3(0, 0, -1);
+  const shoot = (gs: HitGroups, e: ImpactEvent, r = 0) => {
+    const g = gs.add(e, r);
+    gs.select(e.time, eye, fwd, g);
+    return g;
+  };
   const gs = new HitGroups();
   const hit = (i: number, o: Partial<ImpactEvent> = {}) => impact({
     time: i * 0.075, targetName: 'RC wall', targetKind: 'voxel',
     // Each round meets the floor the earlier ones dug (1 cm deeper each) and digs 3 cm more.
     point: new THREE.Vector3(0.01 * Math.sin(i), 1.5 + 0.01 * Math.cos(i), -0.01 * i), depth: 0.03, ...o,
   });
-  gs.add(hit(0));
+  shoot(gs, hit(0));
   assert.equal(groupLine(gs.current), null, 'one hit is not a group yet');
-  for (let i = 1; i < 12; i++) gs.add(hit(i));
+  for (let i = 1; i < 12; i++) shoot(gs, hit(i));
   const g = gs.current!;
   assert.equal(g.count, 12);
   // Reach = depth of the entry point below the first entry plane + depth along the normal.
@@ -157,24 +164,27 @@ test('hit group: a burst on one spot reads as a cavity that keeps deepening', ()
   assert.equal(g.profile.length, 12);
   assert.ok(g.profile.every((r, i) => i === 0 || r >= g.profile[i - 1]!), 'the cavity profile never gets shallower');
   // The round that goes through gives the member's thickness (exit point below the first entry plane) …
-  gs.add(hit(12, { outcome: 'perforate', exitPoint: new THREE.Vector3(0, 1.5, -0.25) }));
+  shoot(gs, hit(12, { outcome: 'perforate', exitPoint: new THREE.Vector3(0, 1.5, -0.25) }));
   assert.equal(g.perforatedAt, 13);
   assert.ok(Math.abs(g.thickness - 0.25) < 1e-9);
   // … and lands behind the wall: a spot of its own, which must not take over the readout.
-  gs.add(hit(12.2, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(0, 0, -6), normal: new THREE.Vector3(0, 1, 0) }));
+  shoot(gs, hit(12.2, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(0, 0, -6), normal: new THREE.Vector3(0, 1, 0) }));
   assert.equal(gs.current, g);
-  gs.add(hit(13.1, { point: new THREE.Vector3(0, 1.5, -0.12) }));
-  gs.add(hit(13.3, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(0.02, 0, -6), normal: new THREE.Vector3(0, 1, 0) }));
+  shoot(gs, hit(13.1, { point: new THREE.Vector3(0, 1.5, -0.12) }));
+  shoot(gs, hit(13.3, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(0.02, 0, -6), normal: new THREE.Vector3(0, 1, 0) }));
   assert.equal(gs.current, g, 'still the wall after a second round landed on the same spot behind it');
   // A tandem precursor and the main jet of one round (same step) are one hit.
   const n = g.count;
-  gs.add(hit(20, { time: 20, agent: 'jet', depth: 0.05 }));
-  gs.add(hit(20, { time: 20, agent: 'jet', depth: 0.25 }));
+  shoot(gs, hit(20, { agent: 'jet', depth: 0.05 }));
+  shoot(gs, hit(20, { agent: 'jet', depth: 0.25 }));
   assert.equal(g.count, n + 1);
   // Fragments are not aimed hits.
-  assert.equal(gs.add(hit(21, { agent: 'fragment' })), null);
-  // Working another spot: it takes over once it is the one being hit.
-  for (let i = 0; i < 4; i++) gs.add(hit(40 + i, { point: new THREE.Vector3(1.2, 1.5, -0.01 * i) }));
+  assert.equal(shoot(gs, hit(21, { agent: 'fragment' })), null);
+  // Working another spot: it takes over once it is the one being hit and the crosshair is on it.
+  const fwd0 = fwd.clone();
+  fwd.set(1.2, 0, -10).normalize();
+  for (let i = 0; i < 4; i++) shoot(gs, hit(40 + i * 0.1, { point: new THREE.Vector3(1.2, 1.5, -0.01 * i) }));
+  fwd.copy(fwd0);
   assert.notEqual(gs.current, g);
   const l2 = groupLine(gs.current)!;
   assert.equal(l2.head, 'Aynı nokta · 4. isabet');
@@ -184,16 +194,18 @@ test('hit group: a burst on one spot reads as a cavity that keeps deepening', ()
   // A burst next to an older hit (9 cm away) stays one spot: each hit goes to the nearest group
   // (only the first rounds, inside the older hit's 10 cm, may join that one).
   const gs2 = new HitGroups();
-  gs2.add(hit(100, { point: new THREE.Vector3(0, 1.59, 0) }));
-  for (let i = 0; i < 30; i++) gs2.add(hit(101 + i * 0.075, { point: new THREE.Vector3(0.012 * Math.sin(i * 2.1), 1.5 + 0.012 * Math.cos(i * 1.7), -0.004 * i) }));
+  shoot(gs2, hit(100, { point: new THREE.Vector3(0, 1.59, 0) }));
+  for (let i = 0; i < 30; i++) shoot(gs2, hit(101 + i * 0.075, { point: new THREE.Vector3(0.012 * Math.sin(i * 2.1), 1.5 + 0.012 * Math.cos(i * 1.7), -0.004 * i) }));
   assert.ok(gs2.current!.count >= 27 && gs2.current!.deepest > 0.1, `burst kept together: ${gs2.list.map((x) => x.count)}`);
-  // Rounds flying on through a hole land all over the ground behind: single hits never take the
-  // readout from the plate, and filling the list with them does not evict it.
+  // Rounds flying on through a hole land on the ground behind: those ricochet marks (no cavity,
+  // far from the crosshair) never take the readout from the plate, and do not evict it either.
   const gs3 = new HitGroups();
   const plate = { targetName: 'plate', targetKind: 'plate', material: MATERIALS.steel_s355 };
-  for (let i = 0; i < 3; i++) gs3.add(hit(200 + i * 0.1, { ...plate, point: new THREE.Vector3(0.003 * i, 1.3, 0), outcome: 'perforate', depth: 0.012 }));
+  for (let i = 0; i < 3; i++) shoot(gs3, hit(200 + i * 0.1, { ...plate, point: new THREE.Vector3(0.003 * i, 1.3, 0), outcome: 'perforate', depth: 0.012 }));
   const plateGroup = gs3.current!;
-  for (let i = 0; i < 12; i++) gs3.add(hit(200.35 + i * 0.1, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(i * 3, 0, -150 - i * 7), normal: new THREE.Vector3(0, 1, 0) }));
+  for (let i = 0; i < 12; i++) shoot(gs3, hit(200.35 + i * 0.1, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(i * 3, 0, -150 - i * 7), normal: new THREE.Vector3(0, 1, 0) }));
+  // … even when they land together (same trajectory through the same hole) and dig a little.
+  for (let i = 0; i < 6; i++) shoot(gs3, hit(201.6 + i * 0.1, { targetName: 'ground', targetKind: 'terrain', material: MATERIALS.soil, point: new THREE.Vector3(0.5, 0, -150), normal: new THREE.Vector3(0, 1, 0), depth: 0.02 }));
   assert.equal(gs3.current, plateGroup);
   assert.equal(groupLine(gs3.current)!.head, 'Aynı nokta · 3. isabet');
   // A dispersed weapon (GAU-8, 9.6 MOA at 30 m: 95 % radius ≈ 0.2 m) still groups on one spot.
@@ -201,17 +213,25 @@ test('hit group: a burst on one spot reads as a cavity that keeps deepening', ()
   const r95 = 2.45 * 9.6 * (Math.PI / (180 * 60)) * 30;
   const rng = new Rng(7);
   const sig = r95 / 2.45;
-  for (let i = 0; i < 60; i++) gs4.add(hit(300 + i * 0.015, { point: new THREE.Vector3(rng.gaussian(0, sig), 1.5 + rng.gaussian(0, sig), -0.002 * i) }), r95);
+  for (let i = 0; i < 60; i++) shoot(gs4, hit(300 + i * 0.015, { point: new THREE.Vector3(rng.gaussian(0, sig), 1.5 + rng.gaussian(0, sig), -0.002 * i) }), r95);
   assert.ok(gs4.current!.count >= 50, `GAU-8 burst: ${gs4.list.map((x) => x.count)}`);
+  // A single round elsewhere after the spot went quiet: no stale readout.
+  const gs5 = new HitGroups();
+  for (let i = 0; i < 5; i++) shoot(gs5, hit(400 + i * 0.1));
+  assert.ok(gs5.current);
+  shoot(gs5, hit(400.9, { point: new THREE.Vector3(2, 1, 0) }));
+  assert.ok(gs5.current, 'still shown right after the burst');
+  shoot(gs5, hit(460, { point: new THREE.Vector3(-2, 1, 0) }));
+  assert.equal(gs5.current, null);
   // Long bursts keep a bounded profile that still ends at the deepest point.
-  for (let i = 0; i < 1000; i++) gs.add(hit(60 + i * 0.07, { point: new THREE.Vector3(1.2, 1.5, -0.0002 * i) }));
+  for (let i = 0; i < 1000; i++) shoot(gs, hit(60 + i * 0.07, { point: new THREE.Vector3(1.2, 1.5, -0.0002 * i) }));
   const lg = gs.current!;
   assert.ok(lg.profile.length <= PROFILE_POINTS && lg.profile.length >= PROFILE_POINTS / 2, `profile ${lg.profile.length}`);
   assert.ok(Math.abs(lg.profile[lg.profile.length - 1]! - lg.deepest) < 1e-12);
   assert.ok(Math.abs(lg.profile.length * lg.stride - lg.count) < lg.stride, `stride ${lg.stride} × ${lg.profile.length} vs ${lg.count}`);
   // Degenerate input stays finite; the list stays bounded.
-  gs.add(hit(2000, { targetName: 'plate', targetKind: 'plate', normal: new THREE.Vector3(0, 0, 0), depth: NaN }));
-  for (let i = 0; i < 20; i++) gs.add(hit(2001 + i, { point: new THREE.Vector3(i, 0, 0) }));
+  shoot(gs, hit(2000, { targetName: 'plate', targetKind: 'plate', normal: new THREE.Vector3(0, 0, 0), depth: NaN }));
+  for (let i = 0; i < 20; i++) shoot(gs, hit(2001 + i, { point: new THREE.Vector3(i, 0, 0) }));
   assert.ok(gs.list.length <= 6);
   assert.ok(gs.list.every((x) => x.profile.every(Number.isFinite) && Number.isFinite(x.deepest)));
 });

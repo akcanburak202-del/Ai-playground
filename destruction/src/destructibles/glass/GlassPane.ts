@@ -14,7 +14,7 @@ import {
 } from './model.ts';
 import { diceDrag, diceRest, dragA, hash01, landingTime, NEVER, siteRelease, sitePosition, type BreakTiming, type DiceRest } from './dicing.ts';
 import { createGlassUniforms, createReflectionMaterial, createTransmissionMaterial, createFittingMaterial, type GlassUniforms } from './look.ts';
-import { DiceSystem, type DieSpawn } from './DiceSystem.ts';
+import { DICE_CAP, DiceSystem, type DieSpawn } from './DiceSystem.ts';
 import { HeapDecal } from './HeapDecal.ts';
 import { FloorProbe } from './floor.ts';
 import { admitBlast, allowance, spend } from './budget.ts';
@@ -37,6 +37,8 @@ const MAX_DICE_PER_PANE = 20000;
 const HEAP_DELAY = 12;
 /** Rigid shards one blast release creates per pane (the smaller pieces fly as dice). */
 const BLAST_SHARDS = 40;
+/** Bucket size of the gone-region lookup grid, m. */
+const GONE_CELL = 0.1;
 /** Inset of point fittings from the corners, m (typical spider-fitting edge distance). */
 const FITTING_INSET = 0.075;
 
@@ -112,10 +114,13 @@ export class GlassPane implements Destructible, Structural {
   private readonly seed: number;
   private readonly tint = new THREE.Color();
   /**
-   * Albedo of a die: a glass fragment is mostly seen by its surface reflection; the body colour is
-   * the light scattered back out of it — weak, and coloured by the long path through the glass.
+   * Albedo of a die (drawn opaque): four of its six faces are rough fracture surfaces, so like
+   * crushed ice or cullet it scatters much of the light back (a heap of clear dice reads pale,
+   * glittering green-grey, on asphalt as on stone), coloured by the long paths through the glass:
+   * ≈ 0.05 + 0.36 T² per channel, T the pane's through-thickness transmittance (≈ 0.33 for clear
+   * float, ≈ 0.1 for body-tinted grey).
    */
-  private diceAlbedo: number[] = [0.1, 0.12, 0.11];
+  private diceAlbedo: number[] = [0.32, 0.36, 0.34];
   private diceJob: {
     timing: BreakTiming; s: number; d: number; salt: number; nx: number; ny: number; rows: number[]; next: number;
     fadeAt: number; x: number; y: number; impactP: THREE.Vector3 | null; hitR: number; field: BlastField | null;
@@ -147,10 +152,22 @@ export class GlassPane implements Destructible, Structural {
   // Annealed / laminated crack network
   private graph: CrackGraph | null = null;
   private gone: Gone[] = [];
+  /** Coarse bucket grid over the pane (GONE_CELL squares) listing the gone regions that overlap each cell */
+  private goneGrid: number[][] | null = null;
+  private goneGx = 1;
   private goneArea = 0;
   private facesDirty = false;
   private schedule = new Map<string, Scheduled>();
-  private releaseQueue: { face: Face; field: BlastField; rigid: boolean; t0: number }[] = [];
+  private releaseQueue: { face: Face; field: BlastField | null; rigid: boolean; t0: number }[] = [];
+  /** Pieces of the crack graph at `version` (releases do not change the graph, so they are reused) */
+  private faceCache: { version: number; faces: Face[] } | null = null;
+  /**
+   * Fresh hits not yet realised on the pieces: pane-local centre, exit-cone radius r (m), and the
+   * struck zone (kernel radius R, m; speed v0 its momentum gives the glass under the kernel, m/s)
+   */
+  private knock: { x: number; y: number; r: number; R: number; v0: number }[] = [];
+  /** Unit in-plane direction of gravity (pane-local x, y) and the in-plane share of g, 0..1 */
+  private readonly gIn = [0, -1, 1];
   private pendingBlasts: BlastLoad[] = [];
   /** Crack segments left to draw (blast stars are drawn over a few steps) */
   private cracksPending = false;
@@ -172,6 +189,7 @@ export class GlassPane implements Destructible, Structural {
   private membrane: Membrane | null = null;
   private lam: { geom: THREE.BufferGeometry; pos: Float32Array; nrm: Float32Array; ring: number[] } | null = null;
   private lamDirty = false;
+  private readonly mb = [0, 0, 0, 0, 0, 0];
   private tearAt = Infinity;
   private torn = false;
   private landed = false;
@@ -182,6 +200,8 @@ export class GlassPane implements Destructible, Structural {
   // Dice and heaps
   private dice: DiceSystem | null = null;
   private decals: HeapDecal[] = [];
+  /** DiceSystem write count when this pane's dice started: once the ring has come round past it, the heap shows at once */
+  private heapFirst = -1;
   private floor: FloorProbe | null = null;
 
   // Structure
@@ -212,12 +232,16 @@ export class GlassPane implements Destructible, Structural {
     this.inverse.copy(this.matrix).invert();
     this.quat.copy(this.root.quaternion);
     this.normalW.set(0, 0, 1).applyQuaternion(this.quat);
+    const gl = _v.set(0, -1, 0).applyQuaternion(_q.copy(this.quat).invert());
+    const gm = Math.hypot(gl.x, gl.y);
+    if (gm > 1e-6) this.gIn.splice(0, 3, gl.x / gm, gl.y / gm, gm);
+    else this.gIn.splice(0, 3, 0, -1, 0);
 
     // Tint: internal transmittance through the full thickness at normal incidence.
     if (spec.tint !== undefined) this.tint.setHex(spec.tint);
     else this.tint.setRGB(...(CLEAR_ABSORPTION.map((a) => Math.exp(-a * spec.thickness)) as [number, number, number]));
 
-    this.diceAlbedo = [this.tint.r, this.tint.g, this.tint.b].map((c) => 0.03 + 0.2 * c * c);
+    this.diceAlbedo = [this.tint.r, this.tint.g, this.tint.b].map((c) => 0.05 + 0.36 * c * c);
     this.cleanTex = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
     this.cleanTex.needsUpdate = true;
     this.uniforms = createGlassUniforms(this.cleanTex, this.width, this.height, this.thickness, this.seed, this.tint);
@@ -240,6 +264,19 @@ export class GlassPane implements Destructible, Structural {
     const w = this.width / 2, h = this.height / 2, t = this.thickness / 2 + pad;
     this.bounds.makeEmpty();
     for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) this.bounds.expandByPoint(_v.set(sx * w, sy * h, sz * t).applyMatrix4(this.matrix));
+  }
+
+  /** World AABB of the (sagging, bulging or fallen) laminated sheet, so registry culling keeps finding it. */
+  private membraneBounds(): void {
+    const m = this.membrane;
+    if (!m) return;
+    const b = m.bounds(this.mb);
+    const pad = this.thickness / 2 + 0.02;
+    this.bounds.makeEmpty();
+    for (const sx of [0, 3]) for (const sy of [1, 4]) for (const sz of [2, 5]) {
+      this.bounds.expandByPoint(_w.set(b[sx]!, b[sy]!, b[sz]!).applyMatrix4(this.matrix));
+    }
+    this.bounds.expandByScalar(pad);
   }
 
   private fittingPoints(): [number, number][] {
@@ -380,7 +417,19 @@ export class GlassPane implements Destructible, Structural {
     const r = this.ensureRaster();
     // The through-hole: the tunnel plus chipping at its lip (a clean hole is 1.2–1.8 × the tunnel).
     const tunnel = Math.max(ev.tunnelRadius, 0.4 * ev.ammo.diameter);
-    const holeR = perforated ? tunnel * (this.type === 'laminated' ? 1.0 : 1.2 + 0.6 * this.rnd()) : 0;
+    let holeR = perforated ? tunnel * (this.type === 'laminated' ? 1.0 : 1.2 + 0.6 * this.rnd()) : 0;
+    // Laminated: where earlier hits have already pulverised both plies (the frost channel), the
+    // interlayer alone meets the round; it is punched and tears across the unsupported patch, so
+    // a tight group merges into one ragged opening instead of staying a set of bullet holes.
+    if (this.type === 'laminated' && holeR > 0) holeR *= 1 + 2.5 * r.sample(x, y, 1);
+    // Oblique hits cut an elongated hole, its exit displaced downstream (the in-plane direction of
+    // the shot, stretch 1/cos θ, capped where the round would rather ricochet).
+    const dl = _d.copy(ev.direction).transformDirection(this.inverse);
+    const inPlane = Math.hypot(dl.x, dl.y);
+    const cosT = Math.max(Math.abs(dl.z), 0.4);
+    const shape = inPlane > 1e-3 ? { ax: dl.x / inPlane, ay: dl.y / inPlane, stretch: 1 / cosT } : undefined;
+    const shift = shape ? 0.5 * this.thickness * Math.sqrt(1 - cosT * cosT) / cosT : 0;
+    const hx = shape ? x + shape.ax * shift : x, hy = shape ? y + shape.ay * shift : y;
     this.lastHit.x = x;
     this.lastHit.y = y;
     this.lastHit.time = this.ctx.time.now;
@@ -390,7 +439,7 @@ export class GlassPane implements Destructible, Structural {
     if (this.type === 'tempered') {
       if (this.broken) return;
       if (temperedFails(ev.outcome, ev.depth, ev.craterDepth, this.thickness)) {
-        if (holeR > 0) r.fillPoly(holeOutline(this.ensureGraph(), x, y, holeR, this.rnd));
+        if (holeR > 0) r.fillPoly(holeOutline(this.ensureGraph(), hx, hy, holeR, this.rnd, shape));
         this.impactFrost(x, y, ev, holeR);
         this.breakTempered(x, y, { kind: 'impact', ev });
       } else this.impactFrost(x, y, ev, 0);
@@ -398,12 +447,18 @@ export class GlassPane implements Destructible, Structural {
       const g = this.ensureGraph();
       const E = Math.min(ev.energyAbsorbed, 2e5);
       const spec = impactStar(this.type, E * (perforated ? 1 : 0.5), this.thickness, Math.max(holeR, 0.5 * tunnel), Math.hypot(this.width, this.height), this.rnd);
-      const res = growStar(g, x, y, holeR, spec, this.rnd, (px, py) => this.isGone(px, py));
+      const res = growStar(g, hx, hy, holeR, spec, this.rnd, (px, py) => this.isGone(px, py), shape);
       if (res.hole.length) this.markGone(res.hole, [], true);
       this.impactFrost(x, y, ev, holeR);
       this.paintCracks();
-      if (this.type === 'annealed') this.facesDirty = true;
-      else this.laminatedHit(x, y, ev, spec.length);
+      if (this.type === 'annealed') {
+        // The Hertzian cone the round punches out of the exit face (and the crushed zone at the
+        // entry) takes the small fragments at the hole margin with it.
+        const R = this.lastHit.R;
+        const v0 = ev.momentum.length() / (arealMass(this.material, this.thickness) * Math.PI * R * R);
+        this.knock.push({ x, y, r: 1.3 * Math.max(perforated ? ev.spallRadius : 0, 2.2 * holeR, ev.craterRadius), R, v0: Number.isFinite(v0) ? v0 : 0 });
+        this.facesDirty = true;
+      } else this.laminatedHit(x, y, ev, spec.length);
     }
     // Hertzian cone flake and glitter out of the exit face.
     if (perforated) {
@@ -470,8 +525,19 @@ export class GlassPane implements Destructible, Structural {
 
   // ─── Gone regions ────────────────────────────────────────────────────────────────────────
 
+  private goneCell(x: number, y: number): number {
+    const gx = this.goneGx, gy = this.goneGrid!.length / gx;
+    const i = Math.min(gx - 1, Math.max(0, Math.floor((x + this.width / 2) / GONE_CELL)));
+    const j = Math.min(gy - 1, Math.max(0, Math.floor((y + this.height / 2) / GONE_CELL)));
+    return j * gx + i;
+  }
+
   private isGone(x: number, y: number): boolean {
-    for (const q of this.gone) {
+    const grid = this.goneGrid;
+    if (!grid) return false;
+    const cell = grid[this.goneCell(x, y)]!;
+    for (let c = 0; c < cell.length; c++) {
+      const q = this.gone[cell[c]!]!;
       const b = q.bounds;
       if (x < b[0] || x > b[2] || y < b[1] || y > b[3]) continue;
       if (!pointInPoly(q.outer, x, y)) continue;
@@ -494,7 +560,16 @@ export class GlassPane implements Destructible, Structural {
   }
 
   private markGone(outer: Poly, holes: Poly[], paint: boolean): void {
-    this.gone.push({ outer, holes, bounds: polyBounds(outer) });
+    const b = polyBounds(outer);
+    const id = this.gone.length;
+    this.gone.push({ outer, holes, bounds: b });
+    if (!this.goneGrid) {
+      this.goneGx = Math.max(1, Math.ceil(this.width / GONE_CELL));
+      this.goneGrid = Array.from({ length: this.goneGx * Math.max(1, Math.ceil(this.height / GONE_CELL)) }, () => []);
+    }
+    const i0 = this.goneCell(b[0], b[1]), i1 = this.goneCell(b[2], b[3]);
+    const gx = this.goneGx;
+    for (let j = Math.floor(i0 / gx); j <= Math.floor(i1 / gx); j++) for (let i = i0 % gx; i <= i1 % gx; i++) this.goneGrid[j * gx + i]!.push(id);
     this.goneArea += Math.max(0, polyArea(outer) + holes.reduce((s, h) => s + polyArea(h), 0));
     if (paint) this.paintPiece(outer, holes);
   }
@@ -516,27 +591,99 @@ export class GlassPane implements Destructible, Structural {
 
   // ─── Annealed: which pieces fall ─────────────────────────────────────────────────────────
 
+  /** Pieces of the current crack graph (cached until the graph changes). */
+  private currentFaces(g: CrackGraph): Face[] {
+    if (!this.faceCache || this.faceCache.version !== g.version) this.faceCache = { version: g.version, faces: g.faces() };
+    return this.faceCache.faces;
+  }
+
   /**
-   * Decide the fate of every piece still in the frame. Framed: a piece bearing on the sill stays; a
-   * piece gripped only by the side/head gaskets stays if the grip (GASKET_GRIP × contact length)
-   * exceeds its weight, but works loose after a while (the dangerous "guillotine" shard); a piece
-   * touching no edge slides out at once. Point-fixed: only pieces holding a fitting stay.
+   * Which pieces stay in the frame. A cracked pane is a masonry of glass: every piece bears on the
+   * pieces below it through their crack faces, down to the sill (the wedge between two radial
+   * cracks above a hole is a keystone and stays), so support is propagated upward from the frame
+   * along contacts whose outward normal points down the pane (in-plane gravity). Framed: the sill
+   * carries what bears on it; a piece touching only the side/head gaskets is held by their grip
+   * (GASKET_GRIP × contact length) but works loose after a while (the "guillotine" shard).
+   * Point-fixed: the pieces holding a fitting carry the rest. Returns 0 = falls, 1 = held,
+   * 2 = held by gasket friction only (falls later).
+   */
+  private support(faces: Face[], gone: Uint8Array): Uint8Array {
+    const n = faces.length;
+    const held = new Uint8Array(n);
+    const bear = new Float64Array(n);
+    const [gx, gy, gm] = this.gIn as [number, number, number];
+    const q = arealMass(this.material, this.thickness) * GRAVITY;
+    const stack: number[] = [];
+    for (let k = 0; k < n; k++) {
+      if (gone[k]) continue;
+      const f = faces[k]!;
+      if (this.spec.framed) {
+        let sill = 0, grip = 0;
+        const L = f.links;
+        for (let i = 0; i < L.length; i += 4) {
+          if (L[i]! >= 0) continue;
+          const down = L[i + 2]! * gx + L[i + 3]! * gy;
+          if (down > 0.5 && gm > 0.3) sill += L[i + 1]!;
+          else grip += L[i + 1]!;
+        }
+        if (sill > 0.01) held[k] = 1;
+        else if (grip * GASKET_GRIP > 1.5 * q * f.area) held[k] = 2;
+      } else {
+        for (const [fx, fy] of this.fittingPoints()) if (pointInPoly(f.outer, fx, fy)) held[k] = 1;
+      }
+    }
+    // Gasket-held seeds go to the bottom of the stack, so full support propagates first and a piece
+    // bearing on both kinds of neighbour counts as fully held.
+    for (let k = 0; k < n; k++) if (held[k] === 2) stack.push(k);
+    for (let k = 0; k < n; k++) if (held[k] === 1) stack.push(k);
+    // A (nearly) horizontal pane has no in-plane load path: loose pieces drop through.
+    if (gm < 0.3) return held;
+    while (stack.length) {
+      const j = stack.pop()!;
+      const L = faces[j]!.links;
+      for (let i = 0; i < L.length; i += 4) {
+        const k = L[i]!;
+        if (k < 0 || gone[k] || held[k]) continue;
+        // Piece k presses on j where j's outward normal points up the pane (k lies above j).
+        const up = -(L[i + 2]! * gx + L[i + 3]! * gy);
+        if (up <= 0.1) continue;
+        bear[k] += L[i + 1]! * up;
+        // Enough bearing length that the piece cannot rotate off a point contact.
+        if (bear[k] >= Math.min(0.03, 0.15 * Math.sqrt(faces[k]!.area))) {
+          held[k] = held[j] === 2 ? 2 : 1;
+          stack.push(k);
+        }
+      }
+    }
+    return held;
+  }
+
+  /**
+   * Decide the fate of every piece still in the frame (see `support`). Pieces a fresh round has
+   * punched out (inside its exit cone) leave at once with the round's momentum; unsupported pieces
+   * slide out after a moment; the release of a piece re-runs the check, so a hole grows upward as
+   * the pieces above it lose their bearing, and sustained fire eats the pane away progressively.
    */
   private evaluateFaces(field: BlastField | null): void {
     const g = this.graph;
     if (!g) return;
     const t0 = performance.now();
-    const faces = g.faces();
+    const faces = this.currentFaces(g);
     this.stats.faces = faces.length;
     const now = this.ctx.time.now;
     const next = new Map<string, Scheduled>();
-    const q = arealMass(this.material, this.thickness) * GRAVITY;
+    const gone = new Uint8Array(faces.length);
+    for (let k = 0; k < faces.length; k++) gone[k] = this.isGone(faces[k]!.sample[0], faces[k]!.sample[1]) ? 1 : 0;
     // Blast releases are painted in one go afterwards (usually the whole pane goes at once); the
     // largest pieces fly as rigid shards, the many small ones as dice (bounded cost per blast).
     const blasted: Face[] = [];
     if (field) {
-      for (const f of faces) {
-        if (!this.isGone(f.sample[0], f.sample[1]) && sampleField(field, field.D, f.sample[0], f.sample[1], this.width, this.height) >= 1) blasted.push(f);
+      for (let k = 0; k < faces.length; k++) {
+        const f = faces[k]!;
+        if (!gone[k] && sampleField(field, field.D, f.sample[0], f.sample[1], this.width, this.height) >= 1) {
+          blasted.push(f);
+          gone[k] = 1;
+        }
       }
       // Largest first: they become the rigid shards and are spawned in the first steps.
       blasted.sort((a, b) => b.area - a.area);
@@ -546,22 +693,50 @@ export class GlassPane implements Destructible, Structural {
       });
       this.runReleaseQueue(4);
     }
-    for (const f of faces) {
-      if (this.isGone(f.sample[0], f.sample[1])) continue;
-      let hold = false;
-      let late = false;
-      if (this.spec.framed) {
-        const grip = (f.edge[1] + f.edge[2] + f.edge[3]) * GASKET_GRIP;
-        if (f.edge[0] > 0.01) hold = true;
-        else if (grip > 1.5 * q * f.area) {
-          hold = true;
-          late = true;
+    // Fresh hits: pieces lying wholly inside the exit cone are punched out; loose pieces (not
+    // clamped by the frame) are shaken out when the round's momentum, shared over the struck zone
+    // (Gaussian kernel of radius R: Δv = v0·e^(−r²/R²), a large piece spreading its share over its
+    // own mass), exceeds what friction on their crack faces arrests within one glass thickness of
+    // travel: v_c = √(2 μ g t), μ ≈ 0.9 for glass on glass.
+    if (this.knock.length) {
+      const vc = Math.sqrt(2 * 0.9 * GRAVITY * this.thickness);
+      for (let k = 0; k < faces.length; k++) {
+        if (gone[k]) continue;
+        const f = faces[k]!;
+        const b = f.bounds;
+        let loose = true;
+        for (let i = 0; i < f.links.length && loose; i += 4) if (f.links[i]! < 0) loose = false;
+        for (const h of this.knock) {
+          let out = false;
+          if (!(b[0] > h.x + h.r || b[2] < h.x - h.r || b[1] > h.y + h.r || b[3] < h.y - h.r)) {
+            out = true;
+            for (let i = 0; i < f.outer.length && out; i += 2) {
+              const dx = f.outer[i]! - h.x, dy = f.outer[i + 1]! - h.y;
+              if (dx * dx + dy * dy > h.r * h.r) out = false;
+            }
+          }
+          if (!out && loose && h.v0 > vc) {
+            const dx = f.sample[0] - h.x, dy = f.sample[1] - h.y;
+            const zone = Math.PI * h.R * h.R;
+            out = h.v0 * Math.exp(-(dx * dx + dy * dy) / (h.R * h.R)) * Math.min(1, zone / f.area) > vc;
+          }
+          if (!out) continue;
+          // The hole shows at once; the piece's body is spawned within the step budget (a burst
+          // can punch out a dozen pieces at once), starting where its flight has taken it.
+          this.markGone(f.outer, f.holes, true);
+          this.releaseQueue.push({ face: f, field: null, rigid: true, t0: now });
+          gone[k] = 1;
+          break;
         }
-      } else {
-        for (const [fx, fy] of this.fittingPoints()) if (pointInPoly(f.outer, fx, fy)) hold = true;
       }
-      if (hold && !late) continue;
-      if (f.area < DICE_AREA && !hold) {
+      this.knock.length = 0;
+    }
+    const held = this.support(faces, gone);
+    for (let k = 0; k < faces.length; k++) {
+      if (gone[k] || held[k] === 1) continue;
+      const f = faces[k]!;
+      const late = held[k] === 2;
+      if (f.area < DICE_AREA && !late) {
         this.releaseFace(f, null);
         continue;
       }
@@ -617,10 +792,10 @@ export class GlassPane implements Destructible, Structural {
       // bullet's momentum (spread over the struck zone).
       const side = this.rnd() < 0.5 ? -1 : 1;
       v.copy(this.normalW).multiplyScalar(side * (0.05 + 0.25 * this.rnd()));
-      const age = this.ctx.time.now - this.lastHit.time;
+      const since = this.ctx.time.now - this.lastHit.time;
       const dx = c[0] - this.lastHit.x, dy = c[1] - this.lastHit.y;
       const R = this.lastHit.R;
-      if (age < 0.4 && dx * dx + dy * dy < 4 * R * R) {
+      if (since < 0.4 && dx * dx + dy * dy < 4 * R * R) {
         const m = arealMass(this.material, this.thickness) * Math.PI * R * R;
         v.addScaledVector(this.lastHit.p, Math.min(8, 1 / Math.max(m, 1e-3)) * Math.exp(-(dx * dx + dy * dy) / (R * R)));
       }
@@ -737,6 +912,7 @@ export class GlassPane implements Destructible, Structural {
       if (j0 + k < ny) rows.push(j0 + k);
       if (j0 - k >= 0) rows.push(j0 - k);
     }
+    this.heapFirst = ds.spawned;
     this.diceJob = {
       timing, s, d, salt, nx, ny, rows, next: 0, fadeAt, x, y,
       impactP: cause.kind === 'impact' ? cause.ev.momentum.clone() : null,
@@ -1164,7 +1340,10 @@ export class GlassPane implements Destructible, Structural {
         for (const [k, s] of this.schedule) {
           if (s.time > now) continue;
           this.schedule.delete(k);
-          if (!this.isGone(s.face.sample[0], s.face.sample[1])) this.releaseFace(s.face, null);
+          if (this.isGone(s.face.sample[0], s.face.sample[1])) continue;
+          this.releaseFace(s.face, null);
+          // What bore on it has lost its support: check again next step (the hole grows upward).
+          this.facesDirty = true;
         }
       }
     }
@@ -1177,6 +1356,7 @@ export class GlassPane implements Destructible, Structural {
       if (this.membrane.awake) {
         this.membrane.step(dt);
         this.lamDirty = true;
+        this.membraneBounds();
         if (this.torn && !this.landed && this.membrane.floorImpulse > 0.5) {
           this.landed = true;
           this.ctx.events.emit('debrisContact', { time: now, position: this.bounds.getCenter(new THREE.Vector3()).setY(this.bounds.min.y), impulse: this.membrane.floorImpulse * 20, size: Math.max(this.width, this.height), material: this.material });
@@ -1220,7 +1400,15 @@ export class GlassPane implements Destructible, Structural {
     }
     this.probes?.update();
     this.uniforms.uTime.value = this.ctx.time.now;
-    if (this.dice) this.dice.update(this.ctx.time.now);
+    if (this.dice) {
+      this.dice.update(this.ctx.time.now);
+      // The scene's dice ring has come round to this pane's dice (a big blast elsewhere): show the
+      // heap now instead of letting it vanish until its decal was due.
+      if (this.heapFirst >= 0 && this.decals.length && this.dice.spawned - DICE_CAP > this.heapFirst) {
+        for (const dcl of this.decals) dcl.appearBy(this.ctx.time.now);
+        this.heapFirst = -1;
+      }
+    }
     this.uploadRaster();
     this.shards?.frameUpdate();
     if (this.lamDirty) {
@@ -1274,15 +1462,20 @@ export class GlassPane implements Destructible, Structural {
   }
 
   /**
-   * Edge-loaded glass buckles long before it crushes: plate buckling N_cr = k π² D / b per metre of
-   * edge, D = E t³ / 12(1 − ν²), k = 4 (Timoshenko & Gere 1961). A frame that deflects onto the pane
-   * with more than that breaks it.
+   * Edge-loaded glass buckles long before it crushes. Plate simply supported on four edges,
+   * compressed down its height a = H across its width b = W: N_cr = k π² D / b² per metre of loaded
+   * edge, D = E t³ / 12(1 − ν²), k = min over half-waves m of (m b/a + a/(m b))² (≈ 4 for tall
+   * panes, larger for wide low ones; Timoshenko & Gere 1961, "Theory of Elastic Stability", §9.2).
+   * A frame that deflects onto the pane with more than N_cr · W breaks it.
    */
   setImposedLoad(newtons: number): void {
     this.imposed = newtons;
     const m = this.material, t = this.thickness;
     const Dp = (m.youngModulus * t * t * t) / (12 * (1 - m.poisson * m.poisson));
-    const Ncr = ((4 * Math.PI * Math.PI * Dp) / (this.height * this.height)) * this.width;
+    const a = this.height, b = this.width;
+    let k = Infinity;
+    for (let w = 1; w <= 12; w++) k = Math.min(k, (w * b / a + a / (w * b)) ** 2);
+    const Ncr = ((k * Math.PI * Math.PI * Dp) / (b * b)) * b;
     if (newtons > Ncr && !this.hasFailed()) this.supportLost();
   }
 
@@ -1297,7 +1490,7 @@ export class GlassPane implements Destructible, Structural {
         this.ensureRaster();
         growStar(g, 0, 0, 0, blastStar(1.3, this.width, this.height, this.rnd), this.rnd, (x, y) => this.isGone(x, y));
         this.paintCracks();
-        const faces = g.faces().filter((f) => !this.isGone(f.sample[0], f.sample[1]));
+        const faces = this.currentFaces(g).filter((f) => !this.isGone(f.sample[0], f.sample[1]));
         for (const f of faces) this.releaseFace(f, null, false);
         this.paintGone(faces);
         break;

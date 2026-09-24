@@ -154,14 +154,27 @@ export function createSmokeMaterial(atmo: Atmosphere, atlas: THREE.Texture): THR
         float hg = (1.0 - g * g) / (12.566 * pow(1.0 + g * g - 2.0 * g * cosT, 1.5));
         float edge = 1.0 - dens;
         float selfShadow = 1.0 - 0.5 * tx.b * dens;
-        vec3 sun = uSunColor * vSunVis * (wrap * selfShadow + hg * 3.5 * (0.3 + 0.7 * edge));
+        // uSunColor is the sun's irradiance: diffuse reflection is E·R/π, exactly as three.js shades
+        // the walls next to the cloud (without the 1/π sun-lit dust outshines a white wall); the
+        // phase-function term is already per steradian.
+        vec3 sun = uSunColor * vSunVis * (wrap * selfShadow * 0.31831 + hg * 3.5 * (0.3 + 0.7 * edge));
         // Sky fill from above, sun-lit ground from below, plus multiply-scattered sunlight inside the
         // cloud — which needs sun-lit parts of the cloud: a puff wholly in a building's shadow keeps
         // only the bounce from the sun-lit surroundings (so it matches the blue-grey shade around it).
         vec3 amb = uSkyAmbient * (0.7 + 0.3 * N.y) + uGroundAmbient * (0.5 - 0.3 * N.y) + uSunColor * 0.035 * (0.25 + 0.75 * vSunVis);
         // Multiple scattering inside an optically thick cloud mixes all incoming colours: neutralise.
         amb = mix(amb, vec3(dot(amb, vec3(0.2126, 0.7152, 0.0722))), 0.45 * dens);
-        vec3 lit = vColor.rgb * (sun + amb);
+        // The particle colour is the reflectance R of an optically thick puff. Thin parts scatter
+        // single-scattering albedo ω instead, which for dark smoke is several times R; inverting
+        // the isotropic two-stream result R = (1 − √(1−ω)) / (1 + √(1−ω)) (Hapke 1981) gives ω.
+        // Without it the thin fringe of soot is near-black and half transparent, and shows the
+        // bright sky behind it as a saturated blue halo. Puffs do not shadow each other, so a stack
+        // of "thin" puffs would add up to ω instead of R: only dark smoke (R ≲ 0.1, where ω/R is
+        // 2–4) gets the correction; for light dust ω/R < 1.6 and R is the better answer.
+        vec3 s2 = (1.0 - vColor.rgb) / (1.0 + vColor.rgb);
+        float dark = 1.0 - smoothstep(0.03, 0.12, dot(vColor.rgb, vec3(0.2126, 0.7152, 0.0722)));
+        vec3 albedo = mix(vColor.rgb, 1.0 - s2 * s2, 0.8 * dark * clamp(1.0 - a, 0.0, 1.0));
+        vec3 lit = albedo * (sun + amb);
         vec3 emis = vHeat > 0.0 ? blackbody(vHeat) * glow(vHeat) * smoothstep(0.1, 0.8, dens) : vec3(0.0);
         vec3 col = mix(vHazeC, lit, vHazeT) * a + emis * a * vHazeT;
         gl_FragColor = vec4(col, a);

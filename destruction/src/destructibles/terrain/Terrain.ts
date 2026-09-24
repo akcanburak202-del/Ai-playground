@@ -5,6 +5,7 @@ import { allocateDestructibleId, type Destructible, type RayHit } from '../Destr
 import { MATERIALS, type MaterialProps } from '../../physics/materials.ts';
 import { GROUPS_STATIC, type PhysicsOwner } from '../../physics/PhysicsWorld.ts';
 import type { BlastLoad, ImpactEvent, ThicknessProbe } from '../../physics/ballistics/types.ts';
+import { fireballRadius } from '../../physics/ballistics/blast.ts';
 import { Noise3 } from '../../core/noise.ts';
 import { Heightfield } from './heightfield.ts';
 import { blastCrater, craterProfile, rimWobbleTable, wobbleAt, type CraterShape } from './crater.ts';
@@ -335,9 +336,9 @@ export class Terrain implements Destructible {
     const W = load.tntKg;
     if (!(W > 0)) return;
     const thermo = load.kind === 'thermobaric';
-    // Fireball footprint on the ground (fireball radius ≈ 1.75 W^⅓, Baker et al. 1983; ×1.6 for
-    // thermobaric fills) — soot where it touched.
-    const Rf = 1.75 * Math.cbrt(W) * (thermo ? 1.6 : 1);
+    // Fireball footprint on the ground (the ballistics module's fireball radius, ≈ 1.75 W^⅓ after
+    // Baker et al. 1983, larger for thermobaric fills) — soot where it touched.
+    const Rf = fireballRadius(W, thermo);
     if (hob < Rf) {
       const rs = Math.sqrt(Math.max(0, Rf * Rf - Math.max(0, hob) ** 2));
       this.paintScorch(cx, cz, rs * 0.85, 0.75 * Math.min(1, 1.2 - hob / Rf));

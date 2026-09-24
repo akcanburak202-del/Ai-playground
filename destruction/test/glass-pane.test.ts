@@ -7,7 +7,7 @@ import { EventBus } from '../src/core/events.ts';
 import { Rng } from '../src/core/rng.ts';
 import type { GlassPaneSpec, SimContext, SimEvents, StructureApi } from '../src/app/contracts.ts';
 import type { Destructible } from '../src/destructibles/Destructible.ts';
-import { createGlassPane, GlassPane } from '../src/destructibles/glass/index.ts';
+import { createGlassPane, DICE_CAP, DiceSystem, GlassPane } from '../src/destructibles/glass/index.ts';
 import { getAmmo } from '../src/physics/ballistics/ammo.ts';
 import { resolveImpact } from '../src/physics/ballistics/penetration.ts';
 import { createBlastLoad } from '../src/physics/ballistics/blast.ts';
@@ -102,6 +102,37 @@ test('tempered pane: one rifle round dices the whole pane, front first, then the
   p.dispose();
 });
 
+test('tempered heap shows at once when the scene dice ring recycles its dice', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'tempered', { width: 1.5, height: 1.6, thickness: 0.01, position: [0, 1.2, 0] });
+  assert.ok(shoot(ctx, p, 'm855', new THREE.Vector3(0.2, 1.3, 10), new THREE.Vector3(0.2, 1.3, 0)));
+  for (let k = 0; k < 30; k++) ctx.step(1 / 60);
+  const inner = p as unknown as { decals: { appearBy(t: number): void; fade?: unknown }[]; dice: DiceSystem };
+  assert.ok(inner.decals.length > 0, 'heap decal built');
+  const fadeAt = () => (inner.decals[0] as unknown as { fade: { value: THREE.Vector2 } }).fade.value.x;
+  assert.ok(fadeAt() > ctx.time.now + 5, 'heap is due only after the dice have lain for a while');
+  // Another pane's blast fills the ring: this pane's dice are overwritten.
+  const d = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, release: 0, flight: 0, drag: 0, seed: 0, sx: 0.01, sy: 0.01, sz: 0.01, floor: 0, qx: 0, qy: 0, qz: 0, qw: 1, r: 0, g: 0, b: 0, fadeAt: 1e9, cell: 0.01 };
+  for (let k = 0; k < DICE_CAP; k++) inner.dice.write(d);
+  ctx.step(1 / 60);
+  assert.ok(fadeAt() <= ctx.time.now, `heap appears now (${fadeAt().toFixed(2)} ≤ ${ctx.time.now.toFixed(2)})`);
+  p.dispose();
+});
+
+test('imposed frame load: the pane breaks at the plate-buckling load (Timoshenko k for its aspect ratio)', async () => {
+  const ctx = await makeCtx();
+  // 10 mm glass: D = E t³ / 12(1 − ν²) ≈ 6.13 kN·m. Square 1 × 1 m: k = 4 → N_cr·W ≈ 242 kN.
+  // Wide 3 × 1 m loaded down its 1 m height: k = (3 + 1/3)² ≈ 11.1 → N_cr·W = k π² D / W ≈ 224 kN.
+  for (const [w, h, ncr] of [[1, 1, 242e3], [3, 1, 224e3]] as const) {
+    const a = pane(ctx, 'tempered', { width: w, height: h, thickness: 0.01, position: [0, 5, 0] });
+    a.setImposedLoad(0.93 * ncr);
+    assert.equal(a.hasFailed(), false, `${w}×${h} holds 93 % of N_cr`);
+    a.setImposedLoad(1.07 * ncr);
+    assert.equal(a.hasFailed(), true, `${w}×${h} breaks at 107 % of N_cr`);
+    a.dispose();
+  }
+});
+
 test('tempered pane shrugs off a shallow chip', async () => {
   const ctx = await makeCtx();
   const p = pane(ctx, 'tempered', { thickness: 0.012 });
@@ -141,6 +172,34 @@ test('annealed pane: a burst cracks it into shards that fall, land and burst aga
   p.dispose();
 });
 
+test('annealed pane under sustained fire at one spot: the hole grows progressively', async () => {
+  const ctx = await makeCtx();
+  const p = pane(ctx, 'annealed', { width: 1.5, height: 1.6, thickness: 0.008, position: [0, 1.13, 0] });
+  const from = new THREE.Vector3(0, 1.2, 11);
+  const rng = new Rng(3);
+  const A = p.width * p.height;
+  const holeArea = () => (1 - p.remaining()) * A;
+  const areas: number[] = [];
+  let hits = 0;
+  for (let k = 1; k <= 40; k++) {
+    if (shoot(ctx, p, 'm855', from, new THREE.Vector3(rng.gaussian(0, 0.03), 1.1 + rng.gaussian(0, 0.03), 0))) hits++;
+    for (let s = 0; s < 5; s++) ctx.step(1 / 60);
+    if (k === 1 || k === 10 || k === 40) {
+      for (let s = 0; s < 30; s++) ctx.step(1 / 60);
+      areas.push(holeArea());
+    }
+  }
+  const [a1, a10, a40] = areas as [number, number, number];
+  // One round: a hole of a few centimetres (bullet hole + exit cone + the loose bits it shakes out),
+  // while the rest of its crack star stays in the frame (every piece bears on the ones below it).
+  assert.ok(a1 > 5e-4 && a1 < 8e-3, `first round opens ${(a1 * 1e4).toFixed(0)} cm²`);
+  assert.ok(a10 > 2 * a1 && a40 >= a10, `hole grows: ${areas.map((a) => (a * 1e4).toFixed(0)).join(' → ')} cm²`);
+  assert.ok(a40 < 0.3 * A, 'a tight group does not bring the whole pane down');
+  // Later rounds of the group find the hole and pass straight through.
+  assert.ok(hits < 40, `hits ${hits}`);
+  p.dispose();
+});
+
 test('laminated pane: holds together, sags with damage, tears out when heavily blasted', async () => {
   const ctx = await makeCtx();
   const p = pane(ctx, 'laminated', { width: 1.2, height: 1.6, position: [0, 1.2, 0] });
@@ -159,6 +218,14 @@ test('laminated pane: holds together, sags with damage, tears out when heavily b
   assert.equal(p.hasFailed(), false, 'D < 2: held by the interlayer');
   for (let k = 0; k < 30; k++) ctx.step(1 / 60);
   assert.ok(p.sag > 0.05, `blast bulge ${(p.sag * 100).toFixed(1)} cm`);
+  // The registry culls rays by `bounds`: they must follow the bulge.
+  {
+    const mem = (p as unknown as { membrane: { x: Float64Array; n: number } }).membrane;
+    for (let k = 0; k < mem.n; k++) {
+      _p.set(mem.x[3 * k]!, mem.x[3 * k + 1]!, mem.x[3 * k + 2]!).applyMatrix4(p.root.matrixWorld);
+      assert.ok(p.bounds.containsPoint(_p), `bounds contain the bulged sheet (particle ${k} at z ${_p.z.toFixed(3)})`);
+    }
+  }
   // 10 kg at 1.2 m: beyond it — the sheet tears out of the frame.
   p.applyBlast(createBlastLoad({ center: new THREE.Vector3(0, 1.2, 1.2), tntKg: 10, kind: 'he' }, ctx.time.now));
   assert.ok(p.hasFailed(), 'torn out of the frame');

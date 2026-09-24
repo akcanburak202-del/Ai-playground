@@ -1,3 +1,4 @@
+import * as THREE from 'three';
 import type { Simulation } from '../app/Simulation.ts';
 import type { BlastEvent, SceneDef, WeaponControllerApi, WeaponSpec } from '../app/contracts.ts';
 import type { AmmoSpec, ImpactEvent } from '../physics/ballistics/types.ts';
@@ -9,6 +10,7 @@ import { Menu } from './menu.ts';
 import { ensureFonts, ensureStyle } from './theme.ts';
 import { HitGroups, ammoLine, blastRow, groupLine, impactRow, weaponSpecs, type ImpactRow } from './telemetry.ts';
 import { buildSlots, slotOf, type Slot } from '../player/slots.ts';
+import { closestApproach } from '../audio/acoustics.ts';
 
 export interface HudOptions {
   scenes: SceneDef[];
@@ -36,6 +38,9 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
 }
 
 let reducedMq: MediaQueryList | null = null;
+const _fwd = new THREE.Vector3();
+const _ca = { s: 0, distance: 0 };
+
 const REDUCED_MOTION = (): boolean => (reducedMq ??= matchMedia('(prefers-reduced-motion: reduce)')).matches;
 
 /** Write text only when it changed (DOM writes are the HUD's main cost). */
@@ -148,6 +153,9 @@ export class Hud implements HudHooks {
   private lastRender = 0;
   private lastScale = -1;
   private hudVisible = true;
+  lite = false;
+  /** Seconds of sustained slow frames (auto lite) */
+  private slowFor = 0;
   private scoped = false;
   private layoutDirty = true;
   private vw = 1280;
@@ -273,6 +281,17 @@ export class Hud implements HudHooks {
 
   toggleHud(): void {
     this.setVisible(!this.hudVisible);
+  }
+
+  /**
+   * Lite panels: solid smoked glass without the backdrop blur. The blur is recomputed by the
+   * compositor every frame over the moving 3D view, the HUD's one real rendering cost; the app
+   * can switch it off for its low quality level, and the HUD does so itself (once) when frames
+   * stay slower than 40 fps for a few seconds.
+   */
+  setLite(on: boolean): void {
+    this.lite = on;
+    this.root.classList.toggle('dx-lite', on);
   }
 
   dispose(): void {
@@ -538,15 +557,19 @@ export class Hud implements HudHooks {
       return;
     }
     // Rows are the latest distinct results: a burst on concrete is one row (×60) with the newest
-    // numbers, so the rounds that went through and skipped off the ground behind do not push
-    // the wall's own row out of the panel. While a spot is being worked, results elsewhere (those
-    // same rounds landing behind it) go in under its row, so the top row and the description stay
-    // with what the viewer is shooting at.
-    // A dispersed weapon's burst is still one spot: its 95 % group radius (2.45 σ) at this range.
-    const sigma = this.weapons.current.dispersionMOA * MOA;
-    const g = this.groups.add(e, 2.45 * sigma * e.point.distanceTo(this.sim.ctx.camera.position));
-    const cur = this.groups.current;
-    const secondary = !!cur && g !== cur && cur.activityAt(e.time) > 1.5;
+    // numbers. A round that has already gone through something lands behind the target (the
+    // ground beyond a holed wall): its row goes in under the top one and it does not count as a
+    // hit on a spot, so the top row, the description and the spot readout stay with what the
+    // viewer is shooting at.
+    const secondary = this.flewThrough(e);
+    if (!secondary) {
+      // A dispersed weapon's burst is still one spot: its 95 % group radius (2.45 σ) at this range.
+      const sigma = this.weapons.current.dispersionMOA * MOA;
+      const cam = this.sim.ctx.camera;
+      const g = this.groups.add(e, 2.45 * sigma * e.point.distanceTo(cam.position));
+      cam.getWorldDirection(_fwd);
+      this.groups.select(e.time, cam.position, _fwd, g);
+    }
     const row = impactRow(e);
     const i = this.impacts.findIndex((r) => r.key === row.key);
     if (i >= 0) {
@@ -561,6 +584,22 @@ export class Hud implements HudHooks {
       this.lastHitFlash = now;
       this.reticle.flashHit();
     }
+  }
+
+  /**
+   * Did the round behind this impact already go through something? The projectile is still in
+   * flight when its impact is reported, with its perforation count not yet raised for this one,
+   * and the point lies on the segment it flew this step.
+   */
+  private flewThrough(e: ImpactEvent): boolean {
+    if (e.agent !== 'projectile') return false;
+    for (const p of this.sim.ctx.projectiles.active) {
+      if (p.perforations === 0 || p.ammo !== e.ammo) continue;
+      const a = p.previous, b = p.position, q = e.point;
+      closestApproach(a.x, a.y, a.z, b.x, b.y, b.z, q.x, q.y, q.z, _ca);
+      if (_ca.distance < 0.25) return true;
+    }
+    return false;
   }
 
   private onScene(): void {
@@ -581,7 +620,14 @@ export class Hud implements HudHooks {
   private frame(realDt: number): void {
     const t0 = performance.now();
     const ctx = this.sim.ctx;
-    if (realDt > 0 && realDt < 1) this.fps += (1 / realDt - this.fps) * Math.min(1, realDt * 3);
+    if (realDt > 0 && realDt < 1) {
+      this.fps += (1 / realDt - this.fps) * Math.min(1, realDt * 3);
+      // Not while the menu is up (paused, and the sheet has its own blur) or the tab stutters once.
+      if (!this.lite && !this.menu.visible) {
+        this.slowFor = realDt > 1 / 40 ? this.slowFor + realDt : Math.max(0, this.slowFor - 2 * realDt);
+        if (this.slowFor > 4) this.setLite(true);
+      }
+    }
     this.statTimer -= realDt;
     const scale = ctx.time.scale;
     if (this.statTimer <= 0 || Math.abs(scale - this.lastScale) > 1e-3) {

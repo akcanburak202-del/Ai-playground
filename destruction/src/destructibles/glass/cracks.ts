@@ -42,19 +42,32 @@ function gauss(rnd: () => number): number {
 }
 
 /**
+ * Shape of an oblique hole: a round striking at obliquity θ cuts an ellipse stretched by 1/cos θ
+ * along its in-plane direction (ax, ay), the exit cone displaced downstream by ≈ ½ t tan θ.
+ */
+export interface HoleShape {
+  ax: number;
+  ay: number;
+  stretch: number;
+}
+
+/**
  * Irregular hole outline around (cx, cy): radius r with ±25 % lobes, kept 1 mm inside the pane so it
  * never runs along the pane edge.
  */
-export function holeOutline(g: CrackGraph, cx: number, cy: number, r: number, rnd: () => number): Poly {
-  const n = Math.max(8, Math.min(22, Math.round(10 + r * 400)));
+export function holeOutline(g: CrackGraph, cx: number, cy: number, r: number, rnd: () => number, shape?: HoleShape): Poly {
+  const n = Math.max(8, Math.min(22, Math.round(10 + r * 400 * (shape ? Math.sqrt(shape.stretch) : 1))));
   const ph = rnd() * TAU, a1 = 0.12 + 0.1 * rnd(), a2 = 0.08 * rnd();
   const out: Poly = [];
   const mx = g.w / 2 - 1e-3, my = g.h / 2 - 1e-3;
+  const ax = shape?.ax ?? 1, ay = shape?.ay ?? 0, st = shape?.stretch ?? 1;
   for (let i = 0; i < n; i++) {
     const a = (i / n) * TAU;
     const k = 1 + a1 * Math.sin(3 * a + ph) + a2 * Math.sin(5 * a + 2 * ph) + 0.12 * (rnd() - 0.5);
-    const x = Math.min(mx, Math.max(-mx, cx + r * k * Math.cos(a)));
-    const y = Math.min(my, Math.max(-my, cy + r * k * Math.sin(a)));
+    // Local frame (along the shot, across it), then back to pane axes.
+    const u = r * k * Math.cos(a) * st, v = r * k * Math.sin(a);
+    const x = Math.min(mx, Math.max(-mx, cx + u * ax - v * ay));
+    const y = Math.min(my, Math.max(-my, cy + u * ay + v * ax));
     out.push(x, y);
   }
   return out;
@@ -67,9 +80,9 @@ export function holeOutline(g: CrackGraph, cx: number, cy: number, r: number, rn
  */
 export function growStar(
   g: CrackGraph, cx: number, cy: number, holeR: number, spec: StarSpec, rnd: () => number,
-  blocked: (x: number, y: number) => boolean = () => false,
+  blocked: (x: number, y: number) => boolean = () => false, shape?: HoleShape,
 ): StarResult {
-  const hole = holeR > 0 ? holeOutline(g, cx, cy, holeR, rnd) : [];
+  const hole = holeR > 0 ? holeOutline(g, cx, cy, holeR, rnd, shape) : [];
   let ring: number[] = [];
   let centre = -1;
   if (hole.length) ring = g.loop(hole, SEG_HOLE);

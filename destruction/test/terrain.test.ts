@@ -154,3 +154,47 @@ test('terrain: plaza probe, blast crater in soil with Rapier colliders following
   assert.equal(t.disposed, true);
   assert.equal(basic.visible, true, 'basic ground restored');
 });
+
+test('terrain: crater removes the pock marks it blew away and re-seats the rest; LOD skirts', async () => {
+  const ctx = await makeCtx();
+  const t = new Terrain(ctx, { size: 200, detail: 64, plaza: { halfX: 10, halfZ: 8, finish: 'pavers' } });
+  ctx.addDestructible(t);
+  const pocks = (t as unknown as { pocks: { mesh: THREE.InstancedMesh } }).pocks.mesh;
+  const m = new THREE.Matrix4(), p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+  const ammo = { id: 'm855', diameter: 0.0057 } as AmmoSpec;
+  const rifle = (x: number, z: number) => ({ point: new THREE.Vector3(x, 0, z), normal: new THREE.Vector3(0, 1, 0), craterRadius: 0.02, craterDepth: 0.017, outcome: 'embed', material: MATERIALS.granite, ammo }) as unknown as ImpactEvent;
+  t.applyImpact(rifle(2, 2)); // inside the coming crater
+  t.applyImpact(rifle(3.2, 2)); // on its lip / ejecta
+  t.applyImpact(rifle(8, 2)); // far away
+  // 3 kg on the pavers at (2, 2): crater ≈ 0.58 m radius.
+  t.applyBlast(createBlastLoad({ center: new THREE.Vector3(2, 0.02, 2), tntKg: 3, kind: 'he', normal: new THREE.Vector3(0, 1, 0), contactTargetId: t.id }, 0));
+  pocks.getMatrixAt(0, m);
+  // (Matrix4.decompose reports scale 1 for a singular matrix: read the basis directly.)
+  assert.equal(Math.hypot(m.elements[0]!, m.elements[1]!, m.elements[2]!), 0, 'the mark inside the crater went with the paving');
+  pocks.getMatrixAt(1, m); m.decompose(p, q, s);
+  assert.ok(s.x > 0 && Math.abs(p.y - t.heightAt(3.2, 2)) < 0.005, `lip mark sits on the new surface (${p.y} vs ${t.heightAt(3.2, 2)})`);
+  pocks.getMatrixAt(2, m); m.decompose(p, q, s);
+  assert.ok(s.x > 0 && Math.abs(p.y) < 0.005, 'far mark untouched');
+
+  // A 30 mm hit digs its pock first and puts the mark on its floor.
+  const cannon = { ...rifle(-3, 3), craterRadius: 0.2, craterDepth: 0.15, material: MATERIALS.soil, ammo: { id: 'pgu14', diameter: 0.03 } } as unknown as ImpactEvent;
+  t.applyImpact(cannon);
+  pocks.getMatrixAt(3, m); m.decompose(p, q, s);
+  assert.ok(p.y < -0.05 && Math.abs(p.y - t.heightAt(-3, 3)) < 0.005, `cannon pock mark on the floor (${p.y})`);
+
+  // Tiles carry edge skirts below the grid (they close LOD T-junction cracks) and stay finite.
+  t.frameUpdate();
+  const tile = t.root.children.find((o) => o.name.startsWith('terrain-tile')) as THREE.Mesh;
+  const pos = tile.geometry.getAttribute('position') as THREE.BufferAttribute;
+  const grid = 65 * 65;
+  assert.equal(pos.count, grid + 4 * 65);
+  let lowest = Infinity;
+  for (let i = 0; i < pos.count; i++) {
+    assert.ok(Number.isFinite(pos.getY(i)));
+    if (i >= grid) lowest = Math.min(lowest, pos.getY(i));
+  }
+  assert.ok(lowest < -0.25, 'skirt hangs below the surface');
+  const idx = tile.geometry.getIndex()!;
+  for (let i = 0; i < idx.count; i++) assert.ok(idx.getX(i) < pos.count);
+  t.dispose();
+});

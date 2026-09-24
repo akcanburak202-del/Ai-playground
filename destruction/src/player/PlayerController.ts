@@ -97,7 +97,7 @@ export class PlayerController implements System, PlayerView {
   private fovWeapon = '';
   private readonly recoilPitch = new RecoilSpring(16, 0.75);
   private readonly recoilYaw = new RecoilSpring(18, 0.8);
-  private readonly aimHold = new AimHold(0.35);
+  private readonly aimHold = new AimHold(0.2);
   /** Wall-clock ms of the last automatic-fire round (the hold works while a burst goes on) */
   private lastAutoShot = -1e9;
   /** Camera kick jitter: its own generator, so the viewer never shifts the simulation's random sequence */
@@ -521,10 +521,12 @@ export class PlayerController implements System, PlayerView {
     }
     if (this.menuOpen) {
       if (this.triggerOut) this.applyTrigger(false);
-      // Behind the menu nothing steers the camera (a key held while it opened must not fly on).
+      // Behind the menu nothing steers the camera (a key held while it opened must not fly on,
+      // nor may the camera coast on its smoothed velocity).
       this.keys.clear();
       this.mouseDX = this.mouseDY = 0;
       this.adsHeld = false;
+      this.vel.set(0, 0, 0);
     }
 
     this.updateTimeScale(dt);

@@ -57,7 +57,8 @@ export class ShockFronts {
             float r = length(vUv - 0.5) * 2.0;
             float band = smoothstep(0.965, 0.985, r) * (1.0 - smoothstep(0.985, 1.0, r));
             float a = band * uStrength * softFade(vDepth, 0.3);
-            vec3 lit = uColor * (uSunColor * max(uSunDir.y, 0.15) + uSkyAmbient);
+            // Lambertian dust sheet on the ground: E_sun·sin(h)/π + sky radiance.
+            vec3 lit = uColor * (uSunColor * max(uSunDir.y, 0.15) * 0.31831 + uSkyAmbient);
             gl_FragColor = vec4(applyHaze(lit, vWorld, cameraPosition) * a, a);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>

@@ -119,13 +119,20 @@ export class Chips {
             // facets (resting granite chips rendered as black pepper).
             vSunShadowWorldPosition.xyz = chipPos + vec3(0.0, 0.12, 0.0);
             vSunShadowWorldNormal = vec3(0.0);
+          #endif
+          #if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+            #pragma unroll_loop_start
+            for ( int i = 0; i < NUM_DIR_LIGHT_SHADOWS; i ++ ) {
+              vDirectionalShadowCoord[ i ] = directionalShadowMatrix[ i ] * vec4( chipPos + vec3( 0.0, 0.12, 0.0 ), 1.0 );
+            }
+            #pragma unroll_loop_end
           #endif`);
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>', '#include <common>\nvarying float vChipKind;')
         .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = vChipKind < 0.5 ? 0.92 : (vChipKind < 1.5 ? 0.06 : 0.38);')
         .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = vChipKind > 1.5 ? 1.0 : 0.0;');
     };
-    m.customProgramCacheKey = () => 'fx-chips-v2';
+    m.customProgramCacheKey = () => 'fx-chips-v3';
     this.material = m;
     this.mesh = new THREE.Mesh(g, m);
     this.mesh.name = 'fx-chips';

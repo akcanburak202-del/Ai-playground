@@ -92,9 +92,38 @@ struct GlassState {
   float crazed;
   float lod;
   float glint;
+  /** The line of sight meets the fracture face of a hole within the glass thickness (0..1) */
+  float edge;
+  /** In-plane normal of that fracture face (pane x, y), pointing into the hole */
+  vec2 edgeN;
 };
 
-GlassState glassState(vec2 uv, float shard) {
+/**
+ * Fracture faces of holes without rim geometry: the view ray entering at uv crosses the slab to
+ * the other face (refracted, Snell n = 1.52, or straight through the air of a hole); where one end
+ * is glass and the other hole, it meets the fracture face on the way — a band t·tan θ wide, zero
+ * head-on and widening at grazing angles, exactly as the walls of a real hole show.
+ */
+void glassEdge(inout GlassState g, vec2 uv, vec3 objView) {
+  vec3 V = normalize(objView);
+  vec2 tIn = -V.xy / 1.52;
+  vec2 run = g.hole > 0.5 ? -V.xy / max(abs(V.z), 0.05) : tIn / sqrt(max(1.0 - dot(tIn, tIn), 0.05));
+  run *= uPane.z;
+  if (dot(run, run) < 1e-10) return;
+  vec2 uv2 = uv + run / uPane.xy;
+  float far = texture(uCrack, uv2, -0.75).b;
+  float e = g.hole > 0.5 ? 1.0 - far : far * (1.0 - g.hole);
+  if (e < 0.02) return;
+  g.edge = e;
+  // Face orientation: gradient of the hole channel half-way across.
+  vec2 px = 1.0 / vec2(textureSize(uCrack, 0));
+  vec2 m = uv + 0.5 * run / uPane.xy;
+  vec2 gr = vec2(texture(uCrack, m + vec2(px.x, 0.0)).b - texture(uCrack, m - vec2(px.x, 0.0)).b,
+                 texture(uCrack, m + vec2(0.0, px.y)).b - texture(uCrack, m - vec2(0.0, px.y)).b) / (px * uPane.xy);
+  g.edgeN = dot(gr, gr) > 1e-8 ? normalize(gr) : normalize(run);
+}
+
+GlassState glassState(vec2 uv, float shard, vec3 objView) {
   GlassState g;
   // Slightly sharpened lookup (LOD bias): hairline cracks stay visible a little further away, as
   // they do in reality because they catch the light.
@@ -108,6 +137,9 @@ GlassState glassState(vec2 uv, float shard) {
   g.crazed = 0.0;
   g.lod = 0.0;
   g.glint = 0.0;
+  g.edge = 0.0;
+  g.edgeN = vec2(0.0);
+  if (shard < 0.5) glassEdge(g, uv, objView);
   if (uHaze > 0.0) {
     // Blotchy whitening (value noise on a ~4 cm lattice).
     vec2 q = uv * uPane.xy / 0.04;
@@ -139,7 +171,10 @@ GlassState glassState(vec2 uv, float shard) {
         float d = dot(st - p, st - p);
         if (d < best) { best = d; bi = q; bs = st; }
       }
-      if (shard < 0.5 && uTime >= gRelease(bs, bi.x, bi.y, salt)) g.hole = 1.0;
+      if (shard < 0.5 && uTime >= gRelease(bs, bi.x, bi.y, salt)) {
+        g.hole = 1.0;
+        g.edge = 0.0;
+      }
       // The visible crazing: Voronoi of the dice (edge distance, Quilez 2012 two-pass method).
       float d = uDice.y;
       uint vsalt = abs(s - d) < 1e-6 ? salt : salt + 17u;
@@ -255,23 +290,35 @@ export function createReflectionMaterial(u: GlassUniforms, o: GlassPassOptions =
     shader.uniforms.uShardTex = shardU;
     shader.uniforms.uShardMode = { value: o.shards ? 1 : 0 };
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', `#include <common>\nattribute float aRim;\nvarying vec2 vGlassUv;\nvarying float vRim;\n${SHARD_VERTEX_PARS}`)
+      .replace('#include <common>', `#include <common>\nattribute float aRim;\nvarying vec2 vGlassUv;\nvarying float vRim;\nvarying vec3 vObjView;\n${SHARD_VERTEX_PARS}`)
       .replace('#include <uv_vertex>', '#include <uv_vertex>\nvGlassUv = uv;\nvRim = aRim;')
       .replace(
         '#include <beginnormal_vertex>',
         '#include <beginnormal_vertex>\n#ifdef GLASS_SHARDS\nmat4 shardM = shardMatrix();\nobjectNormal = mat3(shardM) * objectNormal;\n#endif',
       )
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\n#ifdef GLASS_SHARDS\ntransformed = (shardM * vec4(transformed, 1.0)).xyz;\n#endif');
+      .replace(
+        '#include <begin_vertex>',
+        /* glsl */ `#include <begin_vertex>
+        mat3 gRot = mat3(modelMatrix);
+        #ifdef GLASS_SHARDS
+        transformed = (shardM * vec4(transformed, 1.0)).xyz;
+        gRot = gRot * mat3(shardM);
+        #endif
+        // Eye direction in the pane's own (uv-aligned) frame; the transforms are rigid.
+        vObjView = transpose(gRot) * (cameraPosition - (modelMatrix * vec4(transformed, 1.0)).xyz);`,
+      );
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\nvarying vec2 vGlassUv;\nvarying float vRim;\nuniform float uShardMode;\n${DICING_GLSL}`)
+      .replace('#include <common>', `#include <common>\nvarying vec2 vGlassUv;\nvarying float vRim;\nvarying vec3 vObjView;\nuniform float uShardMode;\n${DICING_GLSL}`)
       .replace(
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>
-        GlassState gs = glassState(vGlassUv, uShardMode);
-        float gCover = 1.0 - gs.hole;
+        GlassState gs = glassState(vGlassUv, uShardMode, vObjView);
+        float gCover = max(1.0 - gs.hole, gs.edge);
         if (gCover < 0.004) discard;
         vec3 frostCol = mix(vec3(0.80, 0.84, 0.83), uTint, 0.25);
         diffuseColor.rgb = frostCol * min(1.0, 0.7 * gs.frost + 0.08 * gs.crack + 0.1 * gs.crazed);
+        // Fracture faces: conchoidal chipping at the lips scatters a little, tinted by the glass.
+        diffuseColor.rgb = mix(diffuseColor.rgb, pow(uTint, vec3(2.0)) * 0.22, gs.edge);
         if (vRim > 0.5) diffuseColor.rgb = pow(uTint, vec3(4.0)) * 0.3;`,
       )
       .replace(
@@ -279,6 +326,7 @@ export function createReflectionMaterial(u: GlassUniforms, o: GlassPassOptions =
         /* glsl */ `#include <roughnessmap_fragment>
         roughnessFactor = mix(roughnessFactor, 0.6, max(gs.frost, vRim * 0.8));
         roughnessFactor = mix(roughnessFactor, 0.25, gs.crack);
+        roughnessFactor = mix(roughnessFactor, 0.18, gs.edge);
         // Sub-pixel dice facets scatter the reflection (a rough mirror), except the few that line up.
         roughnessFactor = mix(roughnessFactor, 0.22, gs.crazed * gs.lod * (1.0 - gs.glint));`,
       )
@@ -295,6 +343,12 @@ export function createReflectionMaterial(u: GlassUniforms, o: GlassPassOptions =
             normal = normalize(mix(normal, normalize(0.35 * normal + 0.94 * cn), 0.92 * gs.crack));
           }
           normal = normalize(normal + (gT * gs.facet.x + gB * gs.facet.y) * gs.crazed);
+          if (gs.edge > 0.0 && dot(gT, gT) > 1e-12 && dot(gB, gB) > 1e-12) {
+            // The hole wall stands across the pane: its normal is in-plane, facing the eye.
+            vec3 en = normalize(normalize(gT) * gs.edgeN.x + normalize(gB) * gs.edgeN.y);
+            if (dot(en, vViewPosition) < 0.0) en = -en;
+            normal = normalize(mix(normal, en, gs.edge));
+          }
         }`,
       )
       .replace('#include <opaque_fragment>', 'outgoingLight *= gCover;\n#include <opaque_fragment>')
@@ -312,20 +366,24 @@ varying vec2 vGlassUv;
 varying float vRim;
 varying vec3 vNrm;
 varying vec3 vView;
+varying vec3 vObjView;
 ${SHARD_VERTEX_PARS}
 void main() {
   vGlassUv = uv;
   vRim = aRim;
   vec3 p = position;
   vec3 n = normal;
+  mat3 rot = mat3(modelMatrix);
 #ifdef GLASS_SHARDS
   mat4 sm = shardMatrix();
   p = (sm * vec4(p, 1.0)).xyz;
   n = mat3(sm) * n;
+  rot = rot * mat3(sm);
 #endif
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   vView = -mv.xyz;
   vNrm = normalize(normalMatrix * n);
+  vObjView = transpose(rot) * (cameraPosition - (modelMatrix * vec4(p, 1.0)).xyz);
   gl_Position = projectionMatrix * mv;
 }
 `;
@@ -335,11 +393,12 @@ varying vec2 vGlassUv;
 varying float vRim;
 varying vec3 vNrm;
 varying vec3 vView;
+varying vec3 vObjView;
 uniform float uShardMode;
 ${DICING_GLSL}
 void main() {
-  GlassState gs = glassState(vGlassUv, uShardMode);
-  float cover = 1.0 - gs.hole;
+  GlassState gs = glassState(vGlassUv, uShardMode, vObjView);
+  float cover = max(1.0 - gs.hole, gs.edge);
   if (cover < 0.004) discard;
   float cosV = clamp(abs(dot(normalize(vNrm), normalize(vView))), 0.0, 1.0);
   // Schlick Fresnel at one face, both faces of the slab: R = 2F / (1 + F).
@@ -350,6 +409,8 @@ void main() {
   vec3 T = pow(max(uTint, vec3(1e-3)), vec3(1.0 / cosT)) * (1.0 - R);
   // Seen through a cut edge the light has run a long way inside the glass: dark sea green.
   if (vRim > 0.5) T = pow(max(uTint, vec3(1e-3)), vec3(7.0)) * 0.85;
+  // Through a fracture face the view is bent and partly totally reflected: a dark green band.
+  T = mix(T, pow(max(uTint, vec3(1e-3)), vec3(3.0)) * 0.3, gs.edge);
   T *= (1.0 - 0.85 * gs.frost) * (1.0 - 0.92 * gs.crack) * (1.0 - 0.4 * gs.crazed);
   gl_FragColor = vec4(mix(vec3(1.0), T, cover), 1.0);
   #include <colorspace_fragment>

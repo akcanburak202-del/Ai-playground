@@ -110,10 +110,10 @@ export class HitGroup {
   private ox = 0;
   private oy = 0;
   private oz = 0;
-  /** Centre of the spot (mean of the hits, in that plane): a wide burst is judged from its middle */
-  private cx = 0;
-  private cy = 0;
-  private cz = 0;
+  /** Centre of the spot, world (mean of the hits, in that plane): a wide burst is judged from its middle. Read-only outside. */
+  cx = 0;
+  cy = 0;
+  cz = 0;
   private nx = 0;
   private ny = 0;
   private nz = 1;
@@ -126,8 +126,8 @@ export class HitGroup {
   }
 
   /**
-   * Squared lateral distance of a hit from this spot, m², or Infinity unless it is on the same
-   * target, within a few crater radii of the first hit and not in front of its surface.
+   * Squared lateral distance of a hit from this spot's centre, m², or Infinity unless it is on the
+   * same target, within the spot's radius and not in front of the first hit's surface.
    */
   distance2(e: ImpactEvent): number {
     if (this.count === 0 || HitGroup.keyOf(e) !== this.key) return Infinity;
@@ -169,7 +169,7 @@ export class HitGroup {
     this.spread = Number.isFinite(minRadius) ? Math.max(0, minRadius) : 0;
   }
 
-  /** Record a hit that `accepts` (or `begin`) admitted. */
+  /** Record a hit this group takes (`distance2` finite, or right after `begin`). */
   push(e: ImpactEvent): void {
     // A tandem precursor and the main jet (or two jets of one round) arrive in the same step:
     // one round, one hit.
@@ -224,11 +224,14 @@ export class HitGroup {
   }
 }
 
+/** Anything with x, y, z (THREE.Vector3 or a plain object): keeps this module free of three.js. */
+type XYZ = { x: number; y: number; z: number };
+
 /**
- * The spots hit recently (a round that goes through a wall lands somewhere behind it, which is
- * a spot of its own). The readout follows the spot being worked hardest right now — the most
- * hits in the last half second or so — and only a spot hit at least twice can take it over, so
- * stray rounds, ricochets and rounds flying on through a hole do not steal it.
+ * The spots hit recently. A round that goes through a wall or a plate lands somewhere behind it,
+ * and the rounds that follow it through the hole land there too: that is a spot of its own, but
+ * not the one the viewer is working. So the readout shows, of the spots hit in the last second or
+ * so that have a cavity to speak of (or were holed), the one nearest the crosshair.
  */
 export class HitGroups {
   readonly list: HitGroup[] = [];
@@ -261,7 +264,7 @@ export class HitGroups {
       if (this.list.length < this.max) this.list.push((g = new HitGroup()));
       else {
         // Recycle the idlest spot, never the one on display.
-        let idle = -1;
+        let idle = 0;
         let low = Infinity;
         this.list.forEach((x, i) => {
           const a = x === this.current ? Infinity : x.activityAt(e.time);
@@ -270,24 +273,38 @@ export class HitGroups {
             idle = i;
           }
         });
-        if (idle < 0) idle = 0;
         g = new HitGroup();
         this.list[idle] = g;
       }
       g.begin(e, minRadius);
     }
     g.push(e);
-    let best = this.current ?? g;
-    let bestA = this.current ? this.current.activityAt(e.time) : -1;
+    return g;
+  }
+
+  /**
+   * Choose the spot on display at sim time t for a viewer at `eye` looking along `fwd` (unit):
+   * of the spots hit lately with at least two hits and a cavity (≥ 1 mm) or a hole, the one at
+   * the smallest angle from the crosshair. With none, the current one stays — unless the latest
+   * hit (`latest`) went elsewhere and the current spot has gone quiet: then nothing is shown
+   * rather than a stale spot.
+   */
+  select(t: number, eye: XYZ, fwd: XYZ, latest: HitGroup | null = null): HitGroup | null {
+    let best: HitGroup | null = null;
+    let bestCos = -2;
     for (const x of this.list) {
-      const a = x.activityAt(e.time);
-      if (x !== best && x.count >= 2 && a > bestA + 1e-6) {
+      if (x.count < 2 || x.activityAt(t) < 0.3 || !(x.deepest >= 0.001 || x.perforatedAt > 0)) continue;
+      const dx = x.cx - eye.x, dy = x.cy - eye.y, dz = x.cz - eye.z;
+      const len = Math.hypot(dx, dy, dz);
+      const cos = len > 1e-6 ? (dx * fwd.x + dy * fwd.y + dz * fwd.z) / len : 1;
+      if (cos > bestCos) {
+        bestCos = cos;
         best = x;
-        bestA = a;
       }
     }
-    this.current = best;
-    return g;
+    if (best) this.current = best;
+    else if (latest && this.current && this.current !== latest && this.current.activityAt(t) < 0.3) this.current = null;
+    return this.current;
   }
 
   reset(): void {

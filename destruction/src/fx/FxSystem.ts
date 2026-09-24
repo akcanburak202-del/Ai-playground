@@ -22,6 +22,17 @@ import { groundOf } from './ground.ts';
 /** Particle budgets (≈ 20 k total, see DESIGN.md §5). */
 export const BUDGET = { smoke: 9000, fire: 2500, sparks: 5000, chips: 3500, tracers: 384 };
 
+type Pool = 'smoke' | 'sparks' | 'chips';
+/** Mean particle life of routine (per-hit) effects per pool, s: the decay time of the load estimate. */
+const POOL_LIFE: Record<Pool, number> = { smoke: 5, sparks: 0.5, chips: 10.5 };
+/**
+ * Per-hit effects are thinned linearly from POOL_SOFT to nothing at POOL_HARD of a pool's budget.
+ * A ring of C slots whose particles live up to L_max recycles none alive while the rate stays under
+ * C / L_max, i.e. an estimated load (rate × mean life) under ≈ 0.75 C for chips (7–14 s).
+ */
+const POOL_SOFT = 0.5;
+const POOL_HARD = 0.75;
+
 /** Exposure time of the virtual camera for motion streaks, s (a 180° shutter at 60 fps). */
 const SHUTTER = 1 / 120;
 
@@ -82,6 +93,13 @@ export class FxSystem implements System, FxApi {
   private markHead = 0;
   private trails = new Map<number, { x: number; y: number; z: number; alive: boolean }>();
   private contactsThisFrame = 0;
+  /**
+   * Particles emitted recently per pool, decaying with the pool's particle life: an estimate of
+   * how many are alive. A GAU-8 (65 rounds/s of 30 mm) would otherwise cycle the chip ring in under
+   * a second and make resting debris — and the smoke of earlier blasts — blink out.
+   */
+  private load: Record<Pool, number> = { smoke: 0, sparks: 0, chips: 0 };
+  private counted: Record<Pool, number> = { smoke: 0, sparks: 0, chips: 0 };
   private textures: THREE.Texture[] = [];
   private unsub: (() => void)[] = [];
   private savedPos = new THREE.Vector3();
@@ -153,18 +171,57 @@ export class FxSystem implements System, FxApi {
 
   chips(o: Parameters<FxApi['chips']>[0]): void {
     this.mark(o.position, MARK_CHIPS);
-    this.emitChips(o.position, o.direction, o.spread, o.speed, o.count, o.size, o.color, o.kind ?? 'stone');
+    this.emitChips(o.position, o.direction, o.spread, o.speed, this.thin('chips', o.count), o.size, o.color, o.kind ?? 'stone');
   }
 
   dust(o: Parameters<FxApi['dust']>[0]): void {
     this.mark(o.position, MARK_DUST);
-    const n = Math.round(Math.min(24, 2 + o.amount * 3));
+    const n = this.thin('smoke', Math.min(24, 2 + o.amount * 3));
     this.emitDust(o.position, o.velocity ?? null, o.radius, n, o.color, 1);
   }
 
   sparks(o: Parameters<FxApi['sparks']>[0]): void {
     this.mark(o.position, MARK_SPARKS);
-    this.emitSparks(o.position, o.direction, o.count, o.speed, 1500 + 800 * (o.hot ?? 0.7), 0.9, 0.0008, 0);
+    this.emitSparks(o.position, o.direction, this.thin('sparks', o.count), o.speed, 1500 + 800 * (o.hot ?? 0.7), 0.9, 0.0008, 0);
+  }
+
+  /**
+   * Particle count for a routine (per-hit) effect, thinned in proportion once the pool nears its
+   * budget; stochastic rounding keeps the expected count. Blasts are never thinned.
+   */
+  private thin(pool: Pool, n: number): number {
+    this.countEmitted();
+    const soft = BUDGET[pool] * POOL_SOFT, hard = BUDGET[pool] * POOL_HARD;
+    const k = Math.min(1, Math.max(0, (hard - this.load[pool]) / (hard - soft)));
+    const x = Math.max(0, n) * k;
+    const whole = Math.floor(x);
+    return whole + (this.rng.next() < x - whole ? 1 : 0);
+  }
+
+  /** Estimated live particles per pool (telemetry, tests). */
+  poolLoad(): Readonly<Record<Pool, number>> {
+    this.countEmitted();
+    return this.load;
+  }
+
+  /** Add everything the pools accepted since the last call to the load estimate. */
+  private countEmitted(): void {
+    const L = this.load, C = this.counted;
+    L.smoke += this.smokeLayer.emitted - C.smoke;
+    L.sparks += this.sparkLayer.emitted - C.sparks;
+    L.chips += this.chipLayer.emitted - C.chips;
+    C.smoke = this.smokeLayer.emitted;
+    C.sparks = this.sparkLayer.emitted;
+    C.chips = this.chipLayer.emitted;
+  }
+
+  /** Let the load estimate decay over dt seconds of simulation time. */
+  private decayLoad(dt: number): void {
+    this.countEmitted();
+    const t = Math.max(0, dt);
+    this.load.smoke *= Math.exp(-t / POOL_LIFE.smoke);
+    this.load.sparks *= Math.exp(-t / POOL_LIFE.sparks);
+    this.load.chips *= Math.exp(-t / POOL_LIFE.chips);
   }
 
   smokeSource(o: Parameters<FxApi['smoke']>[0]): void {
@@ -448,26 +505,26 @@ export class FxSystem implements System, FxApi {
         // crater volume ∝ E): ~0.15 m for 5.56 mm ball, ~0.3 m for .50 AP, ~0.7 m for 30 mm —
         // consistent with slow-motion footage of rifle and cannon hits on masonry.
         const r = Math.min(1.5, Math.max(0.05, (e.craterRadius || 0.02) * 2.5, 0.14 * s) * (soil ? 1.3 : 1));
-        this.emitDust(p, _v.copy(_d).multiplyScalar((soil ? 3 : 2) * Math.sqrt(s)), r, Math.round(Math.min(14, 4 + 2 * s)), m.dustColor, 0.7 + 0.15 * s);
+        this.emitDust(p, _v.copy(_d).multiplyScalar((soil ? 3 : 2) * Math.sqrt(s)), r, this.thin('smoke', Math.min(14, 4 + 2 * s)), m.dustColor, 0.7 + 0.15 * s);
       }
       // The ejecta cone is a ballistic signature of the hit itself: emitted even when the target
       // raised its own (slow, billowing) dust. Soil throws a narrower, steeper plume.
       {
         const r = Math.min(1.2, Math.max(0.06, 0.12 * s));
-        this.emitDustJet(p, _d, soil ? 0.35 : 0.6, (soil ? 9 : 10) * Math.pow(s, 0.35), Math.round(Math.min(12, 5 + 2 * s)), r, m.dustColor);
+        this.emitDustJet(p, _d, soil ? 0.35 : 0.6, (soil ? 9 : 10) * Math.pow(s, 0.35), this.thin('smoke', Math.min(12, 5 + 2 * s)), r, m.dustColor);
       }
       if (!(done & MARK_CHIPS)) {
-        const count = Math.min(90, 6 + 10 * s * s);
+        const count = this.thin('chips', Math.min(90, 6 + 10 * s * s));
         const size = Math.min(0.08, (soil ? 0.012 : 0.008) * Math.sqrt(s));
         this.emitChips(p, _d, soil ? 0.45 : 0.8, (soil ? 9 : 16) * Math.pow(s, 0.3), count, size, soil ? 0x4a3b2c : m.color, 'stone');
       }
-      if ((hard || m.sparks) && !(done & MARK_SPARKS)) this.emitSparks(p, _d, hard ? 6 + 4 * s : 3, 60, 1700, 1.0, 0.0007, 0, 0.35);
+      if ((hard || m.sparks) && !(done & MARK_SPARKS)) this.emitSparks(p, _d, this.thin('sparks', hard ? 6 + 4 * s : 3), 60, 1700, 1.0, 0.0007, 0, 0.35);
     } else if (cls === 'ductile') {
       if (!(done & MARK_SPARKS)) {
         // Sparks spray along the surface in the direction of travel (ricochet-like), hotter and
         // more numerous for hard cores and long rods; a HEAT jet throws molten metal.
         _u.copy(e.direction).addScaledVector(n, -e.direction.dot(n)).normalize().multiplyScalar(0.8).add(_d).normalize();
-        const count = Math.min(260, (jet ? 80 : hard ? 30 : 16) * Math.sqrt(s));
+        const count = this.thin('sparks', Math.min(260, (jet ? 80 : hard ? 30 : 16) * Math.sqrt(s)));
         this.emitSparks(p, _u, count, jet ? 45 : 90, jet ? 2300 : 1900, jet ? 1.2 : 0.8, jet ? 0.0025 : 0.0008, 0, jet ? 1.4 : 0.6);
         if (e.outcome === 'perforate' && e.exitPoint) this.emitSparks(e.exitPoint, e.direction, count * 0.6, 120, 2000, 0.6, 0.001, 0, 0.5);
       }
@@ -478,19 +535,19 @@ export class FxSystem implements System, FxApi {
       this.lights.fire(this.now, _v, jet ? 0xfff0d0 : 0xffa860, flashCandela((jet ? 0.1 : 0.02) * E), 3 + 2 * s, jet ? 0.08 : 0.025);
       if (jet || e.ammo.kind === 'apfsds') this.emitDust(p, _v.copy(n).multiplyScalar(4), 0.25 * s, 6, 0x6d6760, 1);
     } else if (cls === 'glass') {
-      this.emitSparks(p, e.direction, Math.min(200, 25 * s), 6, 0, 1.3, 0.004, 1, 2.5);
-      this.emitChips(p, e.direction, 0.9, 5, Math.min(60, 10 * s), 0.006, m.color, 'glass');
+      this.emitSparks(p, e.direction, this.thin('sparks', Math.min(200, 25 * s)), 6, 0, 1.3, 0.004, 1, 2.5);
+      this.emitChips(p, e.direction, 0.9, 5, this.thin('chips', Math.min(60, 10 * s)), 0.006, m.color, 'glass');
       this.emitDust(p, _v.copy(e.direction).multiplyScalar(-1), 0.05, 2, 0xdfe6e6, 0.3);
     }
     if (e.outcome === 'perforate' && e.exitPoint && cls === 'brittle') {
       // Rear-face spall: a cone of dust and fragments out of the back of the wall.
       this.emitDust(e.exitPoint, _v.copy(e.direction).multiplyScalar(5), Math.max(0.08, e.spallRadius * 2), 5, m.dustColor, 1);
-      this.emitChips(e.exitPoint, e.direction, 0.5, 20 * Math.pow(s, 0.3), Math.min(60, 8 * s), 0.01, m.color, 'stone');
+      this.emitChips(e.exitPoint, e.direction, 0.5, 20 * Math.pow(s, 0.3), this.thin('chips', Math.min(60, 8 * s)), 0.01, m.color, 'stone');
     }
     if (incendiary) {
       // Incendiary (zirconium / misch-metal) flash on impact: a white burst and burning particles.
       this.emitFlame(p.x + n.x * 0.05, p.y + n.y * 0.05, p.z + n.z * 0.05, 0, 0, 0, 0.12 * s, 0.25 * s, 0.05, 2600, 12 + rng.int(0, 4), this.now, 10, 0);
-      this.emitSparks(p, _d, 20 * s, 40, 2400, 1.1, 0.001, 0, 0.5);
+      this.emitSparks(p, _d, this.thin('sparks', 20 * s), 40, 2400, 1.1, 0.001, 0, 0.5);
       // Incendiary filler ≈ 3 % of the projectile mass burning at ~10 MJ/kg (zirconium, misch metal),
       // a flash of a few milliseconds.
       _v.copy(p).addScaledVector(n, 0.5);
@@ -548,9 +605,13 @@ export class FxSystem implements System, FxApi {
       // Turbulent mixing: the fireball is a patchwork of hot and cooler pockets, with tongues of
       // unburnt soot (≈15 % of the puffs never glow) — mottled, not a uniform glowing ball.
       const sootTongue = rng.chance(thermo ? 0.08 : 0.15);
-      P.variant = rng.chance(0.5) ? rng.int(8, 16) : rng.int(0, 8);
+      // Soot tongues are torn streamers, not billows: ragged cells, a little thinner.
+      P.variant = sootTongue || rng.chance(0.5) ? rng.int(8, 16) : rng.int(0, 8);
+      if (sootTongue) P.opacity = 0.65;
       P.heat = sootTongue ? 0 : (thermo ? 2050 : 2250) * rng.range(0.78, 1.06);
-      P.extra = sootTongue ? 0.35 : 0.7;
+      // Young soot is darker than the aged plume, but never below ≈ 0.04 albedo (fresh flame soot
+      // clouds; darker reads as holes in the frame, not smoke).
+      P.extra = sootTongue ? 0.55 : 0.7;
       this.smokeLayer.emit(P);
     }
     // Additive flame cores for the brightest instants.
@@ -582,7 +643,7 @@ export class FxSystem implements System, FxApi {
       P.r = _c.r; P.g = _c.g; P.b = _c.b; P.opacity = 0.62;
       P.seed = rng.next(); P.variant = rng.int(0, 8);
       P.heat = 0;
-      P.extra = 0.25;
+      P.extra = 0.4;
       this.smokeLayer.emit(P);
     }
 
@@ -717,6 +778,7 @@ export class FxSystem implements System, FxApi {
     this.shutter.value = SHUTTER * Math.max(ctx.time.scale, 0.02);
     if (!atmo.pipelineHandlesShake) this.syncLightsFromScene();
     this.contactsThisFrame = 0;
+    this.decayLoad(_simDt);
     this.updateEmitters(now, _simDt);
     this.updateProjectiles(now);
     this.lights.update(now);
@@ -834,16 +896,30 @@ export class FxSystem implements System, FxApi {
     }
     const a = this.atmo;
     const sun = this.sceneSun;
+    a.hasSunShadow.value = 0;
     if (sun) {
       sun.getWorldPosition(_u);
       sun.target.getWorldPosition(_v);
       a.sunDirection.value.copy(_u).sub(_v).normalize();
       a.sunColor.value.copy(sun.color).multiplyScalar(sun.intensity);
+      // The light's own PCF map (a depth-compare texture) keeps smoke in building shadows dark.
+      // Its matrix is last frame's, which is exact for the fixed sun of BasicPipeline.
+      const sh = sun.shadow;
+      const map = sun.castShadow ? sh.map?.depthTexture : null;
+      if (map && map.compareFunction !== null) {
+        a.sunShadowMap.value = map;
+        a.sunShadowMatrix.value[0]!.copy(sh.matrix);
+        a.sunShadowMatrix.value[1]!.copy(sh.matrix);
+        a.sunShadowSplit.value = 1e9;
+        a.hasSunShadow.value = 1;
+      }
     }
     const hemi = this.sceneHemi;
     if (hemi) {
-      a.skyAmbient.value.copy(hemi.color).multiplyScalar(hemi.intensity);
-      a.groundAmbient.value.copy(hemi.groundColor).multiplyScalar(hemi.intensity);
+      // three.js lights a Lambertian surface with hemisphere irradiance × albedo / π: the ambient
+      // uniforms hold radiance per unit albedo, so divide by π (the full pipeline does the same).
+      a.skyAmbient.value.copy(hemi.color).multiplyScalar(hemi.intensity / Math.PI);
+      a.groundAmbient.value.copy(hemi.groundColor).multiplyScalar(hemi.intensity / Math.PI);
     }
     const fog = scene.fog as THREE.Fog | null;
     if (fog?.color) a.hazeColor.value.copy(fog.color);
@@ -895,6 +971,8 @@ export class FxSystem implements System, FxApi {
     this.shaker.reset();
     this.tracers.begin();
     this.tracers.end();
+    this.countEmitted();
+    this.load.smoke = this.load.sparks = this.load.chips = 0;
   }
 
   dispose(): void {
@@ -912,11 +990,4 @@ export class FxSystem implements System, FxApi {
     this.solidRoot.removeFromParent();
     if (this.atmo.fxRoot === this.root) this.atmo.fxRoot = null;
   }
-}
-
-/** Mix two sRGB hex colours (in sRGB space; fine for tinting dust). */
-function mixHex(a: number, b: number, t: number): number {
-  const ch = (x: number, s: number) => (x >> s) & 255;
-  const m = (s: number) => Math.round(ch(a, s) * (1 - t) + ch(b, s) * t) << s;
-  return m(16) | m(8) | m(0);
 }

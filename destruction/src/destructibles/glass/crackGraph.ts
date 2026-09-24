@@ -24,6 +24,7 @@ export const SEG_HOLE = 4;
 export const SNAP = 2e-4;
 /** A crack step that would stop within this of another crack joins it instead (no hairline slivers), m. */
 const REACH = 1.5e-3;
+const EMPTY_LINKS: number[] = [];
 
 export interface GraphHit {
   seg: number;
@@ -48,6 +49,12 @@ export interface Face {
   /** A point strictly inside the piece */
   sample: [number, number];
   bounds: [number, number, number, number];
+  /**
+   * Contacts with the neighbouring pieces, 4 numbers per boundary edge (outline and island
+   * outlines): [neighbour face index (−1: pane edge), edge length m, outward normal x, y]. The
+   * normals say which way this piece presses on each neighbour, i.e. whether it bears on it.
+   */
+  links: number[];
 }
 
 export interface GrowResult {
@@ -419,11 +426,17 @@ export class CrackGraph {
         const t = target(he);
         ang[he] = Math.atan2(this.vy[t]! - this.vy[v]!, this.vx[t]! - this.vx[v]!);
       }
-      const sub = Array.from(out.subarray(a, b)).sort((p, q) => ang[p]! - ang[q]!);
-      for (let k = 0; k < sub.length; k++) {
-        out[a + k] = sub[k]!;
-        pos[sub[k]!] = k;
+      // In-place insertion sort by angle (degrees are small: 2–4, rarely more).
+      for (let k = a + 1; k < b; k++) {
+        const he = out[k]!, an = ang[he]!;
+        let m = k - 1;
+        while (m >= a && ang[out[m]!]! > an) {
+          out[m + 1] = out[m]!;
+          m--;
+        }
+        out[m + 1] = he;
       }
+      for (let k = a; k < b; k++) pos[out[k]!] = k - a;
     }
     // Next half-edge around the face to the left: at the target, the outgoing edge just clockwise
     // of the twin.
@@ -447,9 +460,11 @@ export class CrackGraph {
     for (let s = 0; s < nS; s++) if (keep[s]) parent[find(this.sa[s]!)] = find(this.sb[s]!);
     const mainComp = find(0);
 
-    interface Cycle { poly: Poly; area: number; comp: number; edge: [number, number, number, number] }
+    interface Cycle { poly: Poly; area: number; comp: number; edge: [number, number, number, number]; he: number[] }
     const cycles: Cycle[] = [];
     const seen = new Uint8Array(2 * nS);
+    // Cycle each half-edge belongs to (the face on its left).
+    const cycOf = new Int32Array(2 * nS).fill(-1);
     const hw = this.w / 2, hh = this.h / 2;
     for (let s = 0; s < nS; s++) {
       if (!keep[s]) continue;
@@ -458,10 +473,13 @@ export class CrackGraph {
         if (seen[start]) continue;
         const poly: Poly = [];
         const edge: [number, number, number, number] = [0, 0, 0, 0];
+        const hes: number[] = [];
         let he = start;
         let guard = 0;
         while (!seen[he] && guard++ < 4 * nS + 8) {
           seen[he] = 1;
+          cycOf[he] = cycles.length;
+          hes.push(he);
           const o = origin(he), t = target(he);
           poly.push(this.vx[o]!, this.vy[o]!);
           const seg = he >> 1;
@@ -475,34 +493,62 @@ export class CrackGraph {
           }
           he = next(he);
         }
-        cycles.push({ poly, area: polyArea(poly), comp: find(this.sa[s]!), edge });
+        cycles.push({ poly, area: polyArea(poly), comp: find(this.sa[s]!), edge, he: hes });
       }
     }
-    const faces: (Face & { comp: number })[] = [];
-    const islands: Cycle[] = [];
-    for (const c of cycles) {
-      if (Math.abs(c.area) < 1e-12) continue;
-      if (c.area > 0) {
-        faces.push({ outer: c.poly, holes: [], area: c.area, edge: c.edge, sample: [0, 0], bounds: polyBounds(c.poly), comp: c.comp });
-      } else if (c.comp !== mainComp) islands.push(c);
+    type Built = Face & { comp: number; cycles: number[] };
+    const faces: Built[] = [];
+    const islands: number[] = [];
+    // Face index of every cycle (−1: the pane outline seen from outside, or degenerate).
+    const faceOf = new Int32Array(cycles.length).fill(-1);
+    for (let c = 0; c < cycles.length; c++) {
+      const cy = cycles[c]!;
+      if (Math.abs(cy.area) < 1e-12) continue;
+      if (cy.area > 0) {
+        faceOf[c] = faces.length;
+        faces.push({ outer: cy.poly, holes: [], area: cy.area, edge: cy.edge, sample: [0, 0], bounds: polyBounds(cy.poly), links: EMPTY_LINKS, comp: cy.comp, cycles: [c] });
+      } else if (cy.comp !== mainComp) islands.push(c);
     }
     // Each island outline is a hole in the smallest face of another component that contains it.
-    for (const isl of islands) {
+    for (const c of islands) {
+      const isl = cycles[c]!;
       const x = isl.poly[0]!, y = isl.poly[1]!;
-      let best: (Face & { comp: number }) | null = null;
-      for (const f of faces) {
+      let best: Built | null = null;
+      let bestK = -1;
+      for (let k = 0; k < faces.length; k++) {
+        const f = faces[k]!;
         if (f.comp === isl.comp) continue;
         const b = f.bounds;
         if (x < b[0] || x > b[2] || y < b[1] || y > b[3]) continue;
         if (best && polyArea(f.outer) >= polyArea(best.outer)) continue;
-        if (pointInPoly(f.outer, x, y)) best = f;
+        if (pointInPoly(f.outer, x, y)) {
+          best = f;
+          bestK = k;
+        }
       }
       if (best) {
         best.holes.push(isl.poly);
         best.area += isl.area;
+        best.cycles.push(c);
+        faceOf[c] = bestK;
       }
     }
-    for (const f of faces) f.sample = interiorPoint(f.outer, f.holes);
+    for (const f of faces) {
+      f.sample = interiorPoint(f.outer, f.holes);
+      // Every boundary half-edge has this face on its left: the outward normal is its right-hand
+      // normal, and the face across it owns the twin half-edge.
+      const links: number[] = [];
+      for (const c of f.cycles) {
+        for (const he of cycles[c]!.he) {
+          const o = origin(he), t = target(he);
+          const dx = this.vx[t]! - this.vx[o]!, dy = this.vy[t]! - this.vy[o]!;
+          const len = Math.sqrt(dx * dx + dy * dy);
+          const tw = cycOf[he ^ 1]!;
+          links.push(this.kind[he >> 1] === SEG_BOUNDARY || tw < 0 ? -1 : faceOf[tw]!, len, len > 0 ? dy / len : 0, len > 0 ? -dx / len : 0);
+        }
+      }
+      f.links = links;
+    }
     return faces;
   }
 }

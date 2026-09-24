@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CrackGraph, SEG_ARC, SEG_RADIAL } from '../src/destructibles/glass/crackGraph.ts';
-import { growStar } from '../src/destructibles/glass/cracks.ts';
+import { growStar, holeOutline } from '../src/destructibles/glass/cracks.ts';
 import { blastStar, impactStar } from '../src/destructibles/glass/model.ts';
 import { polyArea, pointInPoly } from '../src/destructibles/glass/polygon.ts';
 import { Rng } from '../src/core/rng.ts';
@@ -122,4 +122,63 @@ test('laminated star is a denser spider web than annealed', () => {
   for (let s = 0; s < g.segmentCount; s++) if (g.live[s] && g.kind[s] === SEG_ARC) arcs++;
   assert.ok(arcs > 20, `arc segments ${arcs}`);
   checkTiling(g, 'laminated');
+});
+
+test('face links: neighbours are mutual, shared lengths agree, normals point at each other', () => {
+  const rnd = rngFn(21);
+  const g = new CrackGraph(1.5, 1.6);
+  for (let k = 0; k < 6; k++) growStar(g, (rnd() - 0.5) * 0.6, (rnd() - 0.5) * 0.6, 0.004, impactStar('annealed', 400, 0.008, 0.004, 2.2, rnd), rnd);
+  const faces = g.faces();
+  const shared = new Map<string, number>();
+  let frame = 0;
+  for (let a = 0; a < faces.length; a++) {
+    const L = faces[a]!.links;
+    for (let i = 0; i < L.length; i += 4) {
+      const b = L[i]!;
+      assert.ok(Math.abs(Math.hypot(L[i + 2]!, L[i + 3]!) - 1) < 1e-9 || L[i + 1] === 0, 'unit outward normal');
+      if (b < 0) {
+        frame += L[i + 1]!;
+        continue;
+      }
+      assert.notEqual(b, a, 'a face is never its own neighbour');
+      shared.set(`${a}>${b}`, (shared.get(`${a}>${b}`) ?? 0) + L[i + 1]!);
+    }
+  }
+  for (const [key, len] of shared) {
+    const [a, b] = key.split('>');
+    const back = shared.get(`${b}>${a}`);
+    assert.ok(back !== undefined && Math.abs(back - len) < 1e-9, `link ${key} is mutual (${len} vs ${back})`);
+  }
+  // The pane edge is shared with the frame only: its length is the pane perimeter.
+  assert.ok(Math.abs(frame - 2 * (1.5 + 1.6)) < 1e-6, `frame contact ${frame}`);
+  // A straight horizontal crack: the upper piece's outward normal on it points down (it bears on the lower one).
+  const h = new CrackGraph(1, 1);
+  let v = h.pointVertex(-0.5, 0, 1e-6);
+  for (let x = -0.4; x <= 0.55; x += 0.1) v = h.grow(v, x, 0, SEG_RADIAL).v;
+  const [f0, f1] = h.faces();
+  const upper = f0!.sample[1] > 0 ? f0! : f1!;
+  let down = 0;
+  for (let i = 0; i < upper.links.length; i += 4) if (upper.links[i]! >= 0) down += upper.links[i + 1]! * -upper.links[i + 3]!;
+  assert.ok(Math.abs(down - 1) < 1e-6, `upper piece bears on the lower one over the full width: ${down}`);
+});
+
+test('an oblique round cuts a hole stretched by 1/cos θ along its in-plane direction', () => {
+  const g = new CrackGraph(1, 1);
+  const theta = Math.PI / 3; // 60°: stretch 2
+  const ax = Math.cos(0.5), ay = Math.sin(0.5);
+  let along = 0, across = 0, area = 0, round = 0;
+  for (let k = 0; k < 20; k++) {
+    const rnd = rngFn(100 + k);
+    const p = holeOutline(g, 0, 0, 0.005, rnd, { ax, ay, stretch: 1 / Math.cos(theta) });
+    const q = holeOutline(g, 0, 0, 0.005, rngFn(100 + k));
+    assert.ok(polyArea(p) > 0, 'outline stays counter-clockwise');
+    area += polyArea(p);
+    round += polyArea(q);
+    for (let i = 0; i < p.length; i += 2) {
+      along = Math.max(along, Math.abs(p[i]! * ax + p[i + 1]! * ay));
+      across = Math.max(across, Math.abs(-p[i]! * ay + p[i + 1]! * ax));
+    }
+  }
+  assert.ok(Math.abs(area / round - 2) < 0.15, `area ratio ${(area / round).toFixed(2)}`);
+  assert.ok(along / across > 1.6 && along / across < 2.5, `elongation ${(along / across).toFixed(2)}`);
 });

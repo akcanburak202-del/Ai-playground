@@ -77,6 +77,12 @@ export class HeapDecal {
     this.mesh.name = 'glass-heap';
   }
 
+  /** Start fading in by time `t` at the latest (its dice are being recycled by the scene's ring). */
+  appearBy(t: number): void {
+    const f = this.fade.value;
+    if (t < f.x) f.set(t, 0.4);
+  }
+
   dispose(): void {
     this.mesh.removeFromParent();
     this.geometry.dispose();

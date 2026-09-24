@@ -54,7 +54,7 @@ export class RecoilSpring {
  * A shooter holding an automatic weapon on target. Every round kicks the muzzle up; under a
  * sustained burst the kicks add up to a steady climb (the mean of the recoil spring), which a
  * trained shooter pulls back down within a few rounds while each round's jump stays. The hold
- * tracks the spring's displacement with a time constant of ≈ 0.35 s while firing; when the burst
+ * tracks the spring's displacement with a time constant of ≈ 0.2 s while firing; when the burst
  * ends it is handed to the spring (its rest point moves by the same amount), so the view neither
  * jumps nor dips below the aim.
  */
@@ -62,7 +62,7 @@ export class AimHold {
   offset = 0;
   tau: number;
 
-  constructor(tau = 0.35) {
+  constructor(tau = 0.2) {
     this.tau = tau;
   }
 

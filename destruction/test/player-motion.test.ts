@@ -94,7 +94,7 @@ test('aim hold: a sustained burst stays on the spot, the kicks stay, release nei
   const dt = 1 / 60;
   const run = (hold: boolean) => {
     const s = new RecoilSpring(16, 0.75);
-    const h = new AimHold(0.35);
+    const h = new AimHold();
     let t = 0, next = 0, sum = 0, n = 0, prev = 0, maxJump = 0, minAfter = 0, peakKick = 0;
     for (; t < 3; t += dt) {
       const firing = t < 2;
