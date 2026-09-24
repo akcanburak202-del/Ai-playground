@@ -50,7 +50,9 @@ const server = await createServer({ root, cacheDir, logLevel: 'error', server: {
 await server.listen();
 const addr = server.httpServer!.address();
 const port = typeof addr === 'object' && addr ? addr.port : 5173;
-const url = `http://127.0.0.1:${port}/${pagePath}${pagePath.includes('?') ? '&' : '?'}manual`;
+// Add ?manual before any #fragment (the app reads the scene id from the hash).
+const [pathPart, hashPart] = pagePath.split('#') as [string, string | undefined];
+const url = `http://127.0.0.1:${port}/${pathPart}${pathPart.includes('?') ? '&' : '?'}manual${hashPart ? `#${hashPart}` : ''}`;
 
 // Prefer the pre-installed Chromium (CHROMIUM_PATH or /opt/pw-browsers/chromium) over a Playwright download.
 const exe = [process.env.CHROMIUM_PATH, '/opt/pw-browsers/chromium'].find((p) => p && existsSync(p));
