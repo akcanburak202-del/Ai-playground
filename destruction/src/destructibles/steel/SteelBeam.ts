@@ -475,9 +475,12 @@ export class SteelBeam implements Destructible, Structural {
       const rx = _o.x - g.c.x, ry = _o.y - g.c.y, rz = _o.z - g.c.z;
       const os = rx * g.a.x + ry * g.a.y + rz * g.a.z, oy = rx * g.u.x + ry * g.u.y + rz * g.u.z, oz = rx * g.v.x + ry * g.v.y + rz * g.v.z;
       const ds = _d.dot(g.a), dy = _d.dot(g.u), dz = _d.dot(g.v);
-      // Cheap reject against the whole segment box.
+      // Cheap reject against the whole segment box. This must accept rays that start inside the
+      // envelope (between the flanges, or just past a perforated face), so test for any overlap
+      // of the ray with the box rather than for an entry.
       const R = Math.max(this.section.cy, this.section.cz) * 1.2;
-      if (slab(os, ds, -g.hl, g.hl, oy, dy, -R, R, oz, dz, -R, R, best).t === Infinity) continue;
+      const env = slabInterval(os, ds, -g.hl, g.hl, oy, dy, -R, R, oz, dz, -R, R);
+      if (!env || env[1] < 0 || env[0] > best) continue;
       for (let p = 0; p < plates.length; p++) {
         const pl = plates[p]!;
         let hit: { t: number; axis: number; sign: number };
@@ -553,9 +556,15 @@ export class SteelBeam implements Destructible, Structural {
       const r0 = runs[0]!;
       r0.t1 = r0.t0 + (r0.t1 - r0.t0) * Math.max(0.1, 1 - dent / Math.max(pl.t, 1e-4));
     }
-    const segments: ProbeSegment[] = runs.map((r) => ({
-      material: this.material, start: r.t0, end: r.t1, strength: Math.max(0.3, this.sim.frac[node * this.section.plates.length + r.plate]!),
-    }));
+    const segments: ProbeSegment[] = runs.map((r) => {
+      let strength = Math.max(0.3, this.sim.frac[node * this.section.plates.length + r.plate]!);
+      // A shot running along a plate's plane (a web seen edge-on) would read as a very thick plate;
+      // a penetrator only engages a sliver of it, so scale the run to ~1.5 plate thicknesses.
+      const pt = this.section.plates[r.plate]!.t;
+      const chord = r.t1 - r.t0;
+      if (pt > 0 && chord > 3 * pt) strength *= Math.max(0.05, (1.5 * pt) / chord);
+      return { material: this.material, start: r.t0, end: r.t1, strength };
+    });
     if (!segments.length) segments.push({ material: this.material, start: 0, end: Math.min(maxDepth, this.maxPlateT()), strength: 1 });
     const last = segments[segments.length - 1]!;
     return { segments, exits: last.end < maxDepth };
