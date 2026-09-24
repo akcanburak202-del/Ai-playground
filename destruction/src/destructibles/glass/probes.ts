@@ -391,23 +391,27 @@ export class ReflectionProbes {
     try {
       if (r.extensions?.get('KHR_parallel_shader_compile')) {
         const n0 = programs();
+        const done = () => {
+          this.compiling = false;
+          for (const o of list) this.markCompiled(o);
+        };
         this.compiling = true;
-        void r.compileAsync(group(list), cam, scene).then(
-          () => {
-            this.compiling = false;
-            for (const o of list) this.markCompiled(o);
-          },
-          () => {
-            this.compiling = false;
-          },
-        );
+        try {
+          void r.compileAsync(group(list), cam, scene).then(done, done);
+        } catch {
+          done();
+        }
         this.stats.compiled += programs() - n0;
         return;
       }
       const t0 = performance.now();
       for (const o of list) {
         const n0 = programs();
-        r.compile(group([o]), cam, scene);
+        try {
+          r.compile(group([o]), cam, scene);
+        } catch {
+          // Left to the face render (counted as a miss if it compiles there): never retried for ever.
+        }
         this.markCompiled(o);
         const made = programs() - n0;
         this.stats.compiled += made;

@@ -57,12 +57,14 @@ export const temple: SceneDef = {
     const r0 = D / 2;
 
     // Crepidoma: three steps; the top one is the stylobate. Voxels: 5 cm on the stylobate (the
-    // columns stand on it and it takes the hits), 6.5 cm below (exactly four per 26 cm riser).
+    // columns stand on it and it takes the hits), a third of the 26 cm riser below (the lower
+    // steps are plain blocks the voxel grid only shows once they are hit; a quarter cost 0.4 s
+    // of the load).
     let stylobate: Destructible | null = null;
     for (let i = 0; i < STEPS; i++) {
       const grow = (STEPS - 1 - i) * STEP_D;
       const hx = ax + r0 + 0.3 + grow, hz = az + r0 + 0.3 + grow;
-      const step = site.box(i === STEPS - 1 ? 'Stilobat' : `Basamak ${i + 1}`, { ...marble, size: [2 * hx, STEP_H, 2 * hz], at: [0, (i + 0.5) * STEP_H, 0], voxel: i === STEPS - 1 ? 0.05 : 0.065 });
+      const step = site.box(i === STEPS - 1 ? 'Stilobat' : `Basamak ${i + 1}`, { ...marble, size: [2 * hx, STEP_H, 2 * hz], at: [0, (i + 0.5) * STEP_H, 0], voxel: i === STEPS - 1 ? 0.05 : STEP_H / 3 });
       if (i === 0) site.ground(step);
       else site.on(stylobate!, step);
       stylobate = step;
@@ -78,11 +80,14 @@ export const temple: SceneDef = {
     for (let i = 0; i < NX; i++) for (let k = 0; k < NZ; k++) if (i === 0 || i === NX - 1 || k === 0 || k === NZ - 1) cols.push([-ax + i * BAY, -az + k * BAY]);
     cols.forEach(([x, z], n) => {
       const dh = shaftH / DRUMS;
+      // Drums: 5 cm voxels (three across a 16 cm flute) on the front half, the side the spawn
+      // looks at; 6 cm on the back half, seen past the front colonnade and the cella (−40 % cells).
+      const vs = z > 0 ? 0.05 : 0.06;
       for (let d = 0; d < DRUMS; d++) {
         const rBot = r0 * (1 - (taper * d) / DRUMS), rTop = r0 * (1 - (taper * (d + 1)) / DRUMS);
         const drum = site.voxel({
           name: `Tambur ${n + 1}.${d + 1}`, ...marble, shape: { type: 'cylinder', radius: rBot, height: dh, flutes: 20, taper: 1 - rTop / rBot },
-          position: [x, base + (d + 0.5) * dh, z], voxelSize: 0.05, dynamic: true,
+          position: [x, base + (d + 0.5) * dh, z], voxelSize: vs, dynamic: true,
         }, box(x, base + d * dh, z, rBot, base + (d + 1) * dh));
         shapes.set(drum, drumShape((rBot + rTop) / 2, dh));
         loose.push(drum);
@@ -343,13 +348,21 @@ function settle(ctx: SimContext, loose: Destructible[], seconds: number): void {
  */
 function echinusShape(rn: number, re: number, h: number): { type: 'sdf'; bounds: [number, number, number]; sdf: (x: number, y: number, z: number) => number } {
   const p = 1.7, dr = re - rn;
-  const sdf = (x: number, y: number, z: number) => {
-    const u = Math.min(1, Math.max(0, y / h + 0.5));
-    const q = Math.pow(1 - u, p - 1);
-    const r = rn + dr * (1 - q * (1 - u));
+  // The profile tabulated over u (the voxel build samples the field ~10⁵ times per capital; pow and
+  // sqrt per sample were a sixth of the temple's load). 256 intervals: < 0.1 mm off the curve.
+  const N = 256, rs = new Float64Array(N + 1), inv = new Float64Array(N + 1);
+  for (let i = 0; i <= N; i++) {
+    const u = i / N, q = Math.pow(1 - u, p - 1);
     const slope = (dr * p * q) / h;
-    const radial = (Math.hypot(x, z) - r) / Math.sqrt(1 + slope * slope);
-    return Math.max(radial, Math.abs(y) - h / 2);
+    rs[i] = rn + dr * (1 - q * (1 - u));
+    inv[i] = 1 / Math.sqrt(1 + slope * slope);
+  }
+  const sdf = (x: number, y: number, z: number) => {
+    const t = Math.min(1, Math.max(0, y / h + 0.5)) * N;
+    const i = Math.min(N - 1, t | 0), f = t - i;
+    const r = rs[i]! + (rs[i + 1]! - rs[i]!) * f;
+    const k = inv[i]! + (inv[i + 1]! - inv[i]!) * f;
+    return Math.max((Math.sqrt(x * x + z * z) - r) * k, Math.abs(y) - h / 2);
   };
   return { type: 'sdf', bounds: [2 * re + 0.02, h, 2 * re + 0.02], sdf };
 }
