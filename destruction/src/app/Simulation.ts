@@ -90,6 +90,11 @@ export class Simulation {
     this.systems.push(s);
   }
 
+  removeSystem(s: System): void {
+    const i = this.systems.indexOf(s);
+    if (i >= 0) this.systems.splice(i, 1);
+  }
+
   getSystem<T extends System>(name: string): T | undefined {
     return this.systems.find((s) => s.name === name) as T | undefined;
   }

@@ -72,6 +72,10 @@ export class PhysicsWorld {
   /** Hard cap on simultaneously simulated dynamic bodies; the oldest sleeping ones get frozen first. */
   maxDynamicBodies = 900;
   private frozenListeners = new Set<(body: RAPIER.RigidBody) => void>();
+  /** Bodies the budget must never freeze (architecture that starts as sleeping rigid bodies). */
+  private exempt = new WeakSet<RAPIER.RigidBody>();
+  /** Set after Rapier traps (a WASM panic leaves the world unusable); stepping stops, the app goes on. */
+  failed = false;
   /** Flat ground slab the Simulation adds on every scene load; terrain replaces it via removeDefaultGround(). */
   defaultGround: RAPIER.RigidBody | null = null;
 
@@ -95,6 +99,8 @@ export class PhysicsWorld {
     this.dynamicBodies = [];
     this.clock = 0;
     this.defaultGround = null;
+    this.exempt = new WeakSet();
+    this.failed = false;
   }
 
   static async create(): Promise<PhysicsWorld> {
@@ -108,9 +114,17 @@ export class PhysicsWorld {
 
   /** Advance by dt seconds (callers keep dt ≤ 1/60). */
   step(dt: number): void {
+    if (this.failed) return;
     this.clock += dt;
     this.world.timestep = dt;
-    this.world.step(this.events);
+    try {
+      this.world.step(this.events);
+    } catch (err) {
+      // A Rapier panic ("unreachable") poisons the WASM instance; keep the rest of the app alive.
+      this.failed = true;
+      console.error('Rapier step failed; rigid-body physics stopped until the scene reloads.', err);
+      return;
+    }
     this.events.drainContactForceEvents((ev) => {
       const c1 = this.world.getCollider(ev.collider1());
       const c2 = this.world.getCollider(ev.collider2());
@@ -191,6 +205,11 @@ export class PhysicsWorld {
     this.defaultGround = null;
   }
 
+  /** Keep a body out of the budget's freezing (e.g. temple drums that must stay able to topple). */
+  exemptFromBudget(body: RAPIER.RigidBody): void {
+    this.exempt.add(body);
+  }
+
   ownerOf(c: RAPIER.Collider): PhysicsOwner | undefined {
     return this.owners.get(c.handle);
   }
@@ -240,7 +259,7 @@ export class PhysicsWorld {
     let excess = this.dynamicBodies.length - this.maxDynamicBodies;
     for (let i = 0; i < this.dynamicBodies.length && excess > 0; ) {
       const e = this.dynamicBodies[i]!;
-      if (e.body.isSleeping() || this.clock - e.born > 30) {
+      if (!this.exempt.has(e.body) && (e.body.isSleeping() || this.clock - e.born > 30)) {
         e.body.setBodyType(this.R.RigidBodyType.Fixed, false);
         this.dynamicBodies.splice(i, 1);
         excess--;

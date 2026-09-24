@@ -174,6 +174,12 @@ export interface ImpactEvent {
   targetName?: string;
   /** Short human-readable explanation of the model result for the telemetry panel */
   summary: string;
+  /** Id of the projectile that caused this impact (pooled ids; unique while the round lives) */
+  projectileId?: number;
+  /** Targets the round had already perforated before this one (0 = primary hit) */
+  priorPerforations?: number;
+  /** Thickness of the struck member along its normal, m (for audio pitch, HUD) */
+  targetThickness?: number;
 }
 
 export type BlastKind = 'he' | 'thermobaric' | 'hesh' | 'contact' | 'shaped';

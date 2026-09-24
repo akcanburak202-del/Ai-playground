@@ -248,8 +248,9 @@ export class WeaponController implements WeaponControllerApi, System {
   }
 
   private muzzle(): THREE.Vector3 {
-    const [r, d, f] = this.current.muzzleOffset;
-    return _pos.clone().addScaledVector(_right, r).addScaledVector(_up, -d).addScaledVector(_fwd, f);
+    // (right, up, forward) from the eye; the table's negative y puts the muzzle below the eye.
+    const [r, u, f] = this.current.muzzleOffset;
+    return _pos.clone().addScaledVector(_right, r).addScaledVector(_up, u).addScaledVector(_fwd, f);
   }
 
   /**

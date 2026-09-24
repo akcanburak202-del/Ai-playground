@@ -64,6 +64,8 @@ export interface StructuralFailureEvent {
   /** Mass that started to fall, kg */
   mass: number;
   cause: 'crushing' | 'buckling' | 'support-lost' | 'severed' | 'overload';
+  /** Main material of the failing element (steel groans, concrete cracks) */
+  material?: MaterialProps;
 }
 
 export interface ChargeEvent {
@@ -119,8 +121,12 @@ export interface WeaponSpec {
   sound: string;
   /** Scoped zoom factor for aim-down-sights (1 = none) */
   zoom: number;
-  /** Launch offset from the viewer (right, down, forward) in metres for visuals */
+  /** Launch offset from the viewer (right, up, forward) in metres for visuals; y < 0 is below the eye */
   muzzleOffset: [number, number, number];
+  /** Placed charges: how far from the viewer a charge can be attached, m */
+  placeRange?: number;
+  /** Indirect fire: arrival conditions shown in the HUD */
+  indirect?: { impactSpeed: number; descentDeg: number; errorM: number };
 }
 
 // ─── Subsystem APIs ──────────────────────────────────────────────────────────────────────────
@@ -175,6 +181,8 @@ export interface WeaponControllerApi {
   readonly cooldown: number;
   /** Where the aim ray currently meets the world (for indirect fire and charge placement) */
   readonly aimPoint: THREE.Vector3 | null;
+  /** Trigger currently held (rotary guns spin while it is) */
+  readonly triggerDown?: boolean;
 }
 
 export interface BlastSystemApi {
@@ -393,4 +401,6 @@ export interface RenderPipelineApi {
   resize(width: number, height: number): void;
   /** Toggle expensive effects (SSAO, bloom) for slow machines; 0 = minimal, 2 = full */
   setQuality(level: 0 | 1 | 2): void;
+  /** Render-only view rotation (recoil kick) that does not move the aim ray, radians */
+  viewKick?(pitch: number, yaw: number): void;
 }
