@@ -21,10 +21,15 @@ export type MaterialId =
   | 'glass_tempered'
   | 'glass_laminated'
   | 'glass_annealed'
-  | 'soil'; // compacted ground under the plaza
+  | 'soil' // compacted ground under the plaza
+  | 'gelatin' // 10 % ordnance gelatin at 4 °C (soft-tissue simulant)
+  | 'bone_sim'; // synthetic cortical-bone simulant (mineral-filled polyurethane)
 
-/** How damage is represented: voxels that crack and crumble, metal that yields, or glass that shatters. */
-export type MaterialClass = 'brittle' | 'ductile' | 'glass' | 'soil';
+/**
+ * How damage is represented: voxels that crack and crumble, metal that yields, glass that shatters,
+ * or a tissue simulant (ballistic gelatin and its synthetic skeleton) that a round tunnels through.
+ */
+export type MaterialClass = 'brittle' | 'ductile' | 'glass' | 'soil' | 'tissue';
 
 export interface MaterialProps {
   id: MaterialId;
@@ -167,6 +172,27 @@ export const MATERIALS: Record<MaterialId, MaterialProps> = {
     compressiveStrength: MPa(0.3), tensileStrength: MPa(0.02),
     soundSpeed: 400, specificHeat: 800,
     color: 0x6b5a45, dustColor: 0x8c7a62, sparks: false,
+  },
+  // Ballistic gelatin: 10 % by mass, conditioned to 4 °C and calibrated with a 4.5 mm steel BB
+  // (FBI protocol; Fackler & Malinowski 1988). Density 1 030–1 040 kg/m³, sound speed ≈ 1 520 m/s,
+  // compressive "strength" is the quasi-static rupture stress; the penetration resistance used by
+  // the gel model is in gel.ts. Young's modulus from indentation tests (≈ 0.3–0.6 MPa).
+  gelatin: {
+    id: 'gelatin', name: '10 % ballistic gelatin', nameTr: 'Balistik jelatin %10', class: 'tissue',
+    density: 1040, youngModulus: MPa(0.45), poisson: 0.49,
+    compressiveStrength: MPa(0.4), tensileStrength: MPa(0.12),
+    soundSpeed: 1520, specificHeat: 3600,
+    color: 0xd8a24a, dustColor: 0xe8c890, sparks: false,
+  },
+  // Synthetic cortical bone (e.g. SYNBONE / Sawbones 4th-gen composite): density ≈ 1.6–1.9 g/cm³,
+  // compressive strength ≈ 150 MPa, tensile ≈ 100 MPa — close to human cortical bone
+  // (Currey 2002, "Bones: Structure and Mechanics").
+  bone_sim: {
+    id: 'bone_sim', name: 'Synthetic bone', nameTr: 'Sentetik kemik', class: 'tissue',
+    density: 1850, youngModulus: GPa(16), poisson: 0.3,
+    compressiveStrength: MPa(150), tensileStrength: MPa(100), fractureToughness: 3e6,
+    soundSpeed: 3000, specificHeat: 1300,
+    color: 0xe6dcc6, dustColor: 0xf0e8d8, sparks: false,
   },
 };
 

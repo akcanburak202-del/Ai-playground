@@ -95,6 +95,47 @@ export interface ProjectileState {
   length: number;
   /** Number of targets already perforated */
   perforations: number;
+  /**
+   * Tissue simulant already traversed by this round, m (a bullet that went through an arm reaches
+   * the torso already yawing). 0 / undefined for a fresh round.
+   */
+  tissuePath?: number;
+  /** The round went through a hard barrier (glass, steel, concrete) and arrives unstable and deformed */
+  destabilized?: boolean;
+}
+
+/**
+ * The wound channel a round leaves in a tissue simulant (ballistic gelatin), sampled along the
+ * shot line from the entry point. Radii are in metres; see gel.ts for the models.
+ */
+export interface WoundProfile {
+  /** Distance from the entry point of each sample, m */
+  s: number[];
+  /** Maximum radius of the temporary cavity at each sample, m */
+  cavity: number[];
+  /** Permanent (crush) cavity radius at each sample, m */
+  crush: number[];
+  /** Reach of the radial tears (fissures) around the channel at each sample, m */
+  fissure: number[];
+  /** Yaw of the round at each sample, rad (0 nose first, π/2 sideways, π base first) */
+  yaw: number[];
+  /** Path length in this target, m */
+  length: number;
+  /** The round came to rest in this target */
+  stopped: boolean;
+  /** Where the yaw first exceeds 20° (the "neck" of the wound profile), m; −1 if it never does */
+  neck: number;
+  /** Largest temporary cavity radius and where it is, m */
+  maxCavity: number;
+  maxCavityAt: number;
+  /** Distance at which a lead-core bullet broke up, m (−1: it held together) */
+  fragmentedAt: number;
+  /** Mass that broke off, kg */
+  massLost: number;
+  /** Side channels of bullet or bone fragments: start distance, direction off the track (polar, azimuth), length, m */
+  fragments: { s: number; polar: number; azimuth: number; length: number }[];
+  /** Bone struck along the channel: distance, and whether it broke */
+  bones: { s: number; broken: boolean }[];
 }
 
 /**
@@ -180,6 +221,10 @@ export interface ImpactEvent {
   priorPerforations?: number;
   /** Thickness of the struck member along its normal, m (for audio pitch, HUD) */
   targetThickness?: number;
+  /** Wound channel in a tissue simulant (gel targets only) */
+  wound?: WoundProfile;
+  /** Tissue path the round carries on with (see ProjectileState.tissuePath) */
+  residualTissuePath?: number;
 }
 
 export type BlastKind = 'he' | 'thermobaric' | 'hesh' | 'contact' | 'shaped';

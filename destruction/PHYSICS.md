@@ -629,3 +629,102 @@ M3 on spreading a `shatter` event's momentum over the splash footprint.
 * Blast loads, body impulses and camera shake are *applied* at the end of the fixed step in which
   the front arrives (≤ 1/60 s after the exact KB arrival at normal speed, finer in slow motion);
   the arrival times themselves are computed from the exact detonation moment.
+
+---
+
+## 13. Tissue simulant: ballistic gelatin and the gel dummy (`gel.ts`, `src/destructibles/gel/`)
+
+**Özet (Türkçe).** Balistik manken, %10 balistik jelatinden (4 °C, FBI protokolü) dökülmüş,
+sentetik iskeletli (kafatası, omurga, kaburgalar, leğen halkası, uzun kemikler) 1,80 m / 76 kg'lık
+bir mankendir; on bir parçası eklemlerle birbirine bağlı rijit cisimlerdir ve manken çelik bir
+standa kelepçelidir. Mermi jelde Poncelet direnciyle yavaşlar; burnu önde girer, "boyun" denen
+mesafeden sonra yan döner (sürtünme alanı ve katsayısı birkaç kat artar), sonunda tabanı önde
+durur. Kurşun çekirdekli mermi yan dönerken hızlıysa kanal kesiminden kırılır ve parçaları kısa
+yan kanallar açar. Geçici boşluk, birim uzunlukta bırakılan enerjiyle orantılı bir hacimde açılır
+(π R² σ_c = dE/dx), birkaç milisaniye titreşir (ağır çekimde görünür) ve jelde, çember uzamasının
+kırılma uzamasını aştığı yere kadar radyal yırtıklar bırakır. Kemiğe çarpan mermi kemiği kırar,
+dengesini kaybeder ve kemik kıymıkları yan kanallar açar. Geçici boşluk bir uzvun tüm kesitini
+kırılma uzamasının ötesine gerdiğinde (R > 1,6·a) o parça jel ve kemik parçalarına ayrılır;
+standdan kopma ise mankenin tamamına verilen hız değişiminden (≈ 0,8 m/s) belirlenir. Tüfek
+mermisi 76 kg'lık bir gövdeyi devirmez (5,56 mm: 3,6 N·s ≈ 5 cm/s); 30 mm top mermisi ya da yakın
+bir patlama devirir.
+
+### 13.1 Retardation in gel
+
+Poncelet form (Peters 1990; Sellier & Kneubuehl 1994, *Wundballistik*):
+
+    m dv/dx = −A(ψ) · (½ ρ C_d(ψ) v² + R)
+
+integrated in 2 mm steps with the exact solution for constant A, C_d over the step,
+u₁ = (u₀ + 2R/(ρC_d))·exp(−ρ C_d A Δx / m) − 2R/(ρC_d) (u = v²).
+
+* ρ = 1 040 kg/m³ (10 % gelatin, 4 °C).
+* **R = 1.5 MPa** from the FBI calibration shot: a 4.5 mm steel BB (0.37 g) at 180 m/s (590 fps)
+  must penetrate 8.5 ± 1 cm; with C_d = 0.47 for a sphere the closed form
+  x = m/(ρ C_d A) · ln(1 + ρ C_d v²/2R) gives 8.9 cm.
+* Presented area A(ψ) = π d²/4 |cos ψ| + 0.85 L d |sin ψ| (ogive side profile ≈ 0.85 L d);
+  C_d = 0.30 nose first, 1.2 sideways, 0.9 base first, blended with cos²/sin²; fragments tumble
+  (C_d = 1.05 on their presented area, fragments.ts).
+* Synthetic bone (1 850 kg/m³, σ_c = 150 MPa, SYNBONE-type composite): same law with R = 2 σ_c
+  (cavity-expansion order).
+
+### 13.2 Yaw, fragmentation, bone
+
+* **Yaw** follows the published wound profiles, not a 6-DOF model: slow growth from 2° to 20° at
+  the neck N, 90° at 1.35 N, 180° (base first) at 2.6 N. Necks: M855 12 cm, M80 16 cm (Fackler &
+  Malinowski 1985/1988), M993 17 cm, 7.62×54R LPS 20 cm, .50 M33 26 cm; others 25 d. Long rods,
+  shells and jets never yaw. A round that perforated glass, steel or masonry arrives destabilised
+  (`destabilized`: the yaw starts at 0.85 N); tissue already traversed carries on (`tissuePath`:
+  a round leaving an arm reaches the torso yawing).
+* **Break-up** of lead-core ball once the yaw passes 50°, if it struck faster than 760 m/s (M855;
+  2 500 fps, Fackler 1988), 790 (M80), 820 (LPS, .50 M33): 40 / 25 / 15 / 20 % of the mass leaves
+  as 5–9 pieces at 10–35° and 0.8 v; each cuts a Poncelet channel (lead sphere) and deposits its
+  energy along the stretch of track it runs beside.
+* **Bone**: a wall that absorbs ≥ 3 J breaks (always, for rifle rounds); the bullet is destabilised
+  (yaw jumps to 0.9 N) and 2–4 splinters cut 2.5–6 cm side channels.
+
+### 13.3 Temporary cavity, permanent channel, tears
+
+* Temporary cavity: π R² σ_c = dE/dx (volume per length ∝ energy deposited there; Kneubuehl 2011,
+  *Wound Ballistics* §3.4), deposit smoothed over ≈ 2 cm. **σ_c = 1.8 MPa**, fitted to the
+  published profiles (M855 at 900 m/s: ≈ 11 cm; M80: ≈ 14 cm).
+* Timing (shader): first period T ≈ 3 ms + 40 ms/m × R_max, 3 pulsations each ≈ 35 % of the one
+  before, then an 8 Hz wobble of the whole piece damped over ≈ 0.2 s. The surface moves as an
+  incompressible column around the cavity: a point at r from the channel goes to √(r² + R²).
+* Permanent (crush) channel: 0.55 × the presented width d|cos ψ| + L|sin ψ|, widened to 0.15 R
+  where fragments riddled the gel.
+* Tears: the gel at radius r is stretched circumferentially by √(1 + R²/r²) − 1 and tears where
+  that exceeds ε_f = 1.0 (ballistic strain rates) → reach r_f = R / √((1 + ε_f)² − 1) ≈ 0.58 R.
+* **Burst of a piece**: its outer wall (section half-size a) is stretched to √(a² + R²); with the
+  surface failing at 0.9 ε_f the piece bursts when R > 1.62 a anywhere along the channel. .50 BMG
+  through an FBI block (a = 7.6 cm, R ≈ 13 cm) bursts it; 5.56 and 7.62 ball do not burst a trunk.
+
+### 13.4 Blasts, stand, ragdoll
+
+* Blast impulse on the dummy's bodies comes from `bodyBlastImpulse` (§7, BlastSystem) like any
+  other rigid body. A piece bursts only in the near field: reflected pressure > 10 MPa **and**
+  reflected impulse > 1 500 Pa·s (≈ 1 kg TNT within 0.5 m), or a contact charge on it.
+* Released from the stand when a hit's momentum or the gathered blast impulse gives the whole
+  dummy > 0.8 m/s (estimate for the clamp). Joints then keep 5 % of their holding stiffness
+  (force-based Rapier motors) and the mannequin crumples as it is thrown.
+
+### 13.5 Calibration (asserted in `test/gel.test.ts`)
+
+| Case | Reference | Model |
+| --- | --- | --- |
+| 4.5 mm BB @ 180 m/s | 8.5 ± 1 cm (FBI calibration) | 8.9 cm |
+| M855 @ 900 m/s: neck / break-up / depth | ≈ 12 cm / yes / 30–40 cm (Fackler, M193/M855) | 12 cm / 14 cm / 34 cm |
+| M855 @ 900 m/s: max temporary cavity | ≈ 10–13 cm at ≈ 15 cm | 10.7 cm at 14.5 cm |
+| M855 @ 700 m/s | no fragmentation | whole, 35 cm |
+| M80 @ 840 m/s: neck / depth / cavity | ≈ 16 cm / ≈ 58 cm / ≈ 11–15 cm | 16 cm / 49 cm / 14 cm |
+| Dummy mass | 50th-percentile adult ≈ 75 kg | 76 kg (gel volume 73 L) |
+
+### 13.6 Limitations
+
+* The yaw curve, the neck table and the break-up speeds are data-driven descriptions; bullets
+  here do not curve along their channels (the exit direction wanders by 1–9°).
+* Hollow-point and expanding bullets are not modelled (the arsenal is military ball / AP).
+* The skeleton is simplified (no hands/feet bones, the pelvis is a ring, ribs are horizontal
+  bands). Organs are not modelled: the dummy is homogeneous gel around bone.
+* `σ_c`, ε_f, the 0.9 surface factor, the blast burst thresholds and the release speed are
+  estimates fitted to published wound profiles and test footage; each is a named constant.

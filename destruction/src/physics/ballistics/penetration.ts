@@ -5,6 +5,7 @@ import type { RayHit } from '../../destructibles/Destructible.ts';
 import { RHA, type MaterialProps } from '../materials.ts';
 import type { AmmoData } from './ammo.ts';
 import type { AmmoSpec, ImpactEvent, ImpactOutcome, ProbeSegment, ProjectileState, ThicknessProbe } from './types.ts';
+import { jetWound, resolveTissue, tissueRunSpeed } from './gel.ts';
 
 /**
  * Terminal ballistics: what one projectile does to one run of material. Pure functions, SI units.
@@ -18,6 +19,7 @@ import type { AmmoSpec, ImpactEvent, ImpactOutcome, ProbeSegment, ProjectileStat
  *    eroding-rod penetration into concrete / soil / glass;
  *  - HEAT jets: rated RHA penetration scaled by √(ρ_RHA/ρ_t) and a target-strength factor;
  *  - soil: Young's penetration equation (Sandia, 1997);
+ *  - tissue simulant (ballistic gelatin, synthetic bone): yawing Poncelet model in gel.ts;
  *  - ricochet: Tate-type critical grazing angle tan³β ∝ Y_t / (ρ_p v²).
  */
 
@@ -634,6 +636,22 @@ function marchKinetic(a: AmmoData, st: MarchState, probe: ThicknessProbe, obliq:
       return;
     }
 
+    if (m.class === 'tissue') {
+      // Gel behind something harder in the same run (a probe that crossed armour into gel): the
+      // round is already deformed, so a nose-first Poncelet pass is an upper bound on what is left.
+      const vOut = tissueRunSpeed(a, v, st.mass, len, m);
+      if (!st.note) st.note = 'Poncelet (jel)';
+      if (vOut > 1) {
+        st.v = vOut;
+        st.depth += len;
+        continue;
+      }
+      st.depth += len * 0.9;
+      st.v = 0;
+      st.stoppedIn = seg;
+      return;
+    }
+
     // Soil (Young 1997)
     const phi = deformConcrete(pen, a);
     const D = phi * youngDepth(v, pen.mass, pen.d, pen.nose);
@@ -683,6 +701,7 @@ export function resolveImpact(p: ProjectileState, hit: RayHit, probe: ThicknessP
   }
   const seg0 = probe.segments[0];
   const mat = seg0?.material ?? hit.material;
+  if (mat.class === 'tissue') return resolveTissue(p, hit, probe, rng);
   const ev = baseEvent(p, hit, dir, speed, obliq, mat);
   const name = `${a.name} ${speed.toFixed(0)} m/s, ${deg(obliq)} → ${mat.nameTr}`;
 
@@ -952,6 +971,13 @@ export function resolveJet(a: AmmoSpec, capacity: number, cone: number, hit: Ray
     ev.craterRadius = 1.0 * cone;
     ev.craterDepth = 0.5 * cone;
     ev.damageRadius = 2 * cone;
+  } else if (mat.class === 'tissue') {
+    // The jet threads gel with a thin channel; the energy it leaves opens a cavity around it.
+    const len = Math.max(ev.depth, 1e-3);
+    ev.wound = jetWound(len, cone, ev.energyAbsorbed / len);
+    ev.tunnelRadius = 0.1 * cone;
+    ev.craterRadius = 0.2 * cone;
+    ev.damageRadius = ev.wound.maxCavity;
   } else {
     ev.tunnelRadius = 0.1 * cone;
     ev.craterRadius = 0.25 * cone;

@@ -5,16 +5,17 @@ import { chapel, chapelLook } from './chapel.ts';
 import { pavilion, pavilionLook } from './pavilion.ts';
 import { tower, towerLook } from './tower.ts';
 import { temple, templeLook } from './temple.ts';
+import { lab, labLook } from './lab.ts';
 
 export { Site, PROFILES, REBAR, region, orientedBox, type V3, type BoxOpts } from './kit.ts';
 export { Decor } from './decor.ts';
 
 /** Every scene, in menu order. */
-export const SCENES: SceneDef[] = [range, chapel, pavilion, tower, temple];
+export const SCENES: SceneDef[] = [range, chapel, pavilion, tower, temple, lab];
 
 /** Photographic settings per scene id (apply with applyLookBeforeLoad / applyLookAfterLoad). */
 export const SCENE_LOOKS: Record<string, SceneLook> = {
-  range: rangeLook, chapel: chapelLook, pavilion: pavilionLook, tower: towerLook, temple: templeLook,
+  range: rangeLook, chapel: chapelLook, pavilion: pavilionLook, tower: towerLook, temple: templeLook, lab: labLook,
 };
 export { applyLookBeforeLoad, applyLookAfterLoad, type SceneLook } from './look.ts';
 

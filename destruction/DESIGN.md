@@ -31,6 +31,7 @@ src/
     steel/                  [M3] steel plates (XPBD shell) and beams (plastic hinges)
     glass/                  [M4] glass panes
     terrain/                [M5] ground heightfield (soil/pavers) with craters
+    gel/                    [M8] ballistic gel dummies and blocks (tissue simulant, ragdoll)
   systems/                  [M1] ProjectileSystem, BlastSystem
   weapons/                  [M1] arsenal table + WeaponController
   render/                   [M5] Pipeline (sky, IBL, shadows, post), shared render helpers
@@ -90,6 +91,7 @@ registry sweep. Per rendered frame: every destructible's `frameUpdate` → syste
 | M5 render+fx | `src/render/**` (keep `BasicPipeline.ts` working), `src/fx/**`, `src/destructibles/terrain/**`, `sandbox/fx.html`, `src/dev/fx-sandbox.ts` | `Pipeline` class in `src/render/Pipeline.ts`; `installFx(sim)` in `src/fx/index.ts`; `createTerrain(ctx, opts)` in `src/destructibles/terrain/index.ts` |
 | M6 audio+ui | `src/audio/**`, `src/ui/**`, `src/player/**`, `sandbox/ui.html`, `src/dev/ui-sandbox.ts` | `installAudio(sim)`, `installPlayer(sim, weapons)`, `installHud(sim, weapons)` |
 | M7 structure+scenes | `src/structure/**`, `src/scenes/**`, `src/app/elements.ts` | `installStructure(sim)`, `SCENES` |
+| M8 gel | `src/destructibles/gel/**`, `src/physics/ballistics/gel.ts`, `test/gel.test.ts` | `createDummy(ctx, spec)`, `createGelBlock(ctx, spec)` in `src/destructibles/gel/index.ts` |
 | Integrator | `src/main.ts`, `src/app/**` except `elements.ts`, `index.html`, `README.md`, package files | the app |
 
 Rules for every module:
@@ -296,6 +298,21 @@ refined architecture, each built from the element factories:
 proving ground (calibration targets), a Tadao-Ando-like concrete chapel with a light cross, a
 Mies-like pavilion (travertine, chrome cruciform columns, glass, onyx wall, thin roof slab), a
 steel-frame tower with glass curtain wall, a Doric marble temple with drum columns.
+
+### M8 — ballistic gel (`createDummy`, `createGelBlock`)
+
+A 1.80 m / 76 kg mannequin of 10 % ordnance gelatin around a simplified synthetic skeleton
+(skull, spine, rib cage, pelvic ring, long bones), cast in eleven pieces. Each piece is a
+destructible of kind `'gel'` on its own Rapier body; pieces are joined by spherical / revolute
+joints whose force-based motors hold the pose, and the torso is clamped to a steel stand. Ray
+tests are exact against the lofted, watertight gel shells; the probe reports gel → bone → gel
+runs, and the resolver (`gel.ts`, material class `'tissue'`) returns a wound profile (yaw, neck,
+fragmentation, temporary cavity, crush channel, tears, bone hits) that the piece draws as milky
+channels, tear blades, fragment tracks and the spent bullet, and animates as the pulsating cavity
+in the vertex shader. Gel is drawn like glass: a multiplicative transmission pass (both faces), the
+channels, then an additive surface pass. The rig decides release from the stand (whole-body Δv)
+and bursting of a piece (cavity past the section's failure strain, or a near-field charge), which
+turns it into gel and bone chunks. `createGelBlock` is the same machinery for an FBI block.
 
 ---
 

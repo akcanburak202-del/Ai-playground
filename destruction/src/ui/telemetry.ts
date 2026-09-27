@@ -80,6 +80,15 @@ export function describeImpact(e: ImpactEvent): string {
       ? `Oyuk dolgu jeti ${fmtLength(e.depth)} kesiti deldi · delik Ø${d(e.tunnelRadius)}`
       : `Oyuk dolgu jeti ${fmtLength(e.depth)} nüfuz etti · delik Ø${d(e.tunnelRadius)}`;
   }
+  if (cls === 'tissue' && e.wound) {
+    const w = e.wound;
+    const parts = [e.outcome === 'perforate' ? `Yara kanalı ${fmtLength(w.length)}, çıkış ${fmtSpeed(e.residualSpeed)}` : `Mermi ${fmtLength(w.length)} derinlikte durdu`];
+    parts.push(`geçici boşluk Ø${d(w.maxCavity)}`);
+    if (w.neck >= 0) parts.push(`sapma ${fmtLength(w.neck)}'de başladı`);
+    if (w.fragmentedAt >= 0) parts.push('mermi parçalandı');
+    if (w.bones.some((b) => b.broken)) parts.push('kemik kırıldı');
+    return parts.join(' · ');
+  }
   switch (e.outcome) {
     case 'ricochet':
       return `Sekti · çıkış hızı ${fmtSpeed(e.residualSpeed)} · yüzeyde iz Ø${d(e.craterRadius)}`;

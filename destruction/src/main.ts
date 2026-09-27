@@ -17,7 +17,7 @@ import { fractureQueueFor, warmVoxelLooks } from './destructibles/voxel/index.ts
  * App entry: builds the simulation with every subsystem, shows the scene menu over a live scene,
  * and exposes `window.__sim` for scripted runs.
  *
- * URL options: `#<scene-id>` opens that scene directly (range, chapel, pavilion, tower, temple);
+ * URL options: `#<scene-id>` opens that scene directly (range, chapel, pavilion, tower, temple, lab);
  * `?q=0|1|2` render quality; `?touch` forces touch controls; `?manual` starts without real-time
  * stepping (used by scripts/shot.ts).
  */

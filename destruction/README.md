@@ -4,7 +4,10 @@ Tarayıcıda çalışan, gerçekçi malzeme fiziğine dayanan bir yıkım simül
 arasında serbestçe uçuyor, askerî silahlarla onları hedef alıyor ve malzemelerin gerçekte nasıl
 davrandığını izliyorsunuz: beton ufalanır, çatlar, arka yüzünden kopar ve içindeki inşaat demirini
 açığa çıkarır; çelik göçer, bükülür, ısınıp kızarır ve sonunda yırtılır; cam çatlar ya da zar gibi
-dağılır; taşıyıcısı kesilen yapılar kademeli olarak çöker.
+dağılır; taşıyıcısı kesilen yapılar kademeli olarak çöker. Balistik Laboratuvarı sahnesinde ise
+sentetik iskeletli balistik jel mankenler vardır: mermi jelde önce burnu önde ilerler, sonra yan
+döner ve parçalanır; geçici boşluk açılıp titreşir, kemikler kırılır, büyük kalibreler uzuvları
+dağıtır ve yakın bir patlama mankeni standından koparıp bir ragdoll gibi fırlatır.
 
 Ekranda görülen her sayı (krater derinliği, delinme sınırı, kalıntı hız, aşırı basınç) yayımlanmış
 mühendislik modellerinden hesaplanır; gösteri için şişirilmez. Modellerin ayrıntısı
@@ -37,7 +40,7 @@ npm install
 npm run dev            # http://127.0.0.1:5173 adresini açın
 ```
 
-- `#range`, `#chapel`, `#pavilion`, `#tower`, `#temple` ile doğrudan bir sahne açılır
+- `#range`, `#chapel`, `#pavilion`, `#tower`, `#temple`, `#lab` ile doğrudan bir sahne açılır
   (ör. `http://127.0.0.1:5173/#pavilion`).
 - `?q=0|1|2` görüntü kalitesini seçer (0: telefon ve zayıf ekran kartları, 2: tam).
 - `npm run build:single` her şeyi (fizik motoru dahil) tek bir HTML dosyasına paketler:
@@ -71,6 +74,7 @@ Telefonda sol tarafta hareket çubuğu, sağ tarafta bakış alanı ve ateş dü
 | Barselona Pavyonu | Mies van der Rohe, 1929 | Traverten podyum, ince betonarme çatı, krom haç kesitli çelik kolonlar, oniks ve yeşil mermer duvarlar, cam |
 | Çelik Kule | Çelik iskeletli ofis yapısı | HEB kolonlar, IPE kirişler, çapraz bağlar, betonarme döşemeler, temperli cam giydirme cephe |
 | Dor Tapınağı | Klasik Yunan tapınağı | Tambur tambur örülmüş yivli mermer sütunlar, arşitrav, triglif, alınlık |
+| Balistik Laboratuvarı | Açık hava yara balistiği atış hattı | Çelik standlarda beş balistik jel manken (%10 jelatin, sentetik iskelet, 1,80 m / 76 kg): çıplak, lamine cam, 6 mm S355, yarım tuğla duvar arkasında ve 8 mm zırh çeliği göğüs plakalı; masada üç FBI jel bloğu (biri sentetik uyluk kemikli) |
 
 ## Silahlar
 
@@ -92,6 +96,10 @@ kaynaklardaki yayımlanmış değerlerdir.
 - **Patlama:** Kingery–Bulmash eğrileri, şok dalgasının varış süresi (camlar dışa doğru genişleyen
   bir halka hâlinde kırılır), basınç–itki hasar eğrileri, Gurney ve Mott parça modeli.
 - **Yapı:** mesnetler, yük akışı, ezilme ve burkulma kontrolleri, kademeli göçme.
+- **Balistik jel (yara balistiği):** Poncelet direnci (FBI kalibrasyon atışına göre ayarlı),
+  mermiye özgü "boyun" mesafesinden sonra sapma ve takla, kurşun çekirdeğin parçalanması, enerjiyle
+  orantılı geçici boşluk ve radyal yırtıklar, sentetik kemik kırığı; jel manken eklemli bir ragdoll'dur
+  (ayrıntılar PHYSICS.md §13).
 
 ## Geliştirme
 
@@ -112,9 +120,12 @@ sayfası `sandbox/` klasöründedir.
 A browser sandbox where you bring military weapons to celebrated-looking architecture and watch
 the materials fail the way real materials fail. Concrete chips, cracks, spalls and exposes its
 rebar under sustained rifle fire; steel dents, bends, heats and tears; glass cracks or dices;
-buildings lose their supports and collapse progressively. Every number comes from a published
+buildings lose their supports and collapse progressively. The Ballistics Lab adds ballistic gel
+dummies with a synthetic skeleton: rounds yaw, tumble and break up in the gel, the temporary
+cavity opens and pulsates, bones break, large calibres burst limbs, and a close blast throws the
+dummy off its stand as a ragdoll. Every number comes from a published
 engineering model (NDRC/Kennedy, Lambert–Jonas, Recht–Ipson, Lanz–Odermatt, Tate,
-Kingery–Bulmash, Gurney/Mott) — see [PHYSICS.md](PHYSICS.md); architecture and module contracts
+Kingery–Bulmash, Gurney/Mott, Poncelet in gelatin) — see [PHYSICS.md](PHYSICS.md); architecture and module contracts
 are in [DESIGN.md](DESIGN.md).
 
 Live build (runs in the browser): https://claude.ai/artifact/G3U1EdvY8rtM4rHK8n2Bty

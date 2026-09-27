@@ -35,7 +35,7 @@ async function build(id: string) {
 test('scene catalogue: unique ids, bilingual names, golden-hour suns', () => {
   const ids = new Set(SCENES.map((s) => s.id));
   assert.equal(ids.size, SCENES.length);
-  assert.deepEqual([...ids].sort(), ['chapel', 'pavilion', 'range', 'temple', 'tower']);
+  assert.deepEqual([...ids].sort(), ['chapel', 'lab', 'pavilion', 'range', 'temple', 'tower']);
   for (const s of SCENES) {
     assert.ok(s.name && s.nameTr && s.blurb && s.blurbTr, s.id);
     assert.ok(s.sun && s.sun.elevation >= 8 && s.sun.elevation <= 20, `${s.id} sun ${s.sun?.elevation}`);
@@ -49,10 +49,11 @@ for (const def of SCENES) {
     const els = ctx.registry.all().filter((d) => d.kind !== 'terrain');
     assert.ok(els.length > 5, `${def.id} has ${els.length} elements`);
     // Structural elements are linked (dynamic stones are held by contact, not by the graph). The
-    // range's plates and glass are clamped on all edges in rigid test frames (their own spec edges).
+    // range's and the lab's plates and glass are clamped on all edges in rigid test frames (their own
+    // spec edges).
     const linked = new Set<Destructible>();
     for (const l of graph.linksOf()) linked.add(l.supported);
-    const rigHeld = (d: Destructible) => def.id === 'range' && (d.kind === 'plate' || d.kind === 'glass');
+    const rigHeld = (d: Destructible) => (def.id === 'range' || def.id === 'lab') && (d.kind === 'plate' || d.kind === 'glass');
     const loose = els.filter((d) => d.structural && !linked.has(d) && !rigHeld(d));
     assert.deepEqual(loose.map((d) => d.name), [], 'unlinked structural elements');
     step(1 / 60);
@@ -68,7 +69,9 @@ for (const def of SCENES) {
     for (let i = 0; i < 120; i++) step(1 / 60);
     for (const [d, c] of before) {
       assert.equal(d.disposed, false, `${d.name} broke at rest`);
-      assert.ok(d.bounds.getCenter(new THREE.Vector3()).distanceTo(c) < 0.01, `${d.name} moved at rest`);
+      // Gel dummies hang on jointed bodies: the joint chain settles by a centimetre or so at load.
+      const tol = d.kind === 'gel' ? 0.03 : 0.01;
+      assert.ok(d.bounds.getCenter(new THREE.Vector3()).distanceTo(c) < tol, `${d.name} moved at rest`);
     }
     assert.equal(graph.stats.releases, 0, 'no support released at rest');
     console.log(`  ${def.id}: ${els.length} elements, ${graph.stats.links} links, ${(weight / 9.80665 / 1000).toFixed(0)} t, build ${ms.toFixed(0)} ms (headless)`);

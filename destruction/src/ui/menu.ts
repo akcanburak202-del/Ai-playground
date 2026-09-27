@@ -29,6 +29,7 @@ const REFERENCE: Record<string, string> = {
   pavilion: 'Mies van der Rohe · Barselona, 1929',
   tower: 'Çelik iskelet ve giydirme cephe',
   temple: 'Parthenon oranlarında · Dor düzeni',
+  lab: 'Balistik jel mankenler · 20 m',
 };
 
 export interface SceneReference {

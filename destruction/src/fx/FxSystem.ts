@@ -748,6 +748,16 @@ export class FxSystem implements System, FxApi {
       _v.copy(p).addScaledVector(n, 0.5);
       this.lights.fire(this.now, _v, jet ? 0xfff0d0 : 0xffa860, flashCandela((jet ? 0.1 : 0.02) * E), 3 + 2 * s, jet ? 0.08 : 0.025);
       if (jet || e.ammo.kind === 'apfsds') this.emitDust(p, _v.copy(n).multiplyScalar(4), 0.25 * s, 6, 0x6d6760, 1);
+    } else if (cls === 'tissue') {
+      // Ballistic gelatin: a splash of gel droplets thrown back out of the entry (the temporary
+      // cavity vents through the entry hole) and a forward spray out of the exit.
+      const E0 = Math.max(e.energyAbsorbed, 1);
+      const g = Math.cbrt(E0 / 1750);
+      this.emitChips(p, _d, 0.7, 6 * Math.pow(g, 0.4), this.thin('chips', Math.min(50, 6 + 10 * g)), 0.004 * Math.sqrt(g), m.color, 'glass');
+      if (e.outcome === 'perforate' && e.exitPoint) {
+        this.emitChips(e.exitPoint, e.direction, 0.6, 10 * Math.pow(g, 0.4), this.thin('chips', Math.min(70, 10 + 14 * g)), 0.005 * Math.sqrt(g), m.color, 'glass');
+        this.emitDust(e.exitPoint, _v.copy(e.direction).multiplyScalar(3), Math.min(0.4, 0.06 * g), 3, 0xf1e6d2, 0.35);
+      }
     } else if (cls === 'glass') {
       this.emitSparks(p, e.direction, this.thin('sparks', Math.min(200, 25 * s)), 6, 0, 1.3, 0.004, 1, 2.5);
       this.emitChips(p, e.direction, 0.9, 5, this.thin('chips', Math.min(60, 10 * s)), 0.006, m.color, 'glass');

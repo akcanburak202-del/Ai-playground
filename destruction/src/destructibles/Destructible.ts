@@ -17,7 +17,7 @@ export interface RayHit {
   part?: number;
 }
 
-export type DestructibleKind = 'voxel' | 'plate' | 'beam' | 'glass' | 'terrain' | 'rebar';
+export type DestructibleKind = 'voxel' | 'plate' | 'beam' | 'glass' | 'terrain' | 'rebar' | 'gel';
 
 /**
  * A structural participant: something that can hold other elements up, and/or be held up.

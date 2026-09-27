@@ -79,6 +79,10 @@ class ProjectileImpl implements Projectile {
   start = NaN;
   interactions = 0;
   ricochets = 0;
+  /** Tissue simulant traversed so far, m (a round leaving an arm reaches the torso yawing) */
+  tissuePath = 0;
+  /** Went through a hard barrier: arrives in gel deformed and yawing */
+  destabilized = false;
 
   /** Start flying a scripted loft from the current position to `target`. */
   startLoft(target: THREE.Vector3, loftHeight: number): void {
@@ -197,6 +201,8 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
     p.spent = false;
     p.ricochets = 0;
     p.interactions = 0;
+    p.tissuePath = 0;
+    p.destabilized = false;
     const g = o.ammo.guidance;
     if (g?.mode === 'topAttack' && o.target && o.target.distanceTo(o.origin) > 5) p.startLoft(o.target, g.loftHeight ?? 150);
     this.active.push(p);
@@ -404,7 +410,10 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
       return true;
     }
     _vel.copy(dir).multiplyScalar(speed);
-    const ev = resolveImpact({ ammo: a, position: hit.point, velocity: _vel, mass: p.mass, length: p.length, perforations: p.perforations }, hit, probe, this.rng);
+    const ev = resolveImpact({
+      ammo: a, position: hit.point, velocity: _vel, mass: p.mass, length: p.length, perforations: p.perforations,
+      tissuePath: p.tissuePath, destabilized: p.destabilized,
+    }, hit, probe, this.rng);
     tagEvent(ev, p.id, p.perforations, probe, hit.normal, dir);
     this.emitImpact(ev, target);
 
@@ -443,6 +452,9 @@ export class ProjectileSystem implements System, ProjectileSystemApi {
         p.perforations++;
         p.mass = ev.residualMass;
         p.length = ev.residualLength;
+        // Gel carries the yaw on to the next target; a hard barrier leaves the round deformed and yawing.
+        if (ev.material.class === 'tissue') p.tissuePath = ev.residualTissuePath ?? p.tissuePath;
+        else if (target !== this.inert) p.destabilized = true;
         const d = ev.residualDirection ?? dir;
         p.velocity.copy(d).multiplyScalar(ev.residualSpeed);
         if (ev.exitPoint) this.contFrom.copy(ev.exitPoint);
